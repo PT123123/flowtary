@@ -2025,12 +2025,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
 
         case WM_SYSKEYDOWN: {
-            // 输入框聚焦时：Alt+数字 最高优先级；其它 Alt+ 组合（含 Alt+字母 / Alt 单独 / Alt+F4）
-            // 一律屏蔽，避免干扰输入。已注册的 Alt 启动热键由 WM_HOTKEY 处统一屏蔽。
+            // 仅处理本软件自带的 Alt+数字 快捷键：输入框聚焦时最高优先级、独占执行。
+            // 其它 Alt+ 组合（Alt+F4 / Alt+字母 / Alt 单独等）不拦截，交给系统默认行为。
             if (GetFocus() == g.hwnd) {
                 if (TryAltDigit(wParam)) return 0;
-                bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
-                if (alt) return 0;  // 屏蔽其它 Alt+ 组合
             }
             break;
         }
