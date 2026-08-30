@@ -40,7 +40,7 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
   （仅文件 / 程序类结果显示，调用 UAC 提权后以管理员身份启动）、`复制路径`（网页结果为 `复制链接`）。
 - **设置窗口**（右键托盘 → 设置，黑暗模式自绘，与主界面同风格，**可拖动边框调整大小**，
   最小 `560×430` 逻辑像素）：
-  - 左侧 **Tab 栏**：`常规` / `网页规则` / `主题` / `一键`。点击切换，关闭窗口后仍记住上次停留的 Tab；
+  - 左侧 **Tab 栏**：`常规` / `网页规则` / `主题` / `一键` / `搜索权重`。点击切换，关闭窗口后仍记住上次停留的 Tab；
     侧栏顶部有 `Flowtary` 品牌标题，激活页用主题强调色 + 左侧竖条高亮。
   - `常规` 页：
     - `开机自动启动`：勾选后写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\Flowtary`，
@@ -54,6 +54,9 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
         其它 `Alt+` 组合（如 `Alt+F4`、`Alt+字母`）不拦截，按系统默认行为处理（例如 `Alt+F4` 仍可关闭程序）。
       - 存 `HKCU\Software\Flowtary\HotkeyMode`（`0`=数字 / `1`=字母 / `2`=关闭），旧 `HotkeyLetters` 键兼容读取。
     - `唤醒位置`：屏幕居中 / 跟随鼠标（存 `HKCU\Software\Flowtary\CenterWake`）
+    - `文件对话框跳转`：在系统标准文件对话框中直接用 Flowtary 定位/跳转到某个文件夹（类 Listary
+      Quick-Switch），**默认勾选**。勾选状态存 `HKCU\Software\Flowtary\FileDlgJump`（`1`=开 / `0`=关，
+      缺省为开）；取消则不再劫持文件对话框。**本项已从托盘右键菜单移除，仅在此设置页调整**
   - `网页规则` 页：
     - `网页搜索规则`：多行编辑器，保存所有网页跳转规则，每行一条
       `前缀 空格 链接模板`（`{q}` 为关键词占位符，如 `bing https://www.bing.com/search?q={q}`）；
@@ -73,13 +76,24 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
     - `启用界面美化`：控制「暗色标题栏 + 圆角窗口 + 强制暗色菜单」三项系统级美化，**默认勾选**；
       取消后窗口标题栏与圆角回归系统默认、菜单回归系统主题（内容配色仍按所选主题绘制）。
       切换即时预览，存 `HKCU\Software\Flowtary\Beautify`
-    - `毛玻璃背景`：亚克力模糊背景，依附于 `启用界面美化`（后者关闭时本项置灰不可选），
-      **默认勾选**。实现优先用文档化属性 `DWMWA_SYSTEMBACKDROP_TYPE=3`（TransientWindow/Acrylic），
-      旧系统回退未公开的 `SetWindowCompositionAttribute` + `ACCENT_ENABLE_ACRYLICBLURBEHIND`，
-      两者都不可用时静默跳过；开启时窗口不透明度上限压到 232，让背后的模糊透出来。
+    - `毛玻璃背景`：亚克力/模糊背景，依附于 `启用界面美化`（后者关闭时本项置灰不可选），
+      **默认勾选**。实现：设置窗（非分层窗口）走文档化 `DWMWA_SYSTEMBACKDROP_TYPE=3`（Acrylic）；
+      主窗为分层窗口（需保留半透明主题），改用未公开 `SetWindowCompositionAttribute` 的
+      `ACCENT_ENABLE_BLURBEHIND(3)` + `LWA_COLORKEY` 透明键色，让背景完全透明以透出模糊，
+      主题色调由 accent 的 `GradientColor` 提供（透明蓝/星空等各显其色）；失效的
+      `ACCENT_ENABLE_ACRYLICBLURBEHIND(4)` 已弃用。开启时 `Paint` 不再不透明铺底，模糊正常透出。
       存 `HKCU\Software\Flowtary\Glass`
     - `主题样式`：黑色简洁 / 透明Mac黑暗 / 透明蓝色 / 星空风格 / 日出浅白
       （存 `HKCU\Software\Flowtary\Theme`）；**美化关闭时该项置灰不可选**（原先位于 `常规` 页，已移入本页）
+  - `搜索权重` 页：**点击加权排序**的开关与性能参数（见下「点击加权排序」）
+    - `启用点击权重记忆`：总开关，**默认勾选**（存 `HKCU\Software\Flowtary\WeightEnabled`）
+    - `写入时机`：每次点击立即写入磁盘 / 延迟 3 秒合并写入磁盘（默认）/ 仅程序退出时写入磁盘
+      （存 `WeightFlush`）。延迟合并模式下连续点击只触发一次写盘，退出时兜底落盘
+    - `条目上限`：1000 / 5000（默认）/ 20000 / 50000 条（存 `WeightMaxEntries`）。
+      内存与磁盘均按此裁剪，超限时优先淘汰权重最低的记录
+    - `清空权重数据`：两步确认（3 秒内再点一次才执行）清空全部权重并写空数据文件
+    - 页面显示当前已记忆条数；数据文件为 `%APPDATA%\Flowtary\weights.dat`
+      （UTF-16 文本，每行 `搜索词 \x1f 文件完整路径 \x1f 权重`）
 - **热键**：依次尝试 `Alt+Space` → `Alt+Q` → `Ctrl+Alt+Space`，全部被占用时弹窗提示；
   实际生效的组合显示在托盘提示文案中（本机 Alt+Space 常被 Flow.Launcher 等占用）。
   当输入框已聚焦时，这些本软件自带的全局 `Alt` 热键会被暂时屏蔽（交给「结果项快捷键」独占），不影响输入；
@@ -101,9 +115,17 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
   1. 用户开始菜单 `%APPDATA%\Microsoft\Windows\Start Menu\Programs` 下全部 `.lnk`
   2. 系统开始菜单 `C:\ProgramData\Microsoft\Windows\Start Menu\Programs` 下全部 `.lnk`
   3. `C:\Program Files`、`C:\Program Files (x86)` 一级子目录下的 `.exe`
-- 匹配排序：精确 > 前缀 > 包含 > 子序列模糊，同级内开始菜单优先于 Program Files；
+- 匹配排序：**点击权重 >** 精确 > 前缀 > 包含 > 子序列模糊，同级内开始菜单优先于 Program Files；
   最多显示 10 条。`.lnk` 通过 `IShellLink + IPersistFile` 解析目标路径，以其目录作为
   启动工作目录；图标懒加载缓存。
+- **点击加权排序**：点击 / 回车 / `Alt+` 快捷键 / 右键「打开」执行某个本地文件、文件夹或程序条目后，
+  针对本次输入框中的**有效搜索词**给该条目 +1 权重；相同有效词再次搜索时该条目排序提前，
+  不同搜索词之间权重互相独立。规则：
+  - 有效词 = 拆分前置命令关键字后的**实际搜索内容**，做标准化（去首尾空格 + 统一小写）作为记录 key；
+    `f`/`d` 前缀只对后面的关键词记录（如 `f 报告` 记 `报告`），无前缀时整个输入即有效词
+  - 命中不应保存的命令前缀（如 `gg`、`bd` 等网页指令）时，本次点击**完全不记录、不写入存储**
+  - 条目以**文件完整绝对路径**为唯一标识，同名文件不混淆
+  - Everything（`f`/`d`）结果返回后同样按权重稳定重排（权重相同保持 Everything 原序）
 
 ## 构建与运行
 
