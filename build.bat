@@ -13,7 +13,7 @@ call "%VS%\VC\Auxiliary\Build\vcvars64.bat" >nul
 
 if not exist build mkdir build
 
-rem ç‰ˆæœ¬ä¿¡æ¯èµ„æºï¼ˆå³é”®å±æ€§å¯è§ç‰ˆæœ¬å·/äº§å“åç­‰ï¼‰ï¼›ç‰ˆæœ¬å·å–è‡ª src\version.h
+rem °æ±¾ĞÅÏ¢×ÊÔ´£¨ÓÒ¼üÊôĞÔ¿É¼û°æ±¾ºÅ/²úÆ·ÃûµÈ£©£»°æ±¾ºÅÈ¡×Ô src\version.h
 rc /nologo /fo build\flowtary.res src\flowtary.rc
 if errorlevel 1 exit /b 1
 
