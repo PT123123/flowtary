@@ -207,10 +207,12 @@ constexpr int kBaseW = 600, kBaseInputH = 56, kBaseRowH = 30, kBasePad = 12;
 constexpr int kFontMin = 11, kFontMax = 24;  // 字体池逻辑字号范围
 constexpr UINT_PTR kTimerDebounce = 1;
 constexpr UINT_PTR kTimerBlink = 2;
+constexpr UINT_PTR kTimerBalloon = 3;
 constexpr int kDebounceMs = 120;
 constexpr int WM_APP_TRAY = WM_APP + 1;
 constexpr int IDM_SETTINGS = 2001;
 constexpr int IDM_EXIT = 2002;
+constexpr int IDM_REFRESH = 2003;   // 托盘菜单：刷新应用缓存
 constexpr int IDM_OPEN = 2011;      // 结果右键菜单：打开
 constexpr int IDM_OPENLOC = 2012;   // 结果右键菜单：打开所在文件夹
 constexpr int IDM_COPYPATH = 2013;  // 结果右键菜单：复制路径
@@ -1121,7 +1123,7 @@ static void TrayAdd() {
     g.nid.cbSize = sizeof(g.nid);
     g.nid.hWnd = g.hwnd;
     g.nid.uID = 1;
-    g.nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    g.nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_INFO;
     g.nid.uCallbackMessage = WM_APP_TRAY;
     g.nid.hIcon = g.hTrayIcon;
     std::wstring tip = L"Flowtary — " + g.hotkeyName + L" 唤出";
@@ -1134,6 +1136,17 @@ static void TrayUpdateTip() {
     std::wstring tip = L"Flowtary — " + g.hotkeyName + L" 唤出";
     lstrcpynW(g.nid.szTip, tip.c_str(), ARRAYSIZE(g.nid.szTip));
     Shell_NotifyIconW(NIM_MODIFY, &g.nid);
+}
+
+static void TrayBalloon(const std::wstring& title, const std::wstring& msg) {
+    if (!g.nid.hWnd) return;
+    g.nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_INFO;
+    g.nid.dwInfoFlags = NIIF_INFO;
+    lstrcpynW(g.nid.szInfoTitle, title.c_str(), ARRAYSIZE(g.nid.szInfoTitle));
+    lstrcpynW(g.nid.szInfo, msg.c_str(), ARRAYSIZE(g.nid.szInfo));
+    Shell_NotifyIconW(NIM_MODIFY, &g.nid);
+    // 短暂展示后清除 szInfo，避免后续 NIM_MODIFY（如提示文案更新）再次弹出
+    SetTimer(g.hwnd, kTimerBalloon, 3500, nullptr);
 }
 
 static void TrayRemove() {
@@ -2066,6 +2079,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 g.caretOn = !g.caretOn;
                 RECT r{0, 0, S(kBaseW), S(kBaseInputH)};
                 InvalidateRect(hwnd, &r, FALSE);
+            } else if (wParam == kTimerBalloon) {
+                KillTimer(hwnd, kTimerBalloon);
+                // 清除气泡文本，防止后续 NIM_MODIFY（如提示更新）再次弹出旧气泡
+                g.nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+                g.nid.szInfo[0] = L'\0';
+                Shell_NotifyIconW(NIM_MODIFY, &g.nid);
             }
             return 0;
 
@@ -2095,6 +2114,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 SetForegroundWindow(hwnd);
                 HMENU menu = CreatePopupMenu();
                 AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_SETTINGS, L"设置(&S)");
+                AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_REFRESH, L"刷新缓存(&R)");
                 AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, 0, (LPCWSTR)L"");  // 自绘分隔线
                 AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_EXIT, L"退出(&X)");
                 StyleDarkMenu(menu);
@@ -2104,6 +2124,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                                          p.x, p.y, 0, hwnd, nullptr);
                 DestroyMenu(menu);
                 if (cmd == IDM_SETTINGS) OpenSettings();
+                else if (cmd == IDM_REFRESH) {
+                    BuildPrograms();
+                    TrayBalloon(L"已刷新", std::to_wstring(g.programs.size()) + L" 个应用已重新索引");
+                }
                 else if (cmd == IDM_EXIT) DestroyWindow(hwnd);
             }
             return 0;
