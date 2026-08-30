@@ -216,6 +216,7 @@ constexpr int IDM_REFRESH = 2003;   // 托盘菜单：刷新应用缓存
 constexpr int IDM_OPEN = 2011;      // 结果右键菜单：打开
 constexpr int IDM_OPENLOC = 2012;   // 结果右键菜单：打开所在文件夹
 constexpr int IDM_COPYPATH = 2013;  // 结果右键菜单：复制路径
+constexpr int IDM_RUNAS = 2014;     // 结果右键菜单：以管理员模式打开
 
 // 结果项快捷键方案：
 //   方案0 Alt+数字：按结果优先级自上而下分配 1..9,0（列表最多 10 行，1=最高优先级）
@@ -884,6 +885,23 @@ static void ExecuteSelected() {
     if (ExecuteRow(g.items[g.sel])) Hide();
 }
 
+// 以管理员（提升权限）模式打开：仅对可执行项（程序 / 文件）有意义，使用 runas 动词提权
+static bool ExecuteRowAdmin(Row& r) {
+    std::wstring path, dir;
+    if (r.kind == Row::Prog) {
+        path = r.action;
+        dir = DirOf(!r.prog->target.empty() ? r.prog->target : r.action);
+    } else if (r.kind == Row::File) {
+        path = r.action;
+        dir = DirOf(path);
+    } else {
+        return false;
+    }
+    HINSTANCE h = ShellExecuteW(nullptr, L"runas", path.c_str(), nullptr,
+                               dir.empty() ? nullptr : dir.c_str(), SW_SHOWNORMAL);
+    return (INT_PTR)h > 32;
+}
+
 static void CopyTextToClipboard(const std::wstring& s) {
     if (s.empty()) return;
     if (!OpenClipboard(g.hwnd)) return;
@@ -937,6 +955,8 @@ static void ShowRowMenu(HWND hwnd) {
     AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_OPEN, (LPCWSTR)L"打开");
     if (r.kind == Row::File || r.kind == Row::Folder || r.kind == Row::Prog)
         AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_OPENLOC, (LPCWSTR)L"打开所在文件夹");
+    if (r.kind == Row::File || r.kind == Row::Prog)
+        AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_RUNAS, (LPCWSTR)L"以管理员模式打开");
     AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_COPYPATH,
                 (LPCWSTR)(r.kind == Row::Web ? L"复制链接" : L"复制路径"));
     SetMenuDefaultItem(menu, IDM_OPEN, FALSE);
@@ -965,6 +985,9 @@ static void ShowRowMenu(HWND hwnd) {
                 ShellExecuteW(nullptr, L"open", L"explorer.exe", args.c_str(), nullptr,
                               SW_SHOWNORMAL);
             }
+            break;
+        case IDM_RUNAS:
+            ExecuteRowAdmin(r);
             break;
         case IDM_COPYPATH:
             CopyTextToClipboard(r.action);  // Web 行复制的是链接
