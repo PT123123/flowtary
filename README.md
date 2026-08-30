@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Flowtary — Windows 极简全局搜索启动器
 
 Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割版）。纯 Win32 + GDI 自绘，
@@ -105,3 +106,6 @@ build.bat         MSVC 一键构建（vswhere 定位 VS，cl /O2 /MT Release）
 - 程序索引在启动时构建，安装/卸载新程序需重启 flowtary 生效
 - UWP 应用不在搜索范围（按方案仅索引 .lnk 与一级 .exe）
 - 未做开机自启（可自行将 flowtary.exe 快捷方式放入 shell:startup）
+=======
+# flowtary
+>>>>>>> d7217ed0d09ceb2d2eeec59961fd1a60e25ad2ae
