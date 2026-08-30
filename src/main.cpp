@@ -12,6 +12,7 @@
 #include <imm.h>
 #include <dwmapi.h>
 #include <uxtheme.h>
+#include <tlhelp32.h>
 
 #include <algorithm>
 #include <cwctype>
@@ -143,12 +144,22 @@ struct Program {
 };
 
 struct Row {
-    enum Kind { File, Folder, Web, Prog, EvFallback, Hint };
+    enum Kind { File, Folder, Web, Prog, EvFallback, Hint, Group };
     Kind kind = Hint;
     std::wstring title;
     std::wstring sub;     // 路径 / URL 说明
     std::wstring action;  // 打开目标；EvFallback 时为 Everything 命令行参数
     Program* prog = nullptr;
+    // 一键组（Row::Group）：groupKill=false 启动 groupTargets 里的文件；
+    // groupKill=true 结束 groupTargets 里的进程名
+    bool groupKill = false;
+    std::vector<std::wstring> groupTargets;
+};
+
+// 一键组：关键字 → 目标列表（启动组存文件路径，关闭组存进程名）
+struct CmdGroup {
+    std::wstring key;                   // 关键字（小写存储，比较时忽略大小写）
+    std::vector<std::wstring> targets;
 };
 
 enum class Mode { None, Everything, Web, Programs };
@@ -182,6 +193,8 @@ struct App {
     HBRUSH brMenuBg = nullptr;   // 弹出菜单背景（跟随主题重建）
 
     std::vector<WebCmd> webCmds;  // 网页跳转规则（设置可编辑）
+    std::vector<CmdGroup> groupsLaunch;  // 一键启动组：关键字 → 文件列表
+    std::vector<CmdGroup> groupsKill;    // 一键关闭组：关键字 → 进程名列表
 
     std::wstring text;
     size_t caret = 0;
@@ -233,6 +246,8 @@ static const WCHAR* kHotkeyLetterOrder = L"ABCDEFGHIJ";
 static void EnableDarkMenus();
 static void ApplyGlass();
 static BYTE EffectiveAlpha(BYTE a);
+static const CmdGroup* FindGroup(const std::vector<CmdGroup>& gs, const std::wstring& key);
+static int KillProcessesByName(const std::wstring& name);
 static void Layout();
 static void RepaintNow();
 static void GenerateStars();
@@ -859,6 +874,27 @@ static void Refresh() {
             }
         } else {
             g.mode = Mode::Programs;
+            // 一键启动 / 一键关闭：整串（去空白、忽略大小写）命中关键字时，
+            // 把组动作插到结果最前面（回车即执行；下方向键仍可选到普通程序结果）
+            std::wstring key = ToLowerW(TrimW(t));
+            auto addGroup = [&](const CmdGroup* gp, bool kill) {
+                if (!gp) return;
+                Row r;
+                r.kind = Row::Group;
+                r.groupKill = kill;
+                r.groupTargets = gp->targets;
+                r.title = (kill ? L"一键关闭：" : L"一键启动：") + gp->key;
+                std::wstring sub;
+                for (size_t i = 0; i < gp->targets.size(); ++i) {
+                    if (i) sub += L"、";
+                    sub += gp->targets[i];
+                }
+                r.sub = sub;
+                r.action = sub;  // 右键「复制路径」时复制目标清单
+                g.items.push_back(std::move(r));
+            };
+            addGroup(FindGroup(g.groupsLaunch, key), false);
+            addGroup(FindGroup(g.groupsKill, key), true);
             SearchPrograms(t);
         }
     }
@@ -883,6 +919,19 @@ static bool ExecuteRow(Row& r) {
             ShellExecuteW(nullptr, L"open", g.everythingExe.c_str(), r.action.c_str(), nullptr,
                           SW_SHOWNORMAL);
             return true;
+        case Row::Group: {
+            // 一键组：启动组逐个打开文件路径；关闭组按进程名结束进程
+            if (r.groupKill) {
+                for (auto& name : r.groupTargets) KillProcessesByName(name);
+            } else {
+                for (auto& p : r.groupTargets) {
+                    std::wstring dir = DirOf(p);
+                    ShellExecuteW(nullptr, L"open", p.c_str(), nullptr,
+                                  dir.empty() ? nullptr : dir.c_str(), SW_SHOWNORMAL);
+                }
+            }
+            return true;
+        }
         case Row::Hint:
             break;
     }
@@ -1401,6 +1450,109 @@ static void SaveWebRules(const std::wstring& editorText) {
     g.webCmds = ParseRules(editorText);
 }
 
+// ---------------- 一键启动 / 一键关闭组 ----------------
+// 文本格式：每行「关键字 + 空白 + 目标;目标;…」，`#` 开头为注释，重复关键字取第一条。
+// 启动组的目标是**文件路径**；关闭组的目标是**进程名**（可带或不带 .exe）。
+static std::wstring LoadRegText(const WCHAR* name) {
+    std::wstring text;
+    DWORD cb = 0;
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", name, RRF_RT_REG_SZ, nullptr,
+                     nullptr, &cb) == ERROR_SUCCESS && cb > sizeof(WCHAR)) {
+        std::vector<WCHAR> buf(cb / sizeof(WCHAR));
+        if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", name, RRF_RT_REG_SZ, nullptr,
+                         buf.data(), &cb) == ERROR_SUCCESS)
+            text = buf.data();
+    }
+    return text;
+}
+
+static void SaveRegText(const WCHAR* name, const std::wstring& s) {
+    RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", name, REG_SZ, s.c_str(),
+                    (DWORD)((s.size() + 1) * sizeof(WCHAR)));
+}
+
+static std::vector<CmdGroup> ParseGroups(const std::wstring& text) {
+    std::vector<CmdGroup> out;
+    size_t i = 0, n = text.size();
+    while (i < n) {
+        size_t j = text.find_first_of(L"\r\n", i);
+        if (j == std::wstring::npos) j = n;
+        std::wstring line = TrimW(text.substr(i, j - i));
+        i = j + 1;
+        if (line.empty() || line[0] == L'#') continue;
+        size_t sp = line.find_first_of(L" \t");
+        if (sp == std::wstring::npos) continue;  // 缺目标列表
+        CmdGroup g;
+        g.key = ToLowerW(TrimW(line.substr(0, sp)));
+        if (g.key.empty()) continue;
+        std::wstring rest = line.substr(sp + 1);
+        size_t p = 0;
+        while (p <= rest.size()) {
+            size_t q = rest.find(L';', p);
+            if (q == std::wstring::npos) q = rest.size();
+            std::wstring one = TrimW(rest.substr(p, q - p));
+            if (!one.empty()) g.targets.push_back(one);
+            if (q == rest.size()) break;
+            p = q + 1;
+        }
+        if (g.targets.empty()) continue;
+        bool dup = false;
+        for (auto& e : out)
+            if (e.key == g.key) { dup = true; break; }
+        if (!dup) out.push_back(std::move(g));
+    }
+    return out;
+}
+
+static std::wstring GroupsToText(const std::vector<CmdGroup>& gs) {
+    std::wstring t;
+    for (auto& g : gs) {
+        t += g.key + L" ";
+        for (size_t i = 0; i < g.targets.size(); ++i) {
+            if (i) t += L";";
+            t += g.targets[i];
+        }
+        t += L"\r\n";
+    }
+    return t;
+}
+
+static void LoadGroupRules() {
+    g.groupsLaunch = ParseGroups(LoadRegText(L"GroupLaunch"));
+    g.groupsKill = ParseGroups(LoadRegText(L"GroupKill"));
+}
+
+static const CmdGroup* FindGroup(const std::vector<CmdGroup>& gs, const std::wstring& key) {
+    for (auto& g : gs)
+        if (g.key == key) return &g;
+    return nullptr;
+}
+
+// 按进程名结束进程（等价 taskkill /F /IM，但不弹控制台窗口）；返回实际结束的进程数
+static int KillProcessesByName(const std::wstring& name) {
+    std::wstring target = ToLowerW(name);
+    if (!EndsWithI(target, L".exe")) target += L".exe";
+    int killed = 0;
+    DWORD self = GetCurrentProcessId();
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (ToLowerW(pe.szExeFile) != target) continue;
+            if (pe.th32ProcessID == self) continue;  // 不结束自身
+            HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
+            if (h) {
+                if (TerminateProcess(h, 1)) ++killed;
+                CloseHandle(h);
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return killed;
+}
+
 // ---------------- 绘制 ----------------
 static void Paint(HDC hdc) {
     RECT rc;
@@ -1567,6 +1719,13 @@ constexpr int IDC_TAB_WEB = 3015;
 constexpr int IDC_TAB_THEME = 3016;
 constexpr int IDC_CHK_BEAUTIFY = 3017;  // 主题页：界面美化开关
 constexpr int IDC_CHK_GLASS = 3018;     // 主题页：毛玻璃背景开关
+// 一键启动 / 一键关闭 Tab（索引 3）
+constexpr int IDC_TAB_GROUP = 3019;
+constexpr int IDC_LBL_LAUNCH = 3020;    // 「启动组」标题
+constexpr int IDC_EDT_LAUNCH = 3021;    // 启动组编辑器：关键字 → 文件路径
+constexpr int IDC_LBL_KILL = 3022;      // 「关闭组」标题
+constexpr int IDC_EDT_KILL = 3023;      // 关闭组编辑器：关键字 → 进程名
+constexpr int IDC_LBL_GROUPHINT = 3024; // 格式说明
 constexpr int IDC_LBL_THEME = 3011;
 constexpr int IDC_CMB_THEME = 3012;
 constexpr int IDM_THEME_BASE = 4200;  // 主题下拉菜单指令基值
@@ -1595,13 +1754,19 @@ static void ShowSettingsTab(HWND h, int tab) {
     vis(IDC_CHK_GLASS, theme);
     vis(IDC_LBL_THEME, theme);
     vis(IDC_CMB_THEME, theme);
+    bool group = (tab == 3);
+    vis(IDC_LBL_LAUNCH, group);
+    vis(IDC_EDT_LAUNCH, group);
+    vis(IDC_LBL_KILL, group);
+    vis(IDC_EDT_KILL, group);
+    vis(IDC_LBL_GROUPHINT, group);
     // 保存/取消始终显示；Y 随 Tab 变化（主题页控件少，按钮上移避免留白）
     RECT rc; GetClientRect(h, &rc);
     int margin = S(156);
     int contentW = rc.right - margin - S(24);
     int btnW = S(96), btnGap = S(12);
     int x0 = margin + (contentW - btnW * 3 - btnGap * 2) / 2;
-    int btnY = general ? S(150) : (web ? S(376) : S(180));
+    int btnY = general ? S(150) : (theme ? S(180) : S(376));
     SetWindowPos(GetDlgItem(h, IDC_BTN_RESET),  nullptr, x0,                         btnY, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
     SetWindowPos(GetDlgItem(h, IDC_BTN_SAVE),   nullptr, x0 + btnW + btnGap,         btnY, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
     SetWindowPos(GetDlgItem(h, IDC_BTN_CANCEL), nullptr, x0 + (btnW + btnGap) * 2,   btnY, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
@@ -1675,6 +1840,11 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                                 S(10), S(112), S(120), S(36), h,
                                 (HMENU)(INT_PTR)IDC_TAB_THEME, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+            c = CreateWindowExW(0, L"BUTTON", L"一键",
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                S(10), S(156), S(120), S(36), h,
+                                (HMENU)(INT_PTR)IDC_TAB_GROUP, g.inst, nullptr);
             SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
 
             c = CreateWindowExW(0, L"BUTTON", L"开机自动启动",
@@ -1773,6 +1943,42 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                                 (HMENU)(INT_PTR)IDC_BTN_CANCEL, g.inst, nullptr);
             SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
 
+            // 一键启动 / 一键关闭 Tab（索引 3）：两个多行编辑器
+            c = CreateWindowExW(0, L"STATIC", L"启动组（关键字 → 文件）：",
+                                WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE, margin, S(20),
+                                contentW, S(24), h, (HMENU)(INT_PTR)IDC_LBL_LAUNCH, g.inst,
+                                nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+            c = CreateWindowExW(0, L"EDIT", nullptr,
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_MULTILINE |
+                                    ES_AUTOVSCROLL | WS_VSCROLL,
+                                margin, S(46), contentW, S(140), h,
+                                (HMENU)(INT_PTR)IDC_EDT_LAUNCH, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fList, TRUE);
+            SetWindowTextW(c, GroupsToText(g.groupsLaunch).c_str());
+            SetWindowTheme(c, L"DarkMode_Explorer", nullptr);
+
+            c = CreateWindowExW(0, L"STATIC", L"关闭组（关键字 → 进程）：",
+                                WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE, margin, S(194),
+                                contentW, S(24), h, (HMENU)(INT_PTR)IDC_LBL_KILL, g.inst,
+                                nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+            c = CreateWindowExW(0, L"EDIT", nullptr,
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_MULTILINE |
+                                    ES_AUTOVSCROLL | WS_VSCROLL,
+                                margin, S(220), contentW, S(110), h,
+                                (HMENU)(INT_PTR)IDC_EDT_KILL, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fList, TRUE);
+            SetWindowTextW(c, GroupsToText(g.groupsKill).c_str());
+            SetWindowTheme(c, L"DarkMode_Explorer", nullptr);
+
+            c = CreateWindowExW(0, L"STATIC",
+                                L"每行：关键字 + 空格 + 目标（多个用 ; 分隔）。启动组填"
+                                L"文件全路径，关闭组填进程名（可省 .exe）；# 开头为注释",
+                                WS_CHILD | WS_VISIBLE, margin, S(338), contentW, S(30), h,
+                                (HMENU)(INT_PTR)IDC_LBL_GROUPHINT, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fList, TRUE);
+
             ShowSettingsTab(h, g.settingsTab);  // 按当前 Tab 初始化分组可见性与按钮位置
             return 0;
         }
@@ -1804,16 +2010,18 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 DrawTextW(hdc, L"Flowtary", -1, &ttr,
                           DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
             }
-            // 规则编辑框自绘 1px 描边（仅网页规则 Tab 可见时绘制，避免通用页残留边框）
-            HWND ed = GetDlgItem(h, IDC_EDT_RULES);
-            if (ed && IsWindowVisible(ed)) {
+            // 编辑框自绘 1px 描边（仅当前 Tab 可见时绘制，避免其它页残留边框）
+            const int kEditIds[] = {IDC_EDT_RULES, IDC_EDT_LAUNCH, IDC_EDT_KILL};
+            HBRUSH brFrame = CreateSolidBrush(RGB(70, 70, 70));
+            for (int eid : kEditIds) {
+                HWND ed = GetDlgItem(h, eid);
+                if (!ed || !IsWindowVisible(ed)) continue;
                 RECT er;
                 GetWindowRect(ed, &er);
                 MapWindowPoints(ed, h, (LPPOINT)&er, 2);
-                HBRUSH brFrame = CreateSolidBrush(RGB(70, 70, 70));
                 FrameRect(hdc, &er, brFrame);
-                DeleteObject(brFrame);
             }
+            DeleteObject(brFrame);
             EndPaint(h, &ps);
             return 0;
         }
@@ -1832,7 +2040,9 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 
         case WM_CTLCOLOREDIT: {
             HDC hdc = (HDC)wp;
-            if ((HWND)lp == GetDlgItem(h, IDC_EDT_RULES)) {
+            HWND w = (HWND)lp;
+            if (w == GetDlgItem(h, IDC_EDT_RULES) || w == GetDlgItem(h, IDC_EDT_LAUNCH) ||
+                w == GetDlgItem(h, IDC_EDT_KILL)) {
                 if (!g.brEditBg) g.brEditBg = CreateSolidBrush(RGB(24, 24, 24));
                 SetTextColor(hdc, RGB(235, 235, 235));
                 SetBkColor(hdc, RGB(24, 24, 24));
@@ -1927,9 +2137,13 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     if (dis->itemState & ODS_FOCUS) DrawFocusRect(dis->hDC, &dis->rcItem);
                     return TRUE;
                 }
-                if (id == IDC_TAB_GENERAL || id == IDC_TAB_WEB || id == IDC_TAB_THEME) {
+                if (id == IDC_TAB_GENERAL || id == IDC_TAB_WEB || id == IDC_TAB_THEME ||
+                    id == IDC_TAB_GROUP) {
                     // 左侧 Tab 按钮：激活项用强调色高亮，并加左侧竖条
-                    int idx = (id == IDC_TAB_GENERAL) ? 0 : (id == IDC_TAB_WEB ? 1 : 2);
+                    int idx = (id == IDC_TAB_GENERAL) ? 0
+                            : (id == IDC_TAB_WEB)     ? 1
+                            : (id == IDC_TAB_THEME)   ? 2
+                                                      : 3;
                     bool active = (g.settingsTab == idx);
                     bool hover = (dis->itemState & ODS_HOTLIGHT) != 0;
                     HBRUSH bk = CreateSolidBrush(active ? t.menuHi : (hover ? t.editBg : t.menuBg));
@@ -1949,7 +2163,9 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     SetTextColor(dis->hDC, active ? t.text : t.sub);
                     SelectObject(dis->hDC, g.fInput);
                     const WCHAR* lbl = (id == IDC_TAB_GENERAL) ? L"常规"
-                                                 : (id == IDC_TAB_WEB ? L"网页规则" : L"主题");
+                                     : (id == IDC_TAB_WEB)     ? L"网页规则"
+                                     : (id == IDC_TAB_THEME)   ? L"主题"
+                                                               : L"一键";
                     RECT tr = dis->rcItem;
                     tr.left += S(10);
                     DrawTextW(dis->hDC, lbl, -1, &tr,
@@ -2008,6 +2224,22 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 GetWindowTextW(GetDlgItem(h, IDC_EDT_RULES), &rulesText[0], len + 1);
                 rulesText.resize(len);
                 SaveWebRules(rulesText);
+                // 一键启动 / 一键关闭组：分别持久化并即时重建索引
+                HWND eL = GetDlgItem(h, IDC_EDT_LAUNCH);
+                int lenL = GetWindowTextLengthW(eL);
+                std::wstring launchText(lenL + 1, 0);
+                GetWindowTextW(eL, &launchText[0], lenL + 1);
+                launchText.resize(lenL);
+                SaveRegText(L"GroupLaunch", launchText);
+                g.groupsLaunch = ParseGroups(launchText);
+
+                HWND eK = GetDlgItem(h, IDC_EDT_KILL);
+                int lenK = GetWindowTextLengthW(eK);
+                std::wstring killText(lenK + 1, 0);
+                GetWindowTextW(eK, &killText[0], lenK + 1);
+                killText.resize(lenK);
+                SaveRegText(L"GroupKill", killText);
+                g.groupsKill = ParseGroups(killText);
                 if (IsWindowVisible(g.hwnd)) LayoutAndRepaint();
                 DestroyWindow(h);
             } else if (id == IDC_CHK_START && HIWORD(wp) == BN_CLICKED) {
@@ -2046,9 +2278,13 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 else return 0;
                 InvalidateRect(GetDlgItem(h, IDC_CMB_HOTKEY), nullptr, TRUE);
                 if (IsWindowVisible(g.hwnd)) RepaintNow();
-             } else if ((id == IDC_TAB_GENERAL || id == IDC_TAB_WEB || id == IDC_TAB_THEME) &&
+             } else if ((id == IDC_TAB_GENERAL || id == IDC_TAB_WEB || id == IDC_TAB_THEME ||
+                         id == IDC_TAB_GROUP) &&
                         HIWORD(wp) == BN_CLICKED) {
-                ShowSettingsTab(h, (id == IDC_TAB_GENERAL) ? 0 : (id == IDC_TAB_WEB ? 1 : 2));
+                ShowSettingsTab(h, (id == IDC_TAB_GENERAL) ? 0
+                                 : (id == IDC_TAB_WEB)    ? 1
+                                 : (id == IDC_TAB_THEME)  ? 2
+                                                          : 3);
              } else if (id == IDC_CMB_WAKE && HIWORD(wp) == BN_CLICKED) {
                 // 下拉弹出黑暗菜单（复用 StyleDarkMenu 同一套自绘/染色）
                 HMENU m = CreatePopupMenu();
@@ -2575,6 +2811,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
 
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     LoadWebRules();
+    LoadGroupRules();
     EnableDarkMenus();  // 按主题深浅强制弹出菜单（托盘/右键） 绘制
     g.msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
 
