@@ -171,7 +171,8 @@ struct App {
     HFONT fInput = nullptr;
     HFONT fList = nullptr;
     HBRUSH brDivider = nullptr;
-    HBRUSH brEditBg = nullptr;   // 设置窗口编辑框深色背景
+    HBRUSH brEditBg = nullptr;   // 设置窗口编辑框背景（跟随主题 editBg）
+    HBRUSH brSettingsBg = nullptr;  // 设置窗口客户区背景（跟随主题 bg）
     HINSTANCE inst = nullptr;
     float scale = 1.0f;          // 全局比例：max(DPI, 屏幕物理高度/1080)，不写死像素
     bool centerWake = true;    // 唤醒位置：true=屏幕居中，false=跟随鼠标
@@ -253,6 +254,7 @@ static BYTE EffectiveAlpha(BYTE a);
 static const CmdGroup* FindGroup(const std::vector<CmdGroup>& gs, const std::wstring& key);
 static int KillProcessesByName(const std::wstring& name);
 static void LayoutSettings(HWND h);
+static void ApplyDarkTitlebar(HWND h);
 static void Layout();
 static void RepaintNow();
 static void GenerateStars();
@@ -353,8 +355,12 @@ static void ApplyTheme(bool repaint = true) {
     g.brMenuBg = CreateSolidBrush(t.menuBg);
     if (g.brEditBg) { DeleteObject(g.brEditBg); g.brEditBg = nullptr; }
     g.brEditBg = CreateSolidBrush(t.editBg);
+    if (g.brSettingsBg) { DeleteObject(g.brSettingsBg); g.brSettingsBg = nullptr; }
+    g.brSettingsBg = CreateSolidBrush(t.bg);
     EnableDarkMenus();
     ApplyGlass();  // 毛玻璃背景随美化开关/玻璃开关与主题底色刷新
+    // 切换主题后同步标题栏明暗（深色↔浅色主题时标题栏要跟着变）
+    if (g.hSettings && g.beautify) ApplyDarkTitlebar(g.hSettings);
     if (t.stars) GenerateStars();
     if (g.hSettings && repaint) {
         EnumChildWindows(g.hSettings, RefreshChildFont, 0);
@@ -1794,9 +1800,9 @@ static void ShowSettingsTab(HWND h, int tab) {
     InvalidateRect(h, nullptr, TRUE);
 }
 
-// Win11 / Win10 20H1+：标题栏跟随暗色
+// Win11 / Win10 20H1+：标题栏明暗跟随当前主题（浅色主题用浅色标题栏，避免与窗口配色割裂）
 static void ApplyDarkTitlebar(HWND h) {
-    BOOL dark = TRUE;
+    BOOL dark = (g.theme && g.theme->dark) ? TRUE : FALSE;
     if (FAILED(DwmSetWindowAttribute(h, 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/, &dark,
                                      sizeof(dark))))
         DwmSetWindowAttribute(h, 19, &dark, sizeof(dark));
@@ -2155,7 +2161,9 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             HDC hdc = BeginPaint(h, &ps);
             RECT rc;
             GetClientRect(h, &rc);
-            FillRect(hdc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
+            // 背景跟随主题底色（浅色主题下不再是硬编码的黑底）
+            FillRect(hdc, &rc,
+                     g.brSettingsBg ? g.brSettingsBg : (HBRUSH)GetStockObject(BLACK_BRUSH));
             // 左侧 Tab 栏背景（深色），与内容区分隔
             if (g.theme) {
                 HBRUSH sbBg = CreateSolidBrush(g.theme->menuBg);
@@ -2197,9 +2205,11 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_CTLCOLORDLG:
         case WM_CTLCOLORSTATIC: {
             HDC hdc = (HDC)wp;
-            SetTextColor(hdc, RGB(235, 235, 235));
+            // 标签文字与背景跟随主题，浅色主题下不会变成「浅字压浅底」
+            SetTextColor(hdc, g.theme ? g.theme->text : RGB(235, 235, 235));
             SetBkMode(hdc, TRANSPARENT);
-            return (LRESULT)GetStockObject(BLACK_BRUSH);
+            return (LRESULT)(g.brSettingsBg ? g.brSettingsBg
+                                            : (HBRUSH)GetStockObject(BLACK_BRUSH));
         }
 
         case WM_CTLCOLOREDIT: {
@@ -2207,9 +2217,10 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             HWND w = (HWND)lp;
             if (w == GetDlgItem(h, IDC_EDT_RULES) || w == GetDlgItem(h, IDC_EDT_LAUNCH) ||
                 w == GetDlgItem(h, IDC_EDT_KILL)) {
-                if (!g.brEditBg) g.brEditBg = CreateSolidBrush(RGB(24, 24, 24));
-                SetTextColor(hdc, RGB(235, 235, 235));
-                SetBkColor(hdc, RGB(24, 24, 24));
+                const Theme& te = *g.theme;
+                if (!g.brEditBg) g.brEditBg = CreateSolidBrush(te.editBg);
+                SetTextColor(hdc, te.text);
+                SetBkColor(hdc, te.editBg);
                 return (LRESULT)g.brEditBg;
             }
             break;
