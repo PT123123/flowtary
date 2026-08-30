@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # Flowtary — Windows 极简全局搜索启动器
 
 Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割版）。纯 Win32 + GDI 自绘，
@@ -31,8 +30,13 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
 - **托盘图标**：启动后常驻任务栏托盘（黑底白点圆形图标）。左键单击 = 唤出/隐藏输入框；
   右键菜单：`设置`、`退出`。Explorer 重启后自动恢复图标（监听 `TaskbarCreated`）。
 - **设置窗口**（右键托盘 → 设置，黑暗模式自绘，与主界面同风格）：
-  - `开机自动启动`：写/删 `HKCU\...\CurrentVersion\Run\Flowtary`
+  - `开机自动启动`：勾选后写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\Flowtary`，
+    取消则删除该值
+  - `Alt+字母快捷打开`：结果列表每行右侧显示字母徽章（按 `a`/`s`/`d`… 顺序分配），
+    按 `Alt+对应字母` 直接执行该项；**默认勾选**（存 `HKCU\Software\Flowtary\HotkeyLetters`）
   - `唤醒位置`：屏幕居中 / 跟随鼠标（存 `HKCU\Software\Flowtary\CenterWake`）
+  - `主题样式`：黑色简洁 / 透明Mac黑暗 / 透明蓝色 / 星空风格 / 日出浅白
+    （存 `HKCU\Software\Flowtary\Theme`）
   - `网页搜索规则`：多行编辑器，保存所有网页跳转规则，每行一条
     `前缀 空格 链接模板`（`{q}` 为关键词占位符，如 `bing https://www.bing.com/search?q={q}`）；
     `#` 开头为注释，重复前缀取第一条；「恢复默认」一键还原内置规则。
@@ -60,7 +64,7 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
 
 ```bat
 build.bat        :: 需要安装 VS 2022 / Build Tools 的 C++ 工作负载（x64）
-build\flowtary.exe   :: 主程序，启动后常驻后台（无窗口无托盘）
+build\flowtary.exe   :: 主程序，启动后无主窗口、常驻托盘，可被全局热键唤出
 build\evtest.exe     :: Everything IPC 协议冒烟测试工具（控制台）
 ```
 
@@ -105,7 +109,3 @@ build.bat         MSVC 一键构建（vswhere 定位 VS，cl /O2 /MT Release）
 - 全屏独占程序中热键仍可响应，但焦点抢占可能被系统限制
 - 程序索引在启动时构建，安装/卸载新程序需重启 flowtary 生效
 - UWP 应用不在搜索范围（按方案仅索引 .lnk 与一级 .exe）
-- 未做开机自启（可自行将 flowtary.exe 快捷方式放入 shell:startup）
-=======
-# flowtary
->>>>>>> d7217ed0d09ceb2d2eeec59961fd1a60e25ad2ae
