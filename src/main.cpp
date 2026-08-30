@@ -1779,6 +1779,28 @@ static void OpenSettings() {
 }
 
 // ---------------- 窗口过程 ----------------
+
+// Alt+数字：执行对应徽章的结果行（输入框聚焦时最高优先级；可在设置关闭）。
+// 返回 true 表示该按键已被消费：数字键匹配到结果，或数字键但无匹配项（如列表为空，吞键避免蜂鸣）。
+static bool TryAltDigit(WPARAM wParam) {
+    bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+    bool alt  = (GetKeyState(VK_MENU)    & 0x8000) != 0;
+    if (!alt || ctrl || !g.hotkeyNum) return false;
+    WCHAR k = 0;
+    if (wParam >= '0' && wParam <= '9') k = (WCHAR)wParam;
+    else if (wParam >= VK_NUMPAD0 && wParam <= VK_NUMPAD9)
+        k = (WCHAR)('0' + (wParam - VK_NUMPAD0));
+    if (!k) return false;  // 非数字键，交给系统/其它逻辑
+    for (int i = 0; i < (int)g.items.size(); ++i) {
+        if (HotkeyDigit(i) == k) {
+            g.sel = i;
+            ExecuteSelected();
+            return true;
+        }
+    }
+    return true;  // 数字键但无匹配项：吞掉，避免系统蜂鸣
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (g.msgTaskbarCreated && msg == g.msgTaskbarCreated) {
         TrayAdd();  // Explorer 重启后恢复托盘图标
@@ -1812,6 +1834,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         case WM_HOTKEY:
             if (wParam == 1) {
+                // 输入框聚焦时屏蔽已注册的 Alt 热键（Alt+Space / Alt+Q / Ctrl+Alt+Space），
+                // 使其不再隐藏/切换窗口，仅 Alt+数字 生效（见 WM_SYSKEYDOWN）。
+                if (GetFocus() == g.hwnd) return 0;
                 if (IsWindowVisible(hwnd)) Hide();
                 else Show();
             }
@@ -1938,23 +1963,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         case WM_KEYDOWN: {
             bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-            bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
-            // Alt+数字：直接执行对应快捷键徽章的结果行（最高优先级，先于其它按键处理；可在设置关闭）
-            if (alt && g.hotkeyNum && !ctrl) {
-                WCHAR k = 0;
-                if (wParam >= '0' && wParam <= '9') k = (WCHAR)wParam;
-                else if (wParam >= VK_NUMPAD0 && wParam <= VK_NUMPAD9)
-                    k = (WCHAR)('0' + (wParam - VK_NUMPAD0));
-                if (k) {
-                    for (int i = 0; i < (int)g.items.size(); ++i) {
-                        if (HotkeyDigit(i) == k) {
-                            g.sel = i;
-                            ExecuteSelected();
-                            return 0;
-                        }
-                    }
-                }
-            }
+            // Alt+数字 由 WM_SYSKEYDOWN（Alt 组合键消息）统一处理，详见下方 case。
             switch (wParam) {
                 case VK_RETURN:
                     ExecuteSelected();
@@ -2011,6 +2020,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     return 0;
                 default:
                     break;
+            }
+            break;
+        }
+
+        case WM_SYSKEYDOWN: {
+            // 输入框聚焦时：Alt+数字 最高优先级；其它 Alt+ 组合（含 Alt+字母 / Alt 单独 / Alt+F4）
+            // 一律屏蔽，避免干扰输入。已注册的 Alt 启动热键由 WM_HOTKEY 处统一屏蔽。
+            if (GetFocus() == g.hwnd) {
+                if (TryAltDigit(wParam)) return 0;
+                bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
+                if (alt) return 0;  // 屏蔽其它 Alt+ 组合
             }
             break;
         }

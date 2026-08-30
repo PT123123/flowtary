@@ -34,7 +34,10 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
     取消则删除该值
   - `Alt+数字快捷打开`：结果列表每行右侧显示数字徽章（按结果优先级自上而下 `1`/`2`/`3`… 分配，
     `1` = 列表最高优先级项），按 `Alt+对应数字`（主键盘或数字小键盘均可）直接执行该项；
-    **默认勾选**（存 `HKCU\Software\Flowtary\HotkeyLetters`）
+    **默认勾选**（存 `HKCU\Software\Flowtary\HotkeyLetters`）。
+    **最高优先级**：输入框聚焦时，除 `Alt+数字` 外的所有 `Alt+` 快捷键一律屏蔽
+    （含 `Alt+Space`/`Alt+Q`/`Ctrl+Alt+Space` 等启动热键，以及 `Alt+字母`/`Alt+F4`），
+    不会误触发隐藏或系统菜单；想关闭窗口请用 `Esc` 或点击别处。
   - `唤醒位置`：屏幕居中 / 跟随鼠标（存 `HKCU\Software\Flowtary\CenterWake`）
   - `主题样式`：黑色简洁 / 透明Mac黑暗 / 透明蓝色 / 星空风格 / 日出浅白
     （存 `HKCU\Software\Flowtary\Theme`）
@@ -44,6 +47,7 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
     存 `HKCU\Software\Flowtary\WebRules`，保存后立即生效，回车即保存
 - **热键**：依次尝试 `Alt+Space` → `Alt+Q` → `Ctrl+Alt+Space`，全部被占用时弹窗提示；
   实际生效的组合显示在托盘提示文案中（本机 Alt+Space 常被 Flow.Launcher 等占用）。
+  当输入框已聚焦时，这些全局 `Alt` 热键会被暂时屏蔽（交给 `Alt+数字` 独占），不影响输入。
 - **外观**：Win11 DWM 圆角 + 灰色描边（旧系统自动回退 GDI 1px 描边）；输入框加高至 56
   逻辑像素。**不写死像素点**：全部尺寸按统一比例缩放，比例 = max(系统 DPI 缩放,
   屏幕物理高度/1080)，高分辨率小屏上按比例放大不会显得过小；换屏唤醒时自动重算，
