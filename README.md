@@ -13,8 +13,8 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
 
 | 输入 | 行为 |
 | :--- | :--- |
-| `d {关键词}` | Everything 只搜本地**文件**（`file:` 修饰符），回车直接打开 |
-| `f {关键词}` | Everything 只搜本地**文件夹**（`folder:` 修饰符），回车在资源管理器打开 |
+| `f {关键词}` | Everything 只搜本地**文件**（`file:` 修饰符），回车直接打开 |
+| `d {关键词}` | Everything 只搜本地**文件夹**（`folder:` 修饰符），回车在资源管理器打开 |
 | `bd {q}` | 百度 `https://www.baidu.com/#ie=UTF-8&wd={q}` |
 | `bili {q}` | B站 `https://search.bilibili.com/all?keyword={q}` |
 | `xhs {q}` | 小红书 `https://www.xiaohongshu.com/search_result?keyword={q}` |
