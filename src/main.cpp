@@ -164,6 +164,10 @@ struct App {
     bool centerWake = true;    // 唤醒位置：true=屏幕居中，false=跟随鼠标
     bool dwmBorderOk = false;  // DWM 描边可用（否则 Paint 回退 GDI 描边）
     bool hotkeyLetters = true; // Alt+字母快捷打开结果项
+    bool startupWanted = false;// 设置窗“开机自动启动”勾选状态（自绘复选框用变量驱动，
+                               // 因为 BS_OWNERDRAW 按钮的 Button_GetCheck/SetCheck 不生效）
+    bool startupSaved = false; // 设置窗打开时的初始值（取消时回退）
+    bool hotkeySaved = false;  // 同上，Alt+字母
     int themeIdx = 0;          // 当前主题索引（设置窗切换后、保存前为暂存值）
     int themeSaved = 0;        // 设置窗打开时的初始主题（取消时回退）
     const Theme* theme = nullptr;
@@ -1412,21 +1416,22 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             int margin = S(24);
             int contentW = S(412);  // 460 - 24*2，所有控件宽度由此推导，不写死像素
 
+            // 自绘复选框：按钮实际为 BS_OWNERDRAW（BS_AUTOCHECKBOX 与之位或后会被吸收），
+            // 其 Button_GetCheck/SetCheck 不生效，勾选状态一律由 g.startupWanted / g.hotkeyLetters 驱动。
+            g.startupWanted = GetStartupEnabled();
+            g.startupSaved = g.startupWanted;
+            g.hotkeySaved = g.hotkeyLetters;
             HWND c = CreateWindowExW(0, L"BUTTON", L"开机自动启动",
-                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX |
-                                         BS_OWNERDRAW,
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                                      margin, S(20), contentW, S(24), h,
                                      (HMENU)(INT_PTR)IDC_CHK_START, g.inst, nullptr);
             SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
-            Button_SetCheck(c, GetStartupEnabled() ? BST_CHECKED : BST_UNCHECKED);
 
             c = CreateWindowExW(0, L"BUTTON", L"Alt+字母快捷打开",
-                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX |
-                                    BS_OWNERDRAW,
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                                 margin, S(44), contentW, S(24), h,
                                 (HMENU)(INT_PTR)IDC_CHK_HOTKEY, g.inst, nullptr);
             SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
-            Button_SetCheck(c, g.hotkeyLetters ? BST_CHECKED : BST_UNCHECKED);
 
             c = CreateWindowExW(0, L"STATIC", L"唤醒位置：",
                                 WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE, margin, S(72), S(90),
@@ -1565,7 +1570,8 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     HBRUSH fb2 = CreateSolidBrush(t.divider);
                     FrameRect(dis->hDC, &box, fb2);
                     DeleteObject(fb2);
-                    if (Button_GetCheck(dis->hwndItem) == BST_CHECKED)
+                    bool checked = (id == IDC_CHK_START) ? g.startupWanted : g.hotkeyLetters;
+                    if (checked)
                         DrawCheckGlyph(dis->hDC, box, t.text);
                     SetBkMode(dis->hDC, TRANSPARENT);
                     SetTextColor(dis->hDC, t.text);
@@ -1655,15 +1661,14 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 DWORD v = g.centerWake ? 1 : 0;
                 RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"CenterWake",
                                 REG_DWORD, &v, sizeof(v));
-                g.hotkeyLetters =
-                    Button_GetCheck(GetDlgItem(h, IDC_CHK_HOTKEY)) == BST_CHECKED;
+                // g.hotkeyLetters / g.startupWanted 已在点击时实时更新，直接持久化即可
                 DWORD vk = g.hotkeyLetters ? 1 : 0;
                 RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"HotkeyLetters",
                                 REG_DWORD, &vk, sizeof(vk));
                 DWORD vt = (DWORD)g.themeIdx;
                 RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"Theme", REG_DWORD,
                                 &vt, sizeof(vt));
-                SetStartup(Button_GetCheck(GetDlgItem(h, IDC_CHK_START)) == BST_CHECKED);
+                SetStartup(g.startupWanted);
                 int len = GetWindowTextLengthW(GetDlgItem(h, IDC_EDT_RULES));
                 std::wstring rulesText(len + 1, 0);
                 GetWindowTextW(GetDlgItem(h, IDC_EDT_RULES), &rulesText[0], len + 1);
@@ -1672,14 +1677,11 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 if (IsWindowVisible(g.hwnd)) LayoutAndRepaint();
                 DestroyWindow(h);
 } else if (id == IDC_CHK_START && HIWORD(wp) == BN_CLICKED) {
-                Button_SetCheck(GetDlgItem(h, IDC_CHK_START),
-                    Button_GetCheck(GetDlgItem(h, IDC_CHK_START)) == BST_CHECKED
-                        ? BST_UNCHECKED : BST_CHECKED);
+                g.startupWanted = !g.startupWanted;
+                InvalidateRect(GetDlgItem(h, IDC_CHK_START), nullptr, TRUE);
             } else if (id == IDC_CHK_HOTKEY && HIWORD(wp) == BN_CLICKED) {
-                Button_SetCheck(GetDlgItem(h, IDC_CHK_HOTKEY),
-                    Button_GetCheck(GetDlgItem(h, IDC_CHK_HOTKEY)) == BST_CHECKED
-                        ? BST_UNCHECKED : BST_CHECKED);
-                g.hotkeyLetters = (Button_GetCheck(GetDlgItem(h, IDC_CHK_HOTKEY)) == BST_CHECKED);
+                g.hotkeyLetters = !g.hotkeyLetters;
+                InvalidateRect(GetDlgItem(h, IDC_CHK_HOTKEY), nullptr, TRUE);
                 if (IsWindowVisible(g.hwnd)) RepaintNow();
              } else if (id == IDC_CMB_WAKE && HIWORD(wp) == BN_CLICKED) {
                 // 下拉弹出黑暗菜单（复用 StyleDarkMenu 同一套自绘/染色）
@@ -1722,11 +1724,16 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 InvalidateRect(GetDlgItem(h, IDC_CMB_THEME), nullptr, TRUE);
             } else if (id == IDC_BTN_CANCEL) {
-                // 取消：回退未保存的主题/快捷键，主题恢复打开时的预设
+                // 取消：回退未保存的主题/复选框，恢复打开时的预设
                 if (g.themeIdx != g.themeSaved) {
                     g.themeIdx = g.themeSaved;
                     g.theme = &kThemes[g.themeIdx];
                     ApplyTheme();
+                }
+                if (g.startupWanted != g.startupSaved) g.startupWanted = g.startupSaved;
+                if (g.hotkeyLetters != g.hotkeySaved) {
+                    g.hotkeyLetters = g.hotkeySaved;
+                    if (IsWindowVisible(g.hwnd)) RepaintNow();
                 }
                 DestroyWindow(h);
             } else if (id == IDC_BTN_RESET) {
