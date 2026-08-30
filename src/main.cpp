@@ -829,9 +829,9 @@ static void Refresh() {
         if (sp != std::wstring::npos && (tok == L"d" || tok == L"f")) {
             g.mode = Mode::Everything;
             if (rest.empty()) {
-                AddHint(tok == L"d" ? L"输入关键词搜索文件" : L"输入关键词搜索文件夹");
+                AddHint(tok == L"f" ? L"输入关键词搜索文件" : L"输入关键词搜索文件夹");
             } else {
-                g.evQuery = BuildModifierQuery(tok == L"d" ? L"file:" : L"folder:", rest);
+                g.evQuery = BuildModifierQuery(tok == L"f" ? L"file:" : L"folder:", rest);
                 AddHint(L"正在搜索…");
                 SetTimer(g.hwnd, kTimerDebounce, kDebounceMs, nullptr);
             }
