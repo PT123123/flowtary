@@ -233,6 +233,7 @@ constexpr UINT_PTR kTimerBalloon = 3;
 constexpr int kDebounceMs = 120;
 constexpr int WM_APP_TRAY = WM_APP + 1;
 constexpr int WM_APP_PROGRAMS_READY = WM_APP + 2;  // 工作线程扫描完成，回主线程接管结果
+constexpr int WM_APP_QUIT = WM_APP + 3;  // 新版本接管：通知旧实例退出
 constexpr int IDM_SETTINGS = 2001;
 constexpr int IDM_EXIT = 2002;
 constexpr int IDM_REFRESH = 2003;   // 托盘菜单：刷新应用缓存
@@ -2626,6 +2627,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (g.brDivider) { DeleteObject(g.brDivider); g.brDivider = nullptr; }
             if (g.brMenuBg) { DeleteObject(g.brMenuBg); g.brMenuBg = nullptr; }
             if (g.brEditBg) { DeleteObject(g.brEditBg); g.brEditBg = nullptr; }
+            if (g.brSettingsBg) { DeleteObject(g.brSettingsBg); g.brSettingsBg = nullptr; }
             PostQuitMessage(0);
             return 0;
 
@@ -2753,6 +2755,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (IsWindowVisible(hwnd)) LayoutAndRepaint();
             return 0;
         }
+
+        case WM_APP_QUIT:
+            // 新版本接管：干净退出（WM_DESTROY 会移除托盘、注销热键）
+            DestroyWindow(hwnd);
+            return 0;
 
         case WM_APP_TRAY: {
             UINT ev = (UINT)lParam;
@@ -2992,12 +2999,189 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+// ---------------- 主题化提示弹窗 ----------------
+// 「重复启动」「检测到新版本」等场景使用：与主界面同款圆角 + 主题配色，
+// 不受系统主题影响，也比系统 MessageBox 好看。
+struct NoticeData {
+    std::wstring title;
+    std::wstring body;
+    std::wstring btn;
+};
+constexpr int IDC_NOTICE_OK = 5001;
+constexpr int kNoticeW = 400, kNoticeH = 184;
+
+static LRESULT CALLBACK NoticeProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_CREATE: {
+            const NoticeData* nd = (const NoticeData*)((CREATESTRUCTW*)lp)->lpCreateParams;
+            if (nd) SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)new NoticeData(*nd));
+            ApplyRoundCorners(h);
+            RECT rc;
+            GetClientRect(h, &rc);
+            int bw = S(112), bh = S(32);
+            HWND b = CreateWindowExW(0, L"BUTTON", nd ? nd->btn.c_str() : L"好",
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                     (rc.right - bw) / 2, rc.bottom - S(22) - bh, bw, bh, h,
+                                     (HMENU)(INT_PTR)IDC_NOTICE_OK, g.inst, nullptr);
+            SendMessageW(b, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+            return 0;
+        }
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC hdc = BeginPaint(h, &ps);
+            RECT rc;
+            GetClientRect(h, &rc);
+            const Theme& t = *g.theme;
+            HBRUSH bg = CreateSolidBrush(t.bg);
+            FillRect(hdc, &rc, bg);
+            DeleteObject(bg);
+            RECT accent{0, 0, rc.right, S(3)};  // 顶部一条强调色，呼应主题
+            HBRUSH ab = CreateSolidBrush(t.menuHi);
+            FillRect(hdc, &accent, ab);
+            DeleteObject(ab);
+            NoticeData* nd = (NoticeData*)GetWindowLongPtrW(h, GWLP_USERDATA);
+            if (nd) {
+                SetBkMode(hdc, TRANSPARENT);
+                SelectObject(hdc, g.fontPool[FontSlot(t.fontInput + 2)]);
+                SetTextColor(hdc, t.text);
+                RECT tr{S(22), S(18), rc.right - S(22), S(50)};
+                DrawTextW(hdc, nd->title.c_str(), -1, &tr,
+                          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                SelectObject(hdc, g.fList);
+                SetTextColor(hdc, t.sub);
+                RECT br{S(22), S(52), rc.right - S(22), rc.bottom - S(68)};
+                DrawTextW(hdc, nd->body.c_str(), -1, &br,
+                          DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX);
+            }
+            EndPaint(h, &ps);
+            return 0;
+        }
+        case WM_DRAWITEM: {
+            DRAWITEMSTRUCT* dis = (DRAWITEMSTRUCT*)lp;
+            if (!dis || dis->CtlType != ODT_BUTTON) break;
+            const Theme& t = *g.theme;
+            bool pressed = (dis->itemState & ODS_SELECTED) != 0;
+            HBRUSH bg = CreateSolidBrush(pressed ? t.selBg : t.menuHi);
+            FillRect(dis->hDC, &dis->rcItem, bg);
+            DeleteObject(bg);
+            HBRUSH bf = CreateSolidBrush(t.divider);
+            FrameRect(dis->hDC, &dis->rcItem, bf);
+            DeleteObject(bf);
+            SetBkMode(dis->hDC, TRANSPARENT);
+            SetTextColor(dis->hDC, t.text);
+            SelectObject(dis->hDC, g.fInput);
+            WCHAR text[32]{};
+            GetWindowTextW(dis->hwndItem, text, 32);
+            DrawTextW(dis->hDC, text, -1, &dis->rcItem,
+                      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            return TRUE;
+        }
+        case WM_COMMAND:
+            if (LOWORD(wp) == IDC_NOTICE_OK) DestroyWindow(h);
+            return 0;
+        case WM_KEYDOWN:
+            if (wp == VK_ESCAPE || wp == VK_RETURN) {
+                DestroyWindow(h);
+                return 0;
+            }
+            break;
+        case WM_TIMER:
+            DestroyWindow(h);
+            return 0;
+        case WM_DESTROY: {
+            NoticeData* nd = (NoticeData*)GetWindowLongPtrW(h, GWLP_USERDATA);
+            delete nd;
+            SetWindowLongPtrW(h, GWLP_USERDATA, 0);
+            return 0;
+        }
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+// 显示弹窗并等待其关闭；autoCloseMs > 0 时到点自动关闭
+static void ShowNotice(const std::wstring& title, const std::wstring& body,
+                       const std::wstring& btn, int autoCloseMs = 0) {
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW nc{};
+        nc.cbSize = sizeof(nc);
+        nc.lpfnWndProc = NoticeProc;
+        nc.hInstance = g.inst;
+        nc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        nc.lpszClassName = L"FlowtaryNotice";
+        if (RegisterClassExW(&nc)) registered = true;
+    }
+    if (!g.theme) return;
+    int W = S(kNoticeW), H = S(kNoticeH);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    GetMonitorInfoW(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY), &mi);
+    int x = mi.rcWork.left + ((mi.rcWork.right - mi.rcWork.left) - W) / 2;
+    int y = mi.rcWork.top + ((mi.rcWork.bottom - mi.rcWork.top) - H) / 2;
+    NoticeData nd{title, body, btn};
+    HWND h = CreateWindowExW(WS_EX_TOPMOST | WS_EX_LAYERED, L"FlowtaryNotice", title.c_str(),
+                             WS_POPUP, x, y, W, H, nullptr, nullptr, g.inst, &nd);
+    if (!h) return;
+    BYTE a = (BYTE)(std::max)((int)g.theme->alpha, 240);  // 透明度跟随主题但保证可读
+    SetLayeredWindowAttributes(h, 0, a, LWA_ALPHA);
+    ShowWindow(h, SW_SHOW);
+    SetForegroundWindow(h);
+    SetFocus(h);
+    if (autoCloseMs > 0) SetTimer(h, 1, autoCloseMs, nullptr);
+    MSG msg;
+    while (IsWindow(h) && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (msg.message == WM_QUIT) {
+            PostQuitMessage(0);
+            break;
+        }
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+}
+
+// ---------------- 单实例：区分「同版本重复启动」与「新版本替换启动」 ----------------
+// 版本戳 = 本 exe 路径 + 最后修改时间。运行中的实例把戳写进注册表；
+// 后启动的进程比对：一致 → 同一个构建，属重复启动；不一致 → 新版本，接管。
+struct BuildStamp {
+    std::wstring path;
+    unsigned long long stamp = 0;
+};
+
+static BuildStamp CurrentBuildStamp() {
+    BuildStamp s;
+    WCHAR buf[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    s.path = buf;
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (GetFileAttributesExW(buf, GetFileExInfoStandard, &fad)) {
+        ULARGE_INTEGER ul;
+        ul.LowPart = fad.ftLastWriteTime.dwLowDateTime;
+        ul.HighPart = fad.ftLastWriteTime.dwHighDateTime;
+        s.stamp = (unsigned long long)ul.QuadPart;
+    }
+    return s;
+}
+
+static bool IsSameRunningBuild() {
+    BuildStamp me = CurrentBuildStamp();
+    std::wstring path = LoadRegText(L"RunningPath");
+    unsigned long long stamp = 0;
+    DWORD cb = sizeof(stamp);
+    RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"RunningStamp", RRF_RT_REG_QWORD,
+                 nullptr, &stamp, &cb);
+    return !path.empty() && path == me.path && stamp != 0 && stamp == me.stamp;
+}
+
+static void RecordRunningBuild() {
+    BuildStamp me = CurrentBuildStamp();
+    SaveRegText(L"RunningPath", me.path);
+    unsigned long long stamp = me.stamp;
+    RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"RunningStamp", REG_QWORD,
+                    &stamp, sizeof(stamp));
+}
+
 // ---------------- 入口 ----------------
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
-    // 单实例
-    HANDLE mtx = CreateMutexW(nullptr, TRUE, L"Local\\Flowtary.Singleton");
-    if (mtx && GetLastError() == ERROR_ALREADY_EXISTS) return 0;
-
     // DPI 感知
     typedef BOOL(WINAPI * SetCtxFn)(HANDLE);
     SetCtxFn setCtx = (SetCtxFn)GetProcAddress(GetModuleHandleW(L"user32.dll"),
@@ -3006,8 +3190,28 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     g.inst = hInst;
     LoadSettings();  // 先加载设置：确定主题/快捷键
     UpdateScale(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY));  // 建字体池（比例 = max(DPI, 物理高/1080)）
+    ApplyTheme(false);  // 建立主题字体与画刷：此时还没有窗口，只为弹窗准备绘制资源
 
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+
+    // 单实例：区分「同版本重复启动」与「新版本替换启动」
+    // （放在主题/字体初始化之后，这样弹窗才能用上主题配色与字体）
+    HANDLE mtx = CreateMutexW(nullptr, TRUE, L"Local\\Flowtary.Singleton");
+    if (mtx && GetLastError() == ERROR_ALREADY_EXISTS) {
+        if (IsSameRunningBuild()) {
+            ShowNotice(L"Flowtary 已在运行",
+                       L"程序已经在后台运行了。\r\n在任务栏托盘找到 Flowtary，左键单击即可唤出。",
+                       L"知道了");
+            return 0;
+        }
+        // 新版本：提示后结束旧实例，由本进程接管继续启动
+        ShowNotice(L"检测到新版本", L"正在关闭旧版本并启动新版本…", L"好", 1500);
+        if (HWND oldWnd = FindWindowW(L"FlowtaryLauncher", L"Flowtary"))
+            PostMessageW(oldWnd, WM_APP_QUIT, 0, 0);
+        WaitForSingleObject(mtx, 5000);  // 等旧实例退出并接管互斥体
+    }
+    RecordRunningBuild();
+
     LoadWebRules();
     LoadGroupRules();
     EnableDarkMenus();  // 按主题深浅强制弹出菜单（托盘/右键） 绘制
