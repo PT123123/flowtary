@@ -163,11 +163,11 @@ struct App {
     float scale = 1.0f;          // 全局比例：max(DPI, 屏幕物理高度/1080)，不写死像素
     bool centerWake = true;    // 唤醒位置：true=屏幕居中，false=跟随鼠标
     bool dwmBorderOk = false;  // DWM 描边可用（否则 Paint 回退 GDI 描边）
-    bool hotkeyLetters = true; // Alt+字母快捷打开结果项
+    bool hotkeyNum = true;     // Alt+数字快捷打开结果项（1=列表最高优先级结果，设置可关）
     bool startupWanted = false;// 设置窗“开机自动启动”勾选状态（自绘复选框用变量驱动，
                                // 因为 BS_OWNERDRAW 按钮的 Button_GetCheck/SetCheck 不生效）
     bool startupSaved = false; // 设置窗打开时的初始值（取消时回退）
-    bool hotkeySaved = false;  // 同上，Alt+字母
+    bool hotkeySaved = false;  // 同上，Alt+数字
     int themeIdx = 0;          // 当前主题索引（设置窗切换后、保存前为暂存值）
     int themeSaved = 0;        // 设置窗打开时的初始主题（取消时回退）
     const Theme* theme = nullptr;
@@ -214,8 +214,8 @@ constexpr int IDM_OPEN = 2011;      // 结果右键菜单：打开
 constexpr int IDM_OPENLOC = 2012;   // 结果右键菜单：打开所在文件夹
 constexpr int IDM_COPYPATH = 2013;  // 结果右键菜单：复制路径
 
-// Alt+字母快捷打开顺序：QWERTY 中排常用键优先，向周边递减（列表最多 10 行）
-static const WCHAR* kHotkeyOrder = L"asdfghjklzxcvbnmqwertyuiop";
+// Alt+数字快捷打开顺序：按结果优先级自上而下分配 1..9,0（列表最多 10 行，1=最高优先级）
+static const WCHAR* kHotkeyOrder = L"1234567890";
 
 // 前置声明（后文定义，ApplyTheme 需要）
 static void EnableDarkMenus();
@@ -224,7 +224,7 @@ static void RepaintNow();
 static void GenerateStars();
 static BOOL CALLBACK RefreshChildFont(HWND child, LPARAM lp);
 
-// 行 → 可触发序号（Hint 行不算）：返回第几个可执行项（用于分配字母），-1=不可触发
+// 行 → 可触发序号（Hint 行不算）：返回第几个可执行项（用于分配数字徽章），-1=不可触发
 static int HotkeySeq(int itemIdx) {
     if (itemIdx < 0 || itemIdx >= (int)g.items.size()) return -1;
     if (g.items[itemIdx].kind == Row::Hint) return -1;
@@ -233,7 +233,7 @@ static int HotkeySeq(int itemIdx) {
         if (g.items[i].kind != Row::Hint) ++n;
     return n;
 }
-static WCHAR HotkeyChar(int itemIdx) {
+static WCHAR HotkeyDigit(int itemIdx) {
     int seq = HotkeySeq(itemIdx);
     return (seq >= 0 && seq < (int)wcslen(kHotkeyOrder)) ? kHotkeyOrder[seq] : 0;
 }
@@ -1156,7 +1156,7 @@ static void SetStartup(bool on) {
 
 static void LoadSettings() {
     g.centerWake = true;
-    g.hotkeyLetters = true;
+    g.hotkeyNum = true;
     DWORD v = 1, cb = sizeof(v);
     if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"CenterWake",
                      RRF_RT_REG_DWORD, nullptr, &v, &cb) == ERROR_SUCCESS)
@@ -1164,7 +1164,7 @@ static void LoadSettings() {
     if (cb >= sizeof(DWORD) && RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary",
                                             L"HotkeyLetters", RRF_RT_REG_DWORD, nullptr, &v,
                                             &cb) == ERROR_SUCCESS)
-        g.hotkeyLetters = v != 0;
+        g.hotkeyNum = v != 0;
     v = (DWORD)g.themeIdx;
     cb = sizeof(v);
     if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"Theme", RRF_RT_REG_DWORD,
@@ -1322,9 +1322,9 @@ static void Paint(HDC hdc) {
         }
         x += S(16) + S(8);
 
-        // Alt+字母徽章（右侧小方框）
+        // Alt+数字徽章（右侧小方框）
         int hkReserved = 0;
-        WCHAR hk = g.hotkeyLetters ? HotkeyChar(i) : 0;
+        WCHAR hk = g.hotkeyNum ? HotkeyDigit(i) : 0;
         if (hk) {
             int bw = S(20), bh = S(20);
             RECT br{W - pad - bw, y + (rowH - bh) / 2, W - pad, y + (rowH - bh) / 2 + bh};
@@ -1417,17 +1417,17 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             int contentW = S(412);  // 460 - 24*2，所有控件宽度由此推导，不写死像素
 
             // 自绘复选框：按钮实际为 BS_OWNERDRAW（BS_AUTOCHECKBOX 与之位或后会被吸收），
-            // 其 Button_GetCheck/SetCheck 不生效，勾选状态一律由 g.startupWanted / g.hotkeyLetters 驱动。
+            // 其 Button_GetCheck/SetCheck 不生效，勾选状态一律由 g.startupWanted / g.hotkeyNum 驱动。
             g.startupWanted = GetStartupEnabled();
             g.startupSaved = g.startupWanted;
-            g.hotkeySaved = g.hotkeyLetters;
+            g.hotkeySaved = g.hotkeyNum;
             HWND c = CreateWindowExW(0, L"BUTTON", L"开机自动启动",
                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                                      margin, S(20), contentW, S(24), h,
                                      (HMENU)(INT_PTR)IDC_CHK_START, g.inst, nullptr);
             SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
 
-            c = CreateWindowExW(0, L"BUTTON", L"Alt+字母快捷打开",
+            c = CreateWindowExW(0, L"BUTTON", L"Alt+数字快捷打开",
                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                                 margin, S(44), contentW, S(24), h,
                                 (HMENU)(INT_PTR)IDC_CHK_HOTKEY, g.inst, nullptr);
@@ -1570,14 +1570,14 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     HBRUSH fb2 = CreateSolidBrush(t.divider);
                     FrameRect(dis->hDC, &box, fb2);
                     DeleteObject(fb2);
-                    bool checked = (id == IDC_CHK_START) ? g.startupWanted : g.hotkeyLetters;
+                    bool checked = (id == IDC_CHK_START) ? g.startupWanted : g.hotkeyNum;
                     if (checked)
                         DrawCheckGlyph(dis->hDC, box, t.text);
                     SetBkMode(dis->hDC, TRANSPARENT);
                     SetTextColor(dis->hDC, t.text);
                     SelectObject(dis->hDC, g.fInput);
                     const WCHAR* label = (id == IDC_CHK_START) ? L"开机自动启动"
-                                                               : L"Alt+字母快捷打开";
+                                                               : L"Alt+数字快捷打开";
                     RECT tr = dis->rcItem;
                     tr.left = box.right + S(10);
                     DrawTextW(dis->hDC, label, -1, &tr,
@@ -1661,8 +1661,8 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 DWORD v = g.centerWake ? 1 : 0;
                 RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"CenterWake",
                                 REG_DWORD, &v, sizeof(v));
-                // g.hotkeyLetters / g.startupWanted 已在点击时实时更新，直接持久化即可
-                DWORD vk = g.hotkeyLetters ? 1 : 0;
+                // g.hotkeyNum / g.startupWanted 已在点击时实时更新，直接持久化即可
+                DWORD vk = g.hotkeyNum ? 1 : 0;
                 RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"HotkeyLetters",
                                 REG_DWORD, &vk, sizeof(vk));
                 DWORD vt = (DWORD)g.themeIdx;
@@ -1680,7 +1680,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 g.startupWanted = !g.startupWanted;
                 InvalidateRect(GetDlgItem(h, IDC_CHK_START), nullptr, TRUE);
             } else if (id == IDC_CHK_HOTKEY && HIWORD(wp) == BN_CLICKED) {
-                g.hotkeyLetters = !g.hotkeyLetters;
+                g.hotkeyNum = !g.hotkeyNum;
                 InvalidateRect(GetDlgItem(h, IDC_CHK_HOTKEY), nullptr, TRUE);
                 if (IsWindowVisible(g.hwnd)) RepaintNow();
              } else if (id == IDC_CMB_WAKE && HIWORD(wp) == BN_CLICKED) {
@@ -1731,8 +1731,8 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     ApplyTheme();
                 }
                 if (g.startupWanted != g.startupSaved) g.startupWanted = g.startupSaved;
-                if (g.hotkeyLetters != g.hotkeySaved) {
-                    g.hotkeyLetters = g.hotkeySaved;
+                if (g.hotkeyNum != g.hotkeySaved) {
+                    g.hotkeyNum = g.hotkeySaved;
                     if (IsWindowVisible(g.hwnd)) RepaintNow();
                 }
                 DestroyWindow(h);
@@ -1939,15 +1939,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_KEYDOWN: {
             bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
             bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
-            // Alt+字母：直接执行对应快捷键徽章的结果行（可在设置关闭）
-            if (alt && g.hotkeyLetters && !ctrl) {
-                WCHAR k = (WCHAR)wParam;
-                if (k >= 'A' && k <= 'Z') k = (WCHAR)(k - 'A' + 'a');
-                for (int i = 0; i < (int)g.items.size(); ++i) {
-                    if (HotkeyChar(i) == k) {
-                        g.sel = i;
-                        ExecuteSelected();
-                        return 0;
+            // Alt+数字：直接执行对应快捷键徽章的结果行（最高优先级，先于其它按键处理；可在设置关闭）
+            if (alt && g.hotkeyNum && !ctrl) {
+                WCHAR k = 0;
+                if (wParam >= '0' && wParam <= '9') k = (WCHAR)wParam;
+                else if (wParam >= VK_NUMPAD0 && wParam <= VK_NUMPAD9)
+                    k = (WCHAR)('0' + (wParam - VK_NUMPAD0));
+                if (k) {
+                    for (int i = 0; i < (int)g.items.size(); ++i) {
+                        if (HotkeyDigit(i) == k) {
+                            g.sel = i;
+                            ExecuteSelected();
+                            return 0;
+                        }
                     }
                 }
             }
