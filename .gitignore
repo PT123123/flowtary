@@ -1,0 +1,6 @@
+# Flowtary 构建产物
+build/
+*.obj
+*.exe
+*.pdb
+*.ilk
