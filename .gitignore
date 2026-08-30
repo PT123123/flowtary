@@ -1,5 +1,6 @@
 # Flowtary 构建产物
 build/
+dist/          # release.bat 的发布输出目录
 *.obj
 *.exe
 *.pdb
