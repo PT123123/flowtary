@@ -1844,9 +1844,12 @@ struct CtlGeom {
     bool anchorBottom = false;  // Y 从底边算起
     bool centerRow = false;     // 底部按钮行，整体居中
     int centerIdx = 0;          // 在按钮行中的序号
+    int growSlot = 0;           // 1=高度加 d1，2=高度加 d2（一键页两个编辑器分摊多余高度）
+    int shiftSlot = 0;          // 1=Y 下移 d1，2=Y 下移 d1+d2
 };
 static std::vector<CtlGeom> sCtl;
-static int sSettingsMargin = 0;  // 内容区左边距（像素，= S(156)）
+static int sSettingsMargin = 0;    // 内容区左边距（像素，= S(156)）
+static int sRecordedClientH = 0;   // 记录几何时的客户区高度（用于计算纵向余量）
 
 static void ApplyLayoutRule(int id, CtlGeom& cg) {
     switch (id) {
@@ -1854,11 +1857,24 @@ static void ApplyLayoutRule(int id, CtlGeom& cg) {
             cg.stretchW = true;
             cg.stretchH = true;
             break;
-        case IDC_EDT_LAUNCH:
-        case IDC_EDT_KILL:
+        case IDC_EDT_LAUNCH:  // 一键页：启动组编辑器吃掉一半纵向余量
+            cg.stretchW = true;
+            cg.growSlot = 1;
+            break;
+        case IDC_LBL_KILL:  // 关闭组标题随之上半段一起下移
+            cg.stretchW = true;
+            cg.shiftSlot = 1;
+            break;
+        case IDC_EDT_KILL:  // 关闭组编辑器吃掉另一半
+            cg.stretchW = true;
+            cg.growSlot = 2;
+            cg.shiftSlot = 1;
+            break;
+        case IDC_LBL_GROUPHINT:  // 说明文字紧跟编辑器下方（不贴底，避免拉高后出现空档）
+            cg.stretchW = true;
+            cg.shiftSlot = 2;
+            break;
         case IDC_LBL_RULES:
-        case IDC_LBL_LAUNCH:
-        case IDC_LBL_KILL:
         case IDC_CHK_START:
         case IDC_CHK_BEAUTIFY:
         case IDC_CHK_GLASS:
@@ -1868,8 +1884,7 @@ static void ApplyLayoutRule(int id, CtlGeom& cg) {
             cg.stretchW = true;  // 内容区控件：宽度跟随
             break;
         case IDC_LBL_RULEHINT:
-        case IDC_LBL_GROUPHINT:
-            cg.stretchW = true;  // 说明文字：跟随宽度并贴底
+            cg.stretchW = true;  // 网页规则说明：跟随宽度并贴底
             cg.anchorBottom = true;
             break;
         case IDC_BTN_RESET:
@@ -1889,6 +1904,7 @@ static void RecordSettingsLayout(HWND h) {
     sCtl.clear();
     RECT crc;
     GetClientRect(h, &crc);
+    sRecordedClientH = crc.bottom;
     for (HWND w = GetWindow(h, GW_CHILD); w; w = GetWindow(w, GW_HWNDNEXT)) {
         int id = GetDlgCtrlID(w);
         if (id == 0) continue;  // 0 = 无 ID（分隔线之类的占位）
@@ -1917,15 +1933,24 @@ static void LayoutSettings(HWND h) {
     for (auto& c : sCtl)
         if (c.centerRow) rowW += c.w;
     int contentW = crc.right - sSettingsMargin - S(24);
+    // 纵向余量由一键页两个编辑器对半分摊（可为负：窗口缩小时同步收拢）
+    int extra = crc.bottom - sRecordedClientH;
+    int d1 = extra / 2, d2 = extra - d1;
     for (auto& cg : sCtl) {
         HWND w = GetDlgItem(h, cg.id);
         if (!w) continue;
         int x = cg.x;
         if (cg.centerRow)
             x = sSettingsMargin + (contentW - rowW) / 2 + cg.centerIdx * (cg.w + gap);
-        int y = cg.anchorBottom ? (crc.bottom - cg.gapPx - cg.h) : cg.y;
+        int y = cg.y;
+        if (cg.anchorBottom) y = crc.bottom - cg.gapPx - cg.h;
+        else if (cg.shiftSlot == 1) y += d1;
+        else if (cg.shiftSlot == 2) y += d1 + d2;
         int wd = cg.stretchW ? (crc.right - S(24) - x) : cg.w;
-        int ht = cg.stretchH ? (crc.bottom - cg.gapPx - y) : cg.h;
+        int ht = cg.h;
+        if (cg.stretchH) ht = crc.bottom - cg.gapPx - y;
+        else if (cg.growSlot == 1) ht += d1;
+        else if (cg.growSlot == 2) ht += d2;
         if (wd < 0) wd = 0;
         if (ht < 0) ht = 0;
         SetWindowPos(w, nullptr, x, y, wd, ht, SWP_NOZORDER);
@@ -2075,30 +2100,30 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             c = CreateWindowExW(0, L"EDIT", nullptr,
                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_MULTILINE |
                                     ES_AUTOVSCROLL | WS_VSCROLL,
-                                margin, S(46), contentW, S(140), h,
+                                margin, S(46), contentW, S(132), h,
                                 (HMENU)(INT_PTR)IDC_EDT_LAUNCH, g.inst, nullptr);
             SendMessageW(c, WM_SETFONT, (WPARAM)g.fList, TRUE);
             SetWindowTextW(c, GroupsToText(g.groupsLaunch).c_str());
             SetWindowTheme(c, L"DarkMode_Explorer", nullptr);
 
             c = CreateWindowExW(0, L"STATIC", L"关闭组（关键字 → 进程）：",
-                                WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE, margin, S(194),
+                                WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE, margin, S(186),
                                 contentW, S(24), h, (HMENU)(INT_PTR)IDC_LBL_KILL, g.inst,
                                 nullptr);
             SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
             c = CreateWindowExW(0, L"EDIT", nullptr,
                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_MULTILINE |
                                     ES_AUTOVSCROLL | WS_VSCROLL,
-                                margin, S(220), contentW, S(110), h,
+                                margin, S(212), contentW, S(104), h,
                                 (HMENU)(INT_PTR)IDC_EDT_KILL, g.inst, nullptr);
             SendMessageW(c, WM_SETFONT, (WPARAM)g.fList, TRUE);
             SetWindowTextW(c, GroupsToText(g.groupsKill).c_str());
             SetWindowTheme(c, L"DarkMode_Explorer", nullptr);
 
             c = CreateWindowExW(0, L"STATIC",
-                                L"每行：关键字 + 空格 + 目标（多个用 ; 分隔）。启动组填"
-                                L"文件全路径，关闭组填进程名（可省 .exe）；# 开头为注释",
-                                WS_CHILD | WS_VISIBLE, margin, S(338), contentW, S(30), h,
+                                L"每行：关键字 + 空格 + 目标（多个用 ; 分隔）；# 开头为注释。"
+                                L"启动组填文件全路径，关闭组填进程名（可省 .exe）",
+                                WS_CHILD | WS_VISIBLE, margin, S(324), contentW, S(36), h,
                                 (HMENU)(INT_PTR)IDC_LBL_GROUPHINT, g.inst, nullptr);
             SendMessageW(c, WM_SETFONT, (WPARAM)g.fList, TRUE);
 
