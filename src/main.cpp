@@ -173,6 +173,8 @@ struct App {
     int themeSaved = 0;        // 设置窗打开时的初始主题（取消时回退）
     bool beautify = true;      // 界面美化：暗色标题栏 + 圆角窗口 + 强制暗色菜单（默认开）
     bool beautifySaved = true; // 设置窗打开时的初始值（取消时回退）
+    bool glass = true;         // 毛玻璃（亚克力）背景，仅在 beautify 开启时生效（默认开）
+    bool glassSaved = true;    // 设置窗打开时的初始值（取消时回退）
     const Theme* theme = nullptr;
     std::vector<Star> stars;   // 星空主题星点坐标
 
@@ -201,6 +203,7 @@ struct App {
 
     NOTIFYICONDATAW nid{};     // 托盘图标
     HICON hTrayIcon = nullptr;
+    HICON hAppIcon = nullptr;  // 窗口图标（与托盘同款，字体绘制，不依赖 .ico 资源）
     HWND hSettings = nullptr;  // 设置窗口
     UINT msgTaskbarCreated = 0;
 } g;
@@ -228,6 +231,8 @@ static const WCHAR* kHotkeyLetterOrder = L"ABCDEFGHIJ";
 
 // 前置声明（后文定义，ApplyTheme 需要）
 static void EnableDarkMenus();
+static void ApplyGlass();
+static BYTE EffectiveAlpha(BYTE a);
 static void Layout();
 static void RepaintNow();
 static void GenerateStars();
@@ -318,16 +323,18 @@ static void ApplyTheme(bool repaint = true) {
     g.fInput = g.fontPool[FontSlot(t.fontInput)];
     g.fList = g.fontPool[FontSlot(t.fontList)];
     if (g.hwnd) {
-        SetLayeredWindowAttributes(g.hwnd, 0, t.alpha, LWA_ALPHA);
+        SetLayeredWindowAttributes(g.hwnd, 0, EffectiveAlpha(t.alpha), LWA_ALPHA);
         if (g.brDivider) { DeleteObject(g.brDivider); g.brDivider = nullptr; }
         g.brDivider = CreateSolidBrush(t.divider);
     }
-    if (g.hSettings) SetLayeredWindowAttributes(g.hSettings, 0, t.alpha, LWA_ALPHA);
+    if (g.hSettings) SetLayeredWindowAttributes(g.hSettings, 0, EffectiveAlpha(t.alpha),
+                                                LWA_ALPHA);
     if (g.brMenuBg) { DeleteObject(g.brMenuBg); g.brMenuBg = nullptr; }
     g.brMenuBg = CreateSolidBrush(t.menuBg);
     if (g.brEditBg) { DeleteObject(g.brEditBg); g.brEditBg = nullptr; }
     g.brEditBg = CreateSolidBrush(t.editBg);
     EnableDarkMenus();
+    ApplyGlass();  // 毛玻璃背景随美化开关/玻璃开关与主题底色刷新
     if (t.stars) GenerateStars();
     if (g.hSettings && repaint) {
         EnumChildWindows(g.hSettings, RefreshChildFont, 0);
@@ -1095,36 +1102,125 @@ static void ApplyRoundCorners(HWND h) {
         g.dwmBorderOk = true;
 }
 
-static HICON MakeTrayIcon() {
-    int s = GetSystemMetrics(SM_CXSMICON);
-    if (s < 8) s = 16;
+// ---------------- 毛玻璃（亚克力）背景 ----------------
+// 优先用文档化属性 DWMWA_SYSTEMBACKDROP_TYPE(38)：3=TransientWindow(亚克力)、1=None(关闭)；
+// 旧系统回退未公开的 SetWindowCompositionAttribute + ACCENT_ENABLE_ACRYLICBLURBEHIND(4)。
+// 两者都不可用时静默跳过，不影响其它功能。
+struct AccentPolicy {
+    int AccentState;
+    int AccentFlags;
+    int GradientColor;
+    int AnimationId;
+};
+struct WinCompAttrData {
+    int Attribute;
+    void* Data;
+    ULONG SizeOfData;
+};
+typedef BOOL(WINAPI* SetWindowCompositionAttributeFn)(HWND, WinCompAttrData*);
+
+static void ApplyGlassTo(HWND h) {
+    if (!h) return;
+    const bool on = g.beautify && g.glass;
+    DWORD backdrop = on ? 3 : 1;  // 3=TransientWindow(亚克力) / 1=None
+    DwmSetWindowAttribute(h, 38 /*DWMWA_SYSTEMBACKDROP_TYPE*/, &backdrop, sizeof(backdrop));
+    // 同步未公开接口：旧系统靠它生效；关闭时也能把残留的亚克力清干净
+    HMODULE u = GetModuleHandleW(L"user32.dll");
+    if (!u) return;
+    auto fn = (SetWindowCompositionAttributeFn)GetProcAddress(u, "SetWindowCompositionAttribute");
+    if (!fn) return;
+    AccentPolicy ap{};
+    if (on) {
+        ap.AccentState = 4;  // ACCENT_ENABLE_ACRYLICBLURBEHIND
+        ap.AccentFlags = 2;  // 作用到整个窗口（含客户区）
+        COLORREF bc = g.theme ? g.theme->bg : RGB(0, 0, 0);
+        // ABGR：高 8 位 = 雾面浓度（越小越通透），低 24 位 = 主题底色（BGR 顺序）
+        ap.GradientColor =
+            (0x99 << 24) | (GetBValue(bc) << 16) | (GetGValue(bc) << 8) | GetRValue(bc);
+    } else {
+        ap.AccentState = 0;  // ACCENT_DISABLED
+    }
+    WinCompAttrData d{19 /*WCA_ACCENT_POLICY*/, &ap, sizeof(ap)};
+    fn(h, &d);
+}
+
+static void ApplyGlass() {
+    ApplyGlassTo(g.hwnd);
+    ApplyGlassTo(g.hSettings);
+}
+
+// 毛玻璃开启时略微降低窗口不透明度，让背后的亚克力模糊透出来；
+// 本程序窗口是「分层窗口 + 统一透明度」，玻璃的可见程度取决于主题自身的 alpha。
+static BYTE EffectiveAlpha(BYTE a) {
+    if (g.beautify && g.glass) return (BYTE)(std::min)((int)a, 232);
+    return a;
+}
+
+// 图标一律用系统自带字体现场绘制：优先 Segoe MDL2 Assets / Segoe Fluent Icons 的
+// 放大镜字形（U+E721），图标字体缺失时回退 Segoe UI 粗体字母「F」。
+// 不引入任何 .ico 资源，零额外图标开销。
+static HICON MakeFontIcon(int size) {
+    if (size < 8) size = 16;
     HDC sdc = GetDC(nullptr);
-    HBITMAP color = CreateCompatibleBitmap(sdc, s, s);
-    HBITMAP mask = CreateBitmap(s, s, 1, 1, nullptr);
+    HBITMAP color = CreateCompatibleBitmap(sdc, size, size);
+    HBITMAP mask = CreateBitmap(size, size, 1, 1, nullptr);
     HDC dc = CreateCompatibleDC(sdc);
 
-    // 颜色位图：黑色圆底 + 白色圆点
+    // 颜色位图：黑色圆底
     HGDIOBJ oldBmp = SelectObject(dc, color);
     HGDIOBJ oldPen = SelectObject(dc, GetStockObject(NULL_PEN));
     HBRUSH black = CreateSolidBrush(RGB(0, 0, 0));
     HGDIOBJ oldBr = SelectObject(dc, black);
-    Ellipse(dc, 0, 0, s, s);
-    HBRUSH white = CreateSolidBrush(RGB(255, 255, 255));
-    SelectObject(dc, white);
-    int m = s * 28 / 100;
-    Ellipse(dc, m, m, s - m, s - m);
+    Ellipse(dc, 0, 0, size, size);
     SelectObject(dc, oldBr);
+    DeleteObject(black);
+
+    // 白色字形：用 GetGlyphIndices 探测码位是否真实存在，避免字体缺失画成方框
+    const WCHAR* kGlyph = L"\xE721";  // 放大镜（Search）
+    const WCHAR* kFams[] = {L"Segoe MDL2 Assets", L"Segoe Fluent Icons", L"Segoe UI Symbol"};
+    int fh = -(size * 58 / 100);
+    HFONT f = nullptr;
+    bool useGlyph = false;
+    for (const WCHAR* fam : kFams) {
+        HFONT cand = CreateFontW(fh, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                 OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+                                 DEFAULT_PITCH | FF_DONTCARE, fam);
+        if (!cand) continue;
+        HGDIOBJ oldF = SelectObject(dc, cand);
+        WORD gi = 0;
+        DWORD gr = GetGlyphIndicesW(dc, kGlyph, 1, &gi, GGI_MARK_NONEXISTING_GLYPHS);
+        SelectObject(dc, oldF);
+        if (gr != GDI_ERROR && gi != 0xFFFF) {
+            f = cand;
+            useGlyph = true;
+            break;
+        }
+        DeleteObject(cand);
+    }
+    if (!f) {  // 图标字体不可用：回退字母 F
+        f = CreateFontW(fh, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+                        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    }
+    if (f) {
+        HGDIOBJ oldF = SelectObject(dc, f);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(255, 255, 255));
+        RECT r{0, 0, size, size};
+        DrawTextW(dc, useGlyph ? kGlyph : L"F", -1, &r,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(dc, oldF);
+        DeleteObject(f);
+    }
     SelectObject(dc, oldPen);
     SelectObject(dc, oldBmp);
-    DeleteObject(black);
-    DeleteObject(white);
 
     // 掩码：单色位图，白=透明、黑=不透明 → 圆外透明
     oldBmp = SelectObject(dc, mask);
     oldPen = SelectObject(dc, GetStockObject(NULL_PEN));
     oldBr = SelectObject(dc, GetStockObject(BLACK_BRUSH));
-    PatBlt(dc, 0, 0, s, s, WHITENESS);
-    Ellipse(dc, 0, 0, s, s);
+    PatBlt(dc, 0, 0, size, size, WHITENESS);
+    Ellipse(dc, 0, 0, size, size);
     SelectObject(dc, oldBr);
     SelectObject(dc, oldPen);
     SelectObject(dc, oldBmp);
@@ -1143,7 +1239,7 @@ static HICON MakeTrayIcon() {
 
 static void TrayAdd() {
     if (!g.hwnd) return;
-    if (!g.hTrayIcon) g.hTrayIcon = MakeTrayIcon();
+    if (!g.hTrayIcon) g.hTrayIcon = MakeFontIcon(GetSystemMetrics(SM_CXSMICON));
     if (!g.hTrayIcon) return; // Guard against icon creation failure
     ZeroMemory(&g.nid, sizeof(g.nid));
     g.nid.cbSize = sizeof(g.nid);
@@ -1183,6 +1279,10 @@ static void TrayRemove() {
     if (g.hTrayIcon) {
         DestroyIcon(g.hTrayIcon);
         g.hTrayIcon = nullptr;
+    }
+    if (g.hAppIcon) {
+        DestroyIcon(g.hAppIcon);
+        g.hAppIcon = nullptr;
     }
     ZeroMemory(&g.nid, sizeof(g.nid)); // Clear structure for safety
 }
@@ -1242,6 +1342,12 @@ static void LoadSettings() {
         g.beautify = v != 0;
     else
         g.beautify = true;  // 默认开
+    cb = sizeof(v);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"Glass", RRF_RT_REG_DWORD,
+                     nullptr, &v, &cb) == ERROR_SUCCESS)
+        g.glass = v != 0;
+    else
+        g.glass = true;  // 默认开
 }
 
 // ---------------- 网页规则解析与持久化 ----------------
@@ -1460,6 +1566,7 @@ constexpr int IDC_TAB_GENERAL = 3014;
 constexpr int IDC_TAB_WEB = 3015;
 constexpr int IDC_TAB_THEME = 3016;
 constexpr int IDC_CHK_BEAUTIFY = 3017;  // 主题页：界面美化开关
+constexpr int IDC_CHK_GLASS = 3018;     // 主题页：毛玻璃背景开关
 constexpr int IDC_LBL_THEME = 3011;
 constexpr int IDC_CMB_THEME = 3012;
 constexpr int IDM_THEME_BASE = 4200;  // 主题下拉菜单指令基值
@@ -1485,6 +1592,7 @@ static void ShowSettingsTab(HWND h, int tab) {
     vis(IDC_BTN_RESET, web);
     bool theme = (tab == 2);
     vis(IDC_CHK_BEAUTIFY, theme);
+    vis(IDC_CHK_GLASS, theme);
     vis(IDC_LBL_THEME, theme);
     vis(IDC_CMB_THEME, theme);
     // 保存/取消始终显示；Y 随 Tab 变化（主题页控件少，按钮上移避免留白）
@@ -1523,6 +1631,7 @@ static void ApplyBeautify() {
         DwmSetWindowAttribute(g.hSettings, DWMWA_WINDOW_CORNER_PREFERENCE, &pref, sizeof(pref));
     }
     EnableDarkMenus();  // 菜单深浅随美化开关与主题
+    ApplyGlass();       // 毛玻璃随美化开关一起开关
 }
 
 static void DrawCheckGlyph(HDC hdc, const RECT& r, COLORREF color) {
@@ -1599,13 +1708,13 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
 
             c = CreateWindowExW(0, L"STATIC", L"主题样式：",
-                                WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE, margin, S(60), S(90),
+                                WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE, margin, S(92), S(90),
                                 S(28), h, (HMENU)(INT_PTR)IDC_LBL_THEME, g.inst, nullptr);
             SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
 
             c = CreateWindowExW(0, L"BUTTON", nullptr,
                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-                                margin + S(90), S(62), contentW - S(90), S(28), h,
+                                margin + S(90), S(94), contentW - S(90), S(28), h,
                                 (HMENU)(INT_PTR)IDC_CMB_THEME, g.inst, nullptr);
             SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
 
@@ -1615,6 +1724,13 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                                 margin, S(20), contentW, S(24), h,
                                 (HMENU)(INT_PTR)IDC_CHK_BEAUTIFY, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+
+            // 毛玻璃背景开关（仅在界面美化开启时可勾选）
+            c = CreateWindowExW(0, L"BUTTON", L"毛玻璃背景（亚克力模糊）",
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                margin, S(52), contentW, S(24), h,
+                                (HMENU)(INT_PTR)IDC_CHK_GLASS, g.inst, nullptr);
             SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
 
             c = CreateWindowExW(0, L"STATIC", L"网页搜索规则：",
@@ -1737,7 +1853,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (dis->CtlType == ODT_BUTTON) {
                 int id = (int)dis->CtlID;
                 const Theme& t = *g.theme;
-                if (id == IDC_CHK_START || id == IDC_CHK_BEAUTIFY) {
+                if (id == IDC_CHK_START || id == IDC_CHK_BEAUTIFY || id == IDC_CHK_GLASS) {
                     // 复选框：自绘方框 + 对勾 + 文字
                     FillRect(dis->hDC, &dis->rcItem, g.brMenuBg);
                     RECT box = dis->rcItem;
@@ -1750,11 +1866,13 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     HBRUSH fb2 = CreateSolidBrush(t.divider);
                     FrameRect(dis->hDC, &box, fb2);
                     DeleteObject(fb2);
-                    bool checked = (id == IDC_CHK_START) ? g.startupWanted : g.beautify;
+                    bool checked = (id == IDC_CHK_START) ? g.startupWanted
+                                 : (id == IDC_CHK_BEAUTIFY ? g.beautify : g.glass);
                     if (checked)
                         DrawCheckGlyph(dis->hDC, box, t.text);
                     SetBkMode(dis->hDC, TRANSPARENT);
-                    SetTextColor(dis->hDC, t.text);
+                    // 毛玻璃依附于界面美化：美化关闭时整项置灰
+                    SetTextColor(dis->hDC, (id == IDC_CHK_GLASS && !g.beautify) ? t.sub : t.text);
                     SelectObject(dis->hDC, g.fInput);
                     WCHAR label[128]{};
                     GetWindowTextW(dis->hwndItem, label, 128);
@@ -1881,6 +1999,9 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 DWORD vb = g.beautify ? 1 : 0;
                 RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"Beautify",
                                 REG_DWORD, &vb, sizeof(vb));
+                DWORD vg = g.glass ? 1 : 0;
+                RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"Glass",
+                                REG_DWORD, &vg, sizeof(vg));
                 SetStartup(g.startupWanted);
                 int len = GetWindowTextLengthW(GetDlgItem(h, IDC_EDT_RULES));
                 std::wstring rulesText(len + 1, 0);
@@ -1897,6 +2018,12 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 ApplyBeautify();  // 即时预览：标题栏 / 圆角 / 菜单深浅立即切换
                 InvalidateRect(GetDlgItem(h, IDC_CHK_BEAUTIFY), nullptr, TRUE);
                 InvalidateRect(GetDlgItem(h, IDC_CMB_THEME), nullptr, TRUE);  // 同步置灰/恢复
+                InvalidateRect(GetDlgItem(h, IDC_CHK_GLASS), nullptr, TRUE);
+            } else if (id == IDC_CHK_GLASS && HIWORD(wp) == BN_CLICKED) {
+                if (!g.beautify) return 0;  // 美化关闭时毛玻璃不可切换
+                g.glass = !g.glass;
+                ApplyTheme();  // 内部会调 ApplyGlass，并重算窗口透明度让模糊透出来
+                InvalidateRect(GetDlgItem(h, IDC_CHK_GLASS), nullptr, TRUE);
             } else if (id == IDC_CMB_HOTKEY && HIWORD(wp) == BN_CLICKED) {
                 // 结果项快捷键方案下拉：列 数字/字母/关闭，当前项打勾；选择后即时预览
                 HMENU m = CreatePopupMenu();
@@ -1974,6 +2101,10 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     g.beautify = g.beautifySaved;
                     ApplyBeautify();
                 }
+                if (g.glass != g.glassSaved) {
+                    g.glass = g.glassSaved;
+                    ApplyTheme();  // 复原透明度与毛玻璃背景
+                }
                 if (g.startupWanted != g.startupSaved) g.startupWanted = g.startupSaved;
                 if (g.hotkeyMode != g.hotkeyModeSaved) {
                     g.hotkeyMode = g.hotkeyModeSaved;
@@ -2003,6 +2134,7 @@ static void OpenSettings() {
     }
     g.themeSaved = g.themeIdx;  // 保存当前主题，取消时用于回退
     g.beautifySaved = g.beautify;
+    g.glassSaved = g.glass;
     HMONITOR mon = MonitorFromWindow(g.hwnd, MONITOR_DEFAULTTONEAREST);
     UpdateScale(mon);  // 窗口与控件尺寸按当前屏幕比例创建
     // 466/490 为逻辑尺寸（含标题栏余量），实际像素随比例缩放
@@ -2452,7 +2584,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInst;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    // 图标用系统字体现场绘制（无 .ico 资源），托盘与两个窗口共用同一枚
+    if (!g.hAppIcon) g.hAppIcon = MakeFontIcon(GetSystemMetrics(SM_CXICON));
+    wc.hIcon = g.hAppIcon;
     wc.lpszClassName = L"FlowtaryLauncher";
     RegisterClassExW(&wc);
 
@@ -2462,7 +2596,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     sc.lpfnWndProc = SettingsProc;
     sc.hInstance = hInst;
     sc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    sc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    sc.hIcon = g.hAppIcon;
     sc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
     sc.lpszClassName = L"FlowtarySettings";
     RegisterClassExW(&sc);
