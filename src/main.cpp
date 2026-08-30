@@ -171,6 +171,8 @@ struct App {
     int settingsTab = 0;        // 设置窗当前 Tab：0=常规, 1=网页规则（关闭后仍记住上次选择）
     int themeIdx = 0;          // 当前主题索引（设置窗切换后、保存前为暂存值）
     int themeSaved = 0;        // 设置窗打开时的初始主题（取消时回退）
+    bool beautify = true;      // 界面美化：暗色标题栏 + 圆角窗口 + 强制暗色菜单（默认开）
+    bool beautifySaved = true; // 设置窗打开时的初始值（取消时回退）
     const Theme* theme = nullptr;
     std::vector<Star> stars;   // 星空主题星点坐标
 
@@ -932,8 +934,9 @@ static void EnableDarkMenus() {
     SetPreferredAppModeFn setMode =
         (SetPreferredAppModeFn)GetProcAddress(ux, MAKEINTRESOURCEA(135));
     FlushMenuThemesFn flush = (FlushMenuThemesFn)GetProcAddress(ux, MAKEINTRESOURCEA(136));
-    // 深色主题 → ForceDark(2)，浅色主题 → AllowDark(1)（跟随系统，保证浅色菜单外观匹配）
-    if (setMode) setMode(g.theme && g.theme->dark ? 2 : 1);
+    // 美化开关关闭时回归系统默认外观；开启时：深色主题→ForceDark(2)，浅色主题→AllowDark(1)
+    int mode = g.beautify ? (g.theme && g.theme->dark ? 2 : 1) : 0;
+    if (setMode) setMode(mode);
     if (flush) flush();
 }
 
@@ -1233,6 +1236,12 @@ static void LoadSettings() {
     if (g.themeIdx < 0 || g.themeIdx >= (int)(sizeof(kThemes) / sizeof(kThemes[0])))
         g.themeIdx = 0;
     g.theme = &kThemes[g.themeIdx];
+    cb = sizeof(v);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"Beautify", RRF_RT_REG_DWORD,
+                     nullptr, &v, &cb) == ERROR_SUCCESS)
+        g.beautify = v != 0;
+    else
+        g.beautify = true;  // 默认开
 }
 
 // ---------------- 网页规则解析与持久化 ----------------
@@ -1449,6 +1458,8 @@ constexpr int IDC_LBL_HOTKEY = 3010;
 constexpr int IDC_CMB_HOTKEY = 3013;
 constexpr int IDC_TAB_GENERAL = 3014;
 constexpr int IDC_TAB_WEB = 3015;
+constexpr int IDC_TAB_THEME = 3016;
+constexpr int IDC_CHK_BEAUTIFY = 3017;  // 主题页：界面美化开关
 constexpr int IDC_LBL_THEME = 3011;
 constexpr int IDC_CMB_THEME = 3012;
 constexpr int IDM_THEME_BASE = 4200;  // 主题下拉菜单指令基值
@@ -1467,20 +1478,22 @@ static void ShowSettingsTab(HWND h, int tab) {
     vis(IDC_CMB_HOTKEY, general);
     vis(IDC_LBL_WAKE, general);
     vis(IDC_CMB_WAKE, general);
-    vis(IDC_LBL_THEME, general);
-    vis(IDC_CMB_THEME, general);
     bool web = (tab == 1);
     vis(IDC_LBL_RULES, web);
     vis(IDC_EDT_RULES, web);
     vis(IDC_LBL_RULEHINT, web);
     vis(IDC_BTN_RESET, web);
-    // 保存/取消始终显示；Y 随 Tab 变化
+    bool theme = (tab == 2);
+    vis(IDC_CHK_BEAUTIFY, theme);
+    vis(IDC_LBL_THEME, theme);
+    vis(IDC_CMB_THEME, theme);
+    // 保存/取消始终显示；Y 随 Tab 变化（主题页控件少，按钮上移避免留白）
     RECT rc; GetClientRect(h, &rc);
     int margin = S(156);
     int contentW = rc.right - margin - S(24);
     int btnW = S(96), btnGap = S(12);
     int x0 = margin + (contentW - btnW * 3 - btnGap * 2) / 2;
-    int btnY = general ? S(150) : S(376);
+    int btnY = general ? S(150) : (web ? S(376) : S(180));
     SetWindowPos(GetDlgItem(h, IDC_BTN_RESET),  nullptr, x0,                         btnY, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
     SetWindowPos(GetDlgItem(h, IDC_BTN_SAVE),   nullptr, x0 + btnW + btnGap,         btnY, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
     SetWindowPos(GetDlgItem(h, IDC_BTN_CANCEL), nullptr, x0 + (btnW + btnGap) * 2,   btnY, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
@@ -1493,6 +1506,23 @@ static void ApplyDarkTitlebar(HWND h) {
     if (FAILED(DwmSetWindowAttribute(h, 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/, &dark,
                                      sizeof(dark))))
         DwmSetWindowAttribute(h, 19, &dark, sizeof(dark));
+}
+
+// 界面美化：按 g.beautify 施加/撤销「暗色标题栏 + 圆角窗口 + 强制暗色菜单」
+static void ApplyBeautify() {
+    if (!g.hSettings) return;
+    if (g.beautify) {
+        ApplyDarkTitlebar(g.hSettings);
+        ApplyRoundCorners(g.hSettings);
+    } else {
+        BOOL dark = FALSE;
+        DwmSetWindowAttribute(g.hSettings, 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/, &dark,
+                             sizeof(dark));
+        DwmSetWindowAttribute(g.hSettings, 19, &dark, sizeof(dark));
+        DWORD pref = 0;  // DWMWCP_DEFAULT：圆角回归系统默认
+        DwmSetWindowAttribute(g.hSettings, DWMWA_WINDOW_CORNER_PREFERENCE, &pref, sizeof(pref));
+    }
+    EnableDarkMenus();  // 菜单深浅随美化开关与主题
 }
 
 static void DrawCheckGlyph(HDC hdc, const RECT& r, COLORREF color) {
@@ -1509,7 +1539,7 @@ static void DrawCheckGlyph(HDC hdc, const RECT& r, COLORREF color) {
 static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_CREATE: {
-            ApplyDarkTitlebar(h);
+            ApplyBeautify();  // 按美化开关施加/撤销暗色标题栏、圆角与暗色菜单
             int margin = S(156);    // 左侧 Tab 栏之后，内容区起点
             RECT crc; GetClientRect(h, &crc);
             int contentW = crc.right - margin - S(24);  // 与 ShowSettingsTab 计算一致
@@ -1521,7 +1551,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             g.hotkeyModeSaved = g.hotkeyMode;
             HWND c;
 
-            // 左侧 Tab 栏（自绘按钮）：常规 / 网页规则
+            // 左侧 Tab 栏（自绘按钮）：常规 / 网页规则 / 主题
             c = CreateWindowExW(0, L"BUTTON", L"常规",
                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                                 S(10), S(24), S(120), S(36), h,
@@ -1531,6 +1561,11 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                                 S(10), S(68), S(120), S(36), h,
                                 (HMENU)(INT_PTR)IDC_TAB_WEB, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+            c = CreateWindowExW(0, L"BUTTON", L"主题",
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                S(10), S(112), S(120), S(36), h,
+                                (HMENU)(INT_PTR)IDC_TAB_THEME, g.inst, nullptr);
             SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
 
             c = CreateWindowExW(0, L"BUTTON", L"开机自动启动",
@@ -1564,14 +1599,22 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
 
             c = CreateWindowExW(0, L"STATIC", L"主题样式：",
-                                WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE, margin, S(104), S(90),
+                                WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE, margin, S(60), S(90),
                                 S(28), h, (HMENU)(INT_PTR)IDC_LBL_THEME, g.inst, nullptr);
             SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
 
             c = CreateWindowExW(0, L"BUTTON", nullptr,
                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-                                margin + S(90), S(106), contentW - S(90), S(28), h,
+                                margin + S(90), S(62), contentW - S(90), S(28), h,
                                 (HMENU)(INT_PTR)IDC_CMB_THEME, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+
+            // 界面美化开关（自绘复选框，状态由 g.beautify 驱动；移入「主题」Tab）
+            c = CreateWindowExW(0, L"BUTTON",
+                                L"启用界面美化（暗色标题栏 / 圆角窗口 / 暗色菜单）",
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                margin, S(20), contentW, S(24), h,
+                                (HMENU)(INT_PTR)IDC_CHK_BEAUTIFY, g.inst, nullptr);
             SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
 
             c = CreateWindowExW(0, L"STATIC", L"网页搜索规则：",
@@ -1637,6 +1680,13 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 RECT dvr = {S(139), 0, S(140), rc.bottom};
                 FillRect(hdc, &dvr, dv);
                 DeleteObject(dv);
+                // 侧栏顶部品牌标题（Tab 列表之上，用强调色）
+                RECT ttr = {S(10), S(2), S(140), S(21)};
+                SetBkMode(hdc, TRANSPARENT);
+                SetTextColor(hdc, g.theme->menuHi);
+                SelectObject(hdc, g.fList);
+                DrawTextW(hdc, L"Flowtary", -1, &ttr,
+                          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
             }
             // 规则编辑框自绘 1px 描边（仅网页规则 Tab 可见时绘制，避免通用页残留边框）
             HWND ed = GetDlgItem(h, IDC_EDT_RULES);
@@ -1687,7 +1737,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (dis->CtlType == ODT_BUTTON) {
                 int id = (int)dis->CtlID;
                 const Theme& t = *g.theme;
-                if (id == IDC_CHK_START) {
+                if (id == IDC_CHK_START || id == IDC_CHK_BEAUTIFY) {
                     // 复选框：自绘方框 + 对勾 + 文字
                     FillRect(dis->hDC, &dis->rcItem, g.brMenuBg);
                     RECT box = dis->rcItem;
@@ -1700,13 +1750,14 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     HBRUSH fb2 = CreateSolidBrush(t.divider);
                     FrameRect(dis->hDC, &box, fb2);
                     DeleteObject(fb2);
-                    bool checked = g.startupWanted;
+                    bool checked = (id == IDC_CHK_START) ? g.startupWanted : g.beautify;
                     if (checked)
                         DrawCheckGlyph(dis->hDC, box, t.text);
                     SetBkMode(dis->hDC, TRANSPARENT);
                     SetTextColor(dis->hDC, t.text);
                     SelectObject(dis->hDC, g.fInput);
-                    const WCHAR* label = L"开机自动启动";
+                    WCHAR label[128]{};
+                    GetWindowTextW(dis->hwndItem, label, 128);
                     RECT tr = dis->rcItem;
                     tr.left = box.right + S(10);
                     DrawTextW(dis->hDC, label, -1, &tr,
@@ -1732,7 +1783,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     FrameRect(dis->hDC, &dis->rcItem, bf);
                     DeleteObject(bf);
                     SetBkMode(dis->hDC, TRANSPARENT);
-                    SetTextColor(dis->hDC, t.text);
+                    SetTextColor(dis->hDC, (id == IDC_CMB_THEME && !g.beautify) ? t.sub : t.text);
                     SelectObject(dis->hDC, g.fInput);
                     const WCHAR* cur = id == IDC_CMB_WAKE
                                            ? (g.centerWake ? L"屏幕居中" : L"跟随鼠标")
@@ -1758,9 +1809,10 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     if (dis->itemState & ODS_FOCUS) DrawFocusRect(dis->hDC, &dis->rcItem);
                     return TRUE;
                 }
-                if (id == IDC_TAB_GENERAL || id == IDC_TAB_WEB) {
+                if (id == IDC_TAB_GENERAL || id == IDC_TAB_WEB || id == IDC_TAB_THEME) {
                     // 左侧 Tab 按钮：激活项用强调色高亮，并加左侧竖条
-                    bool active = (id == IDC_TAB_GENERAL) ? (g.settingsTab == 0) : (g.settingsTab == 1);
+                    int idx = (id == IDC_TAB_GENERAL) ? 0 : (id == IDC_TAB_WEB ? 1 : 2);
+                    bool active = (g.settingsTab == idx);
                     bool hover = (dis->itemState & ODS_HOTLIGHT) != 0;
                     HBRUSH bk = CreateSolidBrush(active ? t.menuHi : (hover ? t.editBg : t.menuBg));
                     FillRect(dis->hDC, &dis->rcItem, bk);
@@ -1778,7 +1830,8 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     SetBkMode(dis->hDC, TRANSPARENT);
                     SetTextColor(dis->hDC, active ? t.text : t.sub);
                     SelectObject(dis->hDC, g.fInput);
-                    const WCHAR* lbl = (id == IDC_TAB_GENERAL) ? L"常规" : L"网页规则";
+                    const WCHAR* lbl = (id == IDC_TAB_GENERAL) ? L"常规"
+                                                 : (id == IDC_TAB_WEB ? L"网页规则" : L"主题");
                     RECT tr = dis->rcItem;
                     tr.left += S(10);
                     DrawTextW(dis->hDC, lbl, -1, &tr,
@@ -1825,6 +1878,9 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 DWORD vt = (DWORD)g.themeIdx;
                 RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"Theme", REG_DWORD,
                                 &vt, sizeof(vt));
+                DWORD vb = g.beautify ? 1 : 0;
+                RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"Beautify",
+                                REG_DWORD, &vb, sizeof(vb));
                 SetStartup(g.startupWanted);
                 int len = GetWindowTextLengthW(GetDlgItem(h, IDC_EDT_RULES));
                 std::wstring rulesText(len + 1, 0);
@@ -1833,9 +1889,14 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 SaveWebRules(rulesText);
                 if (IsWindowVisible(g.hwnd)) LayoutAndRepaint();
                 DestroyWindow(h);
-} else if (id == IDC_CHK_START && HIWORD(wp) == BN_CLICKED) {
+            } else if (id == IDC_CHK_START && HIWORD(wp) == BN_CLICKED) {
                 g.startupWanted = !g.startupWanted;
                 InvalidateRect(GetDlgItem(h, IDC_CHK_START), nullptr, TRUE);
+            } else if (id == IDC_CHK_BEAUTIFY && HIWORD(wp) == BN_CLICKED) {
+                g.beautify = !g.beautify;
+                ApplyBeautify();  // 即时预览：标题栏 / 圆角 / 菜单深浅立即切换
+                InvalidateRect(GetDlgItem(h, IDC_CHK_BEAUTIFY), nullptr, TRUE);
+                InvalidateRect(GetDlgItem(h, IDC_CMB_THEME), nullptr, TRUE);  // 同步置灰/恢复
             } else if (id == IDC_CMB_HOTKEY && HIWORD(wp) == BN_CLICKED) {
                 // 结果项快捷键方案下拉：列 数字/字母/关闭，当前项打勾；选择后即时预览
                 HMENU m = CreatePopupMenu();
@@ -1858,8 +1919,9 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 else return 0;
                 InvalidateRect(GetDlgItem(h, IDC_CMB_HOTKEY), nullptr, TRUE);
                 if (IsWindowVisible(g.hwnd)) RepaintNow();
-             } else if ((id == IDC_TAB_GENERAL || id == IDC_TAB_WEB) && HIWORD(wp) == BN_CLICKED) {
-                ShowSettingsTab(h, (id == IDC_TAB_GENERAL) ? 0 : 1);
+             } else if ((id == IDC_TAB_GENERAL || id == IDC_TAB_WEB || id == IDC_TAB_THEME) &&
+                        HIWORD(wp) == BN_CLICKED) {
+                ShowSettingsTab(h, (id == IDC_TAB_GENERAL) ? 0 : (id == IDC_TAB_WEB ? 1 : 2));
              } else if (id == IDC_CMB_WAKE && HIWORD(wp) == BN_CLICKED) {
                 // 下拉弹出黑暗菜单（复用 StyleDarkMenu 同一套自绘/染色）
                 HMENU m = CreatePopupMenu();
@@ -1879,6 +1941,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 InvalidateRect(GetDlgItem(h, IDC_CMB_WAKE), nullptr, TRUE);
             } else if (id == IDC_CMB_THEME && HIWORD(wp) == BN_CLICKED) {
                 // 主题下拉：列全部预设，当前项打勾；选择后即时预览全部界面
+                if (!g.beautify) return 0;  // 美化关闭时主题样式不可选（下拉置灰）
                 int n = (int)(sizeof(kThemes) / sizeof(kThemes[0]));
                 HMENU m = CreatePopupMenu();
                 for (int i = 0; i < n; ++i)
@@ -1906,6 +1969,10 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     g.themeIdx = g.themeSaved;
                     g.theme = &kThemes[g.themeIdx];
                     ApplyTheme();
+                }
+                if (g.beautify != g.beautifySaved) {
+                    g.beautify = g.beautifySaved;
+                    ApplyBeautify();
                 }
                 if (g.startupWanted != g.startupSaved) g.startupWanted = g.startupSaved;
                 if (g.hotkeyMode != g.hotkeyModeSaved) {
@@ -1935,6 +2002,7 @@ static void OpenSettings() {
         return;
     }
     g.themeSaved = g.themeIdx;  // 保存当前主题，取消时用于回退
+    g.beautifySaved = g.beautify;
     HMONITOR mon = MonitorFromWindow(g.hwnd, MONITOR_DEFAULTTONEAREST);
     UpdateScale(mon);  // 窗口与控件尺寸按当前屏幕比例创建
     // 466/490 为逻辑尺寸（含标题栏余量），实际像素随比例缩放
@@ -1948,7 +2016,7 @@ static void OpenSettings() {
                                   WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN, x,
                                   y, W, H, nullptr, nullptr, g.inst, nullptr);
     if (g.hSettings) {
-        ApplyRoundCorners(g.hSettings);
+        ApplyBeautify();  // 圆角/暗色标题栏随美化开关（此前无条件圆角会覆盖「关闭美化」）
         SetLayeredWindowAttributes(g.hSettings, 0, g.theme->alpha, LWA_ALPHA);
         ShowWindow(g.hSettings, SW_SHOW);
         SetForegroundWindow(g.hSettings);
@@ -2406,10 +2474,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     ApplyRoundCorners(g.hwnd);
     ApplyTheme();  // 应用主题：透明度、字体、刷子、菜单深色、星点
 
-    BuildPrograms();
-    g.everythingExe = FindEverythingExe();
-    SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
-
     // 热键依次尝试：Alt+Space -> Alt+Q -> Ctrl+Alt+Space（避免与其他启动器冲突导致完全不可用）
     static const struct { UINT mod, vk; const WCHAR* name; } kHotkeys[] = {
         {MOD_ALT | MOD_NOREPEAT, VK_SPACE, L"Alt+Space"},
@@ -2428,7 +2492,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
         MessageBoxW(nullptr, L"Alt+Space / Alt+Q / Ctrl+Alt+Space 热键均注册失败，可能被其他程序占用。",
                     L"Flowtary", MB_ICONWARNING);
     }
-    TrayAdd();  // 气泡提示使用最终选定的热键名
+    TrayAdd();  // 优先让托盘图标就位（气泡提示使用最终选定的热键名）
+
+    BuildPrograms();  // 程序扫描较慢，放最后，托盘已先出现
+    g.everythingExe = FindEverythingExe();
+    SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
