@@ -13,6 +13,8 @@
 #include <dwmapi.h>
 #include <uxtheme.h>
 #include <tlhelp32.h>
+#include <process.h>
+#include <new>
 
 #include <algorithm>
 #include <cwctype>
@@ -186,6 +188,7 @@ struct App {
     bool beautifySaved = true; // 设置窗打开时的初始值（取消时回退）
     bool glass = true;         // 毛玻璃（亚克力）背景，仅在 beautify 开启时生效（默认开）
     bool glassSaved = true;    // 设置窗打开时的初始值（取消时回退）
+    bool startingUp = true;    // 程序扫描尚未完成：托盘提示/右键菜单显示「正在启动中」
     const Theme* theme = nullptr;
     std::vector<Star> stars;   // 星空主题星点坐标
 
@@ -228,6 +231,7 @@ constexpr UINT_PTR kTimerBlink = 2;
 constexpr UINT_PTR kTimerBalloon = 3;
 constexpr int kDebounceMs = 120;
 constexpr int WM_APP_TRAY = WM_APP + 1;
+constexpr int WM_APP_PROGRAMS_READY = WM_APP + 2;  // 工作线程扫描完成，回主线程接管结果
 constexpr int IDM_SETTINGS = 2001;
 constexpr int IDM_EXIT = 2002;
 constexpr int IDM_REFRESH = 2003;   // 托盘菜单：刷新应用缓存
@@ -248,6 +252,7 @@ static void ApplyGlass();
 static BYTE EffectiveAlpha(BYTE a);
 static const CmdGroup* FindGroup(const std::vector<CmdGroup>& gs, const std::wstring& key);
 static int KillProcessesByName(const std::wstring& name);
+static void LayoutSettings(HWND h);
 static void Layout();
 static void RepaintNow();
 static void GenerateStars();
@@ -497,17 +502,17 @@ static std::wstring ResolveLnkTarget(const std::wstring& lnk) {
 }
 
 // ---------------- 程序枚举（启动时一次性，之后纯内存匹配） ----------------
-static void AddLnk(const std::wstring& full) {
+static void AddLnk(const std::wstring& full, std::vector<Program>& out) {
     size_t i = full.find_last_of(L"\\/");
     Program p;
     p.name = StripExt(i == std::wstring::npos ? full : full.substr(i + 1));
     p.path = full;
     p.target = ResolveLnkTarget(full);
     p.startMenu = true;
-    if (!p.name.empty()) g.programs.push_back(std::move(p));
+    if (!p.name.empty()) out.push_back(std::move(p));
 }
 
-static void EnumLnkDir(const std::wstring& dir, int depth) {
+static void EnumLnkDir(const std::wstring& dir, int depth, std::vector<Program>& out) {
     if (depth > 6) return;
     WIN32_FIND_DATAW fd{};
     HANDLE h = FindFirstFileW((dir + L"\\*").c_str(), &fd);
@@ -518,15 +523,15 @@ static void EnumLnkDir(const std::wstring& dir, int depth) {
         std::wstring full = dir + L"\\" + name;
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
-            EnumLnkDir(full, depth + 1);
+            EnumLnkDir(full, depth + 1, out);
         } else if (EndsWithI(name, L".lnk")) {
-            AddLnk(full);
+            AddLnk(full, out);
         }
     } while (FindNextFileW(h, &fd));
     FindClose(h);
 }
 
-static void EnumProgramFiles(const std::wstring& pf) {
+static void EnumProgramFiles(const std::wstring& pf, std::vector<Program>& out) {
     if (pf.empty()) return;
     WIN32_FIND_DATAW fd{};
     HANDLE h = FindFirstFileW((pf + L"\\*").c_str(), &fd);
@@ -546,27 +551,29 @@ static void EnumProgramFiles(const std::wstring& pf) {
             p.path = sub + L"\\" + fe.cFileName;
             p.target = p.path;
             p.startMenu = false;
-            if (!p.name.empty()) g.programs.push_back(std::move(p));
+            if (!p.name.empty()) out.push_back(std::move(p));
         } while (FindNextFileW(he, &fe));
         FindClose(he);
     } while (FindNextFileW(h, &fd));
     FindClose(h);
 }
 
-static void BuildPrograms() {
-    g.programs.clear();
+// 扫描已装软件到 out（按显示名称去重，保留优先级更高的来源）。
+// 只写传入容器、不碰 g.programs，因此可以安全地在工作线程调用。
+static void BuildProgramsInto(std::vector<Program>& out) {
+    std::vector<Program> raw;
     WCHAR buf[MAX_PATH]{};
     if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, buf)))
-        EnumLnkDir(std::wstring(buf) + L"\\Microsoft\\Windows\\Start Menu\\Programs", 0);
-    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_COMMON_PROGRAMS, nullptr, SHGFP_TYPE_CURRENT, buf)))
-        EnumLnkDir(buf, 0);
+        EnumLnkDir(std::wstring(buf) + L"\\Microsoft\\Windows\\Start Menu\\Programs", 0, raw);
+    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_COMMON_PROGRAMS, nullptr, SHGFP_TYPE_CURRENT,
+                                   buf)))
+        EnumLnkDir(buf, 0, raw);
     WCHAR pf[MAX_PATH]{};
-    if (GetEnvironmentVariableW(L"ProgramFiles", pf, MAX_PATH)) EnumProgramFiles(pf);
-    if (GetEnvironmentVariableW(L"ProgramFiles(x86)", pf, MAX_PATH)) EnumProgramFiles(pf);
+    if (GetEnvironmentVariableW(L"ProgramFiles", pf, MAX_PATH)) EnumProgramFiles(pf, raw);
+    if (GetEnvironmentVariableW(L"ProgramFiles(x86)", pf, MAX_PATH)) EnumProgramFiles(pf, raw);
 
     // 按显示名称去重（保留优先级更高的来源）
-    std::vector<Program> out;
-    for (auto& p : g.programs) {
+    for (auto& p : raw) {
         std::wstring k = ToLowerW(p.name);
         bool dup = false;
         for (auto& q : out) {
@@ -574,7 +581,27 @@ static void BuildPrograms() {
         }
         if (!dup) out.push_back(std::move(p));
     }
+}
+
+static void BuildPrograms() {  // 主线程：原地重建 g.programs
+    std::vector<Program> out;
+    BuildProgramsInto(out);
     g.programs = std::move(out);
+}
+
+// 启动扫描放到工作线程：托盘图标先就位并可响应（右键显示「正在启动中」），
+// 扫描结果通过 WM_APP_PROGRAMS_READY 交回主线程接管，避免与搜索并发读写 g.programs。
+static unsigned __stdcall ScanProgramsThread(void*) {
+    // ResolveLnkTarget 走 CoCreateInstance：COM 按线程初始化，工作线程必须自己来一次
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    auto* out = new (std::nothrow) std::vector<Program>();
+    if (out) BuildProgramsInto(*out);
+    CoUninitialize();
+    if (g.hwnd && out)
+        PostMessageW(g.hwnd, WM_APP_PROGRAMS_READY, 0, (LPARAM)out);
+    else
+        delete out;
+    return 0;
 }
 
 static std::wstring FindEverythingExe() {
@@ -799,7 +826,7 @@ static void HandleEverythingReply(const COPYDATASTRUCT* cds) {
         }
         g.items.push_back(std::move(r));
     }
-    if (g.items.empty()) AddHint(L"无结果");
+    if (g.items.empty()) AddHint(g.startingUp ? L"正在启动中…" : L"无结果");
     g.sel = 0;
     LayoutAndRepaint();
 }
@@ -1297,14 +1324,16 @@ static void TrayAdd() {
     g.nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_INFO;
     g.nid.uCallbackMessage = WM_APP_TRAY;
     g.nid.hIcon = g.hTrayIcon;
-    std::wstring tip = L"Flowtary — " + g.hotkeyName + L" 唤出";
+    std::wstring tip = g.startingUp ? L"Flowtary — 正在启动中…"
+                                    : (L"Flowtary — " + g.hotkeyName + L" 唤出");
     lstrcpynW(g.nid.szTip, tip.c_str(), ARRAYSIZE(g.nid.szTip));
     Shell_NotifyIconW(NIM_ADD, &g.nid);
 }
 
 static void TrayUpdateTip() {
     if (!g.hwnd) return;
-    std::wstring tip = L"Flowtary — " + g.hotkeyName + L" 唤出";
+    std::wstring tip = g.startingUp ? L"Flowtary — 正在启动中…"
+                                    : (L"Flowtary — " + g.hotkeyName + L" 唤出");
     lstrcpynW(g.nid.szTip, tip.c_str(), ARRAYSIZE(g.nid.szTip));
     Shell_NotifyIconW(NIM_MODIFY, &g.nid);
 }
@@ -1760,16 +1789,8 @@ static void ShowSettingsTab(HWND h, int tab) {
     vis(IDC_LBL_KILL, group);
     vis(IDC_EDT_KILL, group);
     vis(IDC_LBL_GROUPHINT, group);
-    // 保存/取消始终显示；Y 随 Tab 变化（主题页控件少，按钮上移避免留白）
-    RECT rc; GetClientRect(h, &rc);
-    int margin = S(156);
-    int contentW = rc.right - margin - S(24);
-    int btnW = S(96), btnGap = S(12);
-    int x0 = margin + (contentW - btnW * 3 - btnGap * 2) / 2;
-    int btnY = general ? S(150) : (theme ? S(180) : S(376));
-    SetWindowPos(GetDlgItem(h, IDC_BTN_RESET),  nullptr, x0,                         btnY, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
-    SetWindowPos(GetDlgItem(h, IDC_BTN_SAVE),   nullptr, x0 + btnW + btnGap,         btnY, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
-    SetWindowPos(GetDlgItem(h, IDC_BTN_CANCEL), nullptr, x0 + (btnW + btnGap) * 2,   btnY, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+    // 保存/取消/恢复默认：始终显示，贴底并整行居中（由 LayoutSettings 统一处理）
+    LayoutSettings(h);
     InvalidateRect(h, nullptr, TRUE);
 }
 
@@ -1810,11 +1831,113 @@ static void DrawCheckGlyph(HDC hdc, const RECT& r, COLORREF color) {
     DeleteObject(pen);
 }
 
+// ---------------- 设置窗口可缩放布局 ----------------
+// 思路：WM_CREATE 建完所有控件后，记录各控件的像素矩形与「距客户区底边的距离」，
+// resize 时按规则重算。这样不必改动每一处 CreateWindowEx 调用，且默认尺寸下的
+// 观感与改之前完全一致（底边距离是实测出来的，不依赖对标题栏高度的假设）。
+struct CtlGeom {
+    int id = 0;
+    int x = 0, y = 0, w = 0, h = 0;
+    int gapPx = 0;              // 客户区底边到该控件下沿的像素距离
+    bool stretchW = false;      // 宽度跟随内容区（右边距固定 24 逻辑像素）
+    bool stretchH = false;      // 高度撑到底部预留区
+    bool anchorBottom = false;  // Y 从底边算起
+    bool centerRow = false;     // 底部按钮行，整体居中
+    int centerIdx = 0;          // 在按钮行中的序号
+};
+static std::vector<CtlGeom> sCtl;
+static int sSettingsMargin = 0;  // 内容区左边距（像素，= S(156)）
+
+static void ApplyLayoutRule(int id, CtlGeom& cg) {
+    switch (id) {
+        case IDC_EDT_RULES:                                  // 网页规则框：跟随宽和高
+            cg.stretchW = true;
+            cg.stretchH = true;
+            break;
+        case IDC_EDT_LAUNCH:
+        case IDC_EDT_KILL:
+        case IDC_LBL_RULES:
+        case IDC_LBL_LAUNCH:
+        case IDC_LBL_KILL:
+        case IDC_CHK_START:
+        case IDC_CHK_BEAUTIFY:
+        case IDC_CHK_GLASS:
+        case IDC_CMB_HOTKEY:
+        case IDC_CMB_WAKE:
+        case IDC_CMB_THEME:
+            cg.stretchW = true;  // 内容区控件：宽度跟随
+            break;
+        case IDC_LBL_RULEHINT:
+        case IDC_LBL_GROUPHINT:
+            cg.stretchW = true;  // 说明文字：跟随宽度并贴底
+            cg.anchorBottom = true;
+            break;
+        case IDC_BTN_RESET:
+        case IDC_BTN_SAVE:
+        case IDC_BTN_CANCEL:
+            cg.anchorBottom = true;  // 按钮：贴底并整行居中
+            cg.centerRow = true;
+            cg.centerIdx = (id == IDC_BTN_RESET) ? 0 : (id == IDC_BTN_SAVE ? 1 : 2);
+            break;
+        default:
+            break;  // 左侧 Tab 与固定宽度标签保持原位
+    }
+}
+
+// 记录初始几何（WM_CREATE 末尾调用一次）
+static void RecordSettingsLayout(HWND h) {
+    sCtl.clear();
+    RECT crc;
+    GetClientRect(h, &crc);
+    for (HWND w = GetWindow(h, GW_CHILD); w; w = GetWindow(w, GW_HWNDNEXT)) {
+        int id = GetDlgCtrlID(w);
+        if (id == 0) continue;  // 0 = 无 ID（分隔线之类的占位）
+        RECT r;
+        GetWindowRect(w, &r);
+        MapWindowPoints(nullptr, h, (LPPOINT)&r, 2);
+        CtlGeom cg;
+        cg.id = id;
+        cg.x = r.left;
+        cg.y = r.top;
+        cg.w = r.right - r.left;
+        cg.h = r.bottom - r.top;
+        cg.gapPx = crc.bottom - r.bottom;
+        ApplyLayoutRule(id, cg);
+        sCtl.push_back(cg);
+    }
+}
+
+// 按当前客户区尺寸重排所有控件（WM_SIZE / 切 Tab 时调用）
+static void LayoutSettings(HWND h) {
+    if (sCtl.empty()) return;
+    RECT crc;
+    GetClientRect(h, &crc);
+    int gap = S(12);
+    int rowW = gap * 2;  // 底部按钮行总宽（含两处间距）
+    for (auto& c : sCtl)
+        if (c.centerRow) rowW += c.w;
+    int contentW = crc.right - sSettingsMargin - S(24);
+    for (auto& cg : sCtl) {
+        HWND w = GetDlgItem(h, cg.id);
+        if (!w) continue;
+        int x = cg.x;
+        if (cg.centerRow)
+            x = sSettingsMargin + (contentW - rowW) / 2 + cg.centerIdx * (cg.w + gap);
+        int y = cg.anchorBottom ? (crc.bottom - cg.gapPx - cg.h) : cg.y;
+        int wd = cg.stretchW ? (crc.right - S(24) - x) : cg.w;
+        int ht = cg.stretchH ? (crc.bottom - cg.gapPx - y) : cg.h;
+        if (wd < 0) wd = 0;
+        if (ht < 0) ht = 0;
+        SetWindowPos(w, nullptr, x, y, wd, ht, SWP_NOZORDER);
+    }
+}
+
 static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_CREATE: {
             ApplyBeautify();  // 按美化开关施加/撤销暗色标题栏、圆角与暗色菜单
             int margin = S(156);    // 左侧 Tab 栏之后，内容区起点
+            sSettingsMargin = margin;
             RECT crc; GetClientRect(h, &crc);
             int contentW = crc.right - margin - S(24);  // 与 ShowSettingsTab 计算一致
 
@@ -1979,9 +2102,25 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                                 (HMENU)(INT_PTR)IDC_LBL_GROUPHINT, g.inst, nullptr);
             SendMessageW(c, WM_SETFONT, (WPARAM)g.fList, TRUE);
 
-            ShowSettingsTab(h, g.settingsTab);  // 按当前 Tab 初始化分组可见性与按钮位置
+            RecordSettingsLayout(h);            // 记录初始几何，之后可随窗口缩放重排
+            ShowSettingsTab(h, g.settingsTab);  // 按当前 Tab 初始化分组可见性并重排
             return 0;
         }
+
+        case WM_GETMINMAXINFO: {
+            // 允许拖动调整大小，但限制最小尺寸，避免控件挤成一团
+            MINMAXINFO* mmi = (MINMAXINFO*)lp;
+            mmi->ptMinTrackSize.x = S(560);
+            mmi->ptMinTrackSize.y = S(430);
+            return 0;
+        }
+
+        case WM_SIZE:
+            if (wp != SIZE_MINIMIZED) {
+                LayoutSettings(h);
+                InvalidateRect(h, nullptr, TRUE);
+            }
+            return 0;
 
         case WM_ERASEBKGND:
             return 1;  // 背景由 WM_PAINT 统一填充，避免闪白
@@ -2381,7 +2520,9 @@ static void OpenSettings() {
     int x = mi.rcWork.left + ((mi.rcWork.right - mi.rcWork.left) - W) / 2;
     int y = mi.rcWork.top + ((mi.rcWork.bottom - mi.rcWork.top) - H) / 2;
     g.hSettings = CreateWindowExW(WS_EX_LAYERED, L"FlowtarySettings", L"Flowtary 设置",
-                                  WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN, x,
+                                  WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN |
+                                      WS_THICKFRAME,  // 可拖动调整大小
+                                  x,
                                   y, W, H, nullptr, nullptr, g.inst, nullptr);
     if (g.hSettings) {
         ApplyBeautify();  // 圆角/暗色标题栏随美化开关（此前无条件圆角会覆盖「关闭美化」）
@@ -2564,6 +2705,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return TRUE;
         }
 
+        case WM_APP_PROGRAMS_READY: {
+            // 工作线程扫描完成：在主线程接管结果（工作线程从不写 g.programs）
+            std::vector<Program>* p = (std::vector<Program>*)lParam;
+            if (p) {
+                g.programs = std::move(*p);
+                delete p;
+            }
+            g.startingUp = false;
+            TrayUpdateTip();  // 提示文案从「正在启动中」切回热键名
+            if (IsWindowVisible(hwnd)) LayoutAndRepaint();
+            return 0;
+        }
+
         case WM_APP_TRAY: {
             UINT ev = (UINT)lParam;
             if (ev == WM_LBUTTONUP || ev == WM_LBUTTONDBLCLK) {
@@ -2572,10 +2726,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             } else if (ev == WM_RBUTTONUP || ev == WM_CONTEXTMENU) {
                 SetForegroundWindow(hwnd);
                 HMENU menu = CreatePopupMenu();
-                AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_SETTINGS, L"设置(&S)");
-                AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_REFRESH, L"刷新缓存(&R)");
-                AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, 0, (LPCWSTR)L"");  // 自绘分隔线
-                AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_EXIT, L"退出(&X)");
+                if (g.startingUp) {
+                    // 扫描未完成：菜单照样弹出来（有响应），但只显示状态项与退出
+                    AppendMenuW(menu, MF_OWNERDRAW | MF_STRING | MF_GRAYED | MF_DISABLED, 0,
+                                (LPCWSTR)L"正在启动中…");
+                    AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, 0, (LPCWSTR)L"");  // 自绘分隔线
+                    AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_EXIT, L"退出(&X)");
+                } else {
+                    AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_SETTINGS, L"设置(&S)");
+                    AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_REFRESH, L"刷新缓存(&R)");
+                    AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, 0, (LPCWSTR)L"");  // 自绘分隔线
+                    AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_EXIT, L"退出(&X)");
+                }
                 StyleDarkMenu(menu);
                 POINT p;
                 GetCursorPos(&p);
@@ -2865,7 +3027,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     }
     TrayAdd();  // 优先让托盘图标就位（气泡提示使用最终选定的热键名）
 
-    BuildPrograms();  // 程序扫描较慢，放最后，托盘已先出现
+    // 程序扫描较慢：放到工作线程，托盘图标已先就位且可响应（右键显示「正在启动中」）
+    g.startingUp = true;
+    _beginthreadex(nullptr, 0, ScanProgramsThread, nullptr, 0, nullptr);
     g.everythingExe = FindEverythingExe();
     SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
 
