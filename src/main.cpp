@@ -168,6 +168,7 @@ struct App {
                                // 因为 BS_OWNERDRAW 按钮的 Button_GetCheck/SetCheck 不生效）
     bool startupSaved = false; // 设置窗打开时的初始值（取消时回退）
     int hotkeyModeSaved = 0;   // 同上，结果项快捷键方案（取消时回退）
+    int settingsTab = 0;        // 设置窗当前 Tab：0=常规, 1=网页规则（关闭后仍记住上次选择）
     int themeIdx = 0;          // 当前主题索引（设置窗切换后、保存前为暂存值）
     int themeSaved = 0;        // 设置窗打开时的初始主题（取消时回退）
     const Theme* theme = nullptr;
@@ -1410,9 +1411,45 @@ constexpr int IDC_BTN_RESET = 3008;
 constexpr int IDC_LBL_RULEHINT = 3009;
 constexpr int IDC_LBL_HOTKEY = 3010;
 constexpr int IDC_CMB_HOTKEY = 3013;
+constexpr int IDC_TAB_GENERAL = 3014;
+constexpr int IDC_TAB_WEB = 3015;
 constexpr int IDC_LBL_THEME = 3011;
 constexpr int IDC_CMB_THEME = 3012;
 constexpr int IDM_THEME_BASE = 4200;  // 主题下拉菜单指令基值
+
+// 设置窗口 Tab 切换：按 g.settingsTab 显示/隐藏对应分组控件，
+// 并把「保存/取消」按钮位置随 Tab 调整（通用页按钮上移，避免大片留白）。
+static void ShowSettingsTab(HWND h, int tab) {
+    g.settingsTab = tab;
+    auto vis = [h](int id, bool show) {
+        HWND w = GetDlgItem(h, id);
+        if (w) ShowWindow(w, show ? SW_SHOW : SW_HIDE);
+    };
+    bool general = (tab == 0);
+    vis(IDC_CHK_START, general);
+    vis(IDC_LBL_HOTKEY, general);
+    vis(IDC_CMB_HOTKEY, general);
+    vis(IDC_LBL_WAKE, general);
+    vis(IDC_CMB_WAKE, general);
+    vis(IDC_LBL_THEME, general);
+    vis(IDC_CMB_THEME, general);
+    bool web = (tab == 1);
+    vis(IDC_LBL_RULES, web);
+    vis(IDC_EDT_RULES, web);
+    vis(IDC_LBL_RULEHINT, web);
+    vis(IDC_BTN_RESET, web);
+    // 保存/取消始终显示；Y 随 Tab 变化
+    RECT rc; GetClientRect(h, &rc);
+    int margin = S(156);
+    int contentW = rc.right - margin - S(24);
+    int btnW = S(96), btnGap = S(12);
+    int x0 = margin + (contentW - btnW * 3 - btnGap * 2) / 2;
+    int btnY = general ? S(150) : S(376);
+    SetWindowPos(GetDlgItem(h, IDC_BTN_RESET),  nullptr, x0,                         btnY, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+    SetWindowPos(GetDlgItem(h, IDC_BTN_SAVE),   nullptr, x0 + btnW + btnGap,         btnY, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+    SetWindowPos(GetDlgItem(h, IDC_BTN_CANCEL), nullptr, x0 + (btnW + btnGap) * 2,   btnY, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+    InvalidateRect(h, nullptr, TRUE);
+}
 
 // Win11 / Win10 20H1+：标题栏跟随暗色
 static void ApplyDarkTitlebar(HWND h) {
@@ -1437,18 +1474,33 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_CREATE: {
             ApplyDarkTitlebar(h);
-            int margin = S(24);
-            int contentW = S(412);  // 460 - 24*2，所有控件宽度由此推导，不写死像素
+            int margin = S(156);    // 左侧 Tab 栏之后，内容区起点
+            RECT crc; GetClientRect(h, &crc);
+            int contentW = crc.right - margin - S(24);  // 与 ShowSettingsTab 计算一致
 
             // 自绘复选框：按钮实际为 BS_OWNERDRAW（BS_AUTOCHECKBOX 与之位或后会被吸收），
             // 其 Button_GetCheck/SetCheck 不生效，勾选状态由 g.startupWanted 驱动。
             g.startupWanted = GetStartupEnabled();
             g.startupSaved = g.startupWanted;
             g.hotkeyModeSaved = g.hotkeyMode;
-            HWND c = CreateWindowExW(0, L"BUTTON", L"开机自动启动",
-                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-                                     margin, S(20), contentW, S(24), h,
-                                     (HMENU)(INT_PTR)IDC_CHK_START, g.inst, nullptr);
+            HWND c;
+
+            // 左侧 Tab 栏（自绘按钮）：常规 / 网页规则
+            c = CreateWindowExW(0, L"BUTTON", L"常规",
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                S(10), S(24), S(120), S(36), h,
+                                (HMENU)(INT_PTR)IDC_TAB_GENERAL, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+            c = CreateWindowExW(0, L"BUTTON", L"网页规则",
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                S(10), S(68), S(120), S(36), h,
+                                (HMENU)(INT_PTR)IDC_TAB_WEB, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+
+            c = CreateWindowExW(0, L"BUTTON", L"开机自动启动",
+                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                 margin, S(20), contentW, S(24), h,
+                                 (HMENU)(INT_PTR)IDC_CHK_START, g.inst, nullptr);
             SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
 
             // 结果项快捷键方案（自绘下拉，复用黑暗弹出菜单，与 唤醒位置/主题 同款）
@@ -1525,6 +1577,8 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                                 x0 + (btnW + btnGap) * 2, S(376), btnW, S(32), h,
                                 (HMENU)(INT_PTR)IDC_BTN_CANCEL, g.inst, nullptr);
             SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+
+            ShowSettingsTab(h, g.settingsTab);  // 按当前 Tab 初始化分组可见性与按钮位置
             return 0;
         }
 
@@ -1537,9 +1591,20 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             RECT rc;
             GetClientRect(h, &rc);
             FillRect(hdc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
-            // 规则编辑框自绘 1px 描边（替代浅色系统 CLIENTEDGE）
+            // 左侧 Tab 栏背景（深色），与内容区分隔
+            if (g.theme) {
+                HBRUSH sbBg = CreateSolidBrush(g.theme->menuBg);
+                RECT sb = {0, 0, S(140), rc.bottom};
+                FillRect(hdc, &sb, sbBg);
+                DeleteObject(sbBg);
+                HBRUSH dv = CreateSolidBrush(g.theme->divider);
+                RECT dvr = {S(139), 0, S(140), rc.bottom};
+                FillRect(hdc, &dvr, dv);
+                DeleteObject(dv);
+            }
+            // 规则编辑框自绘 1px 描边（仅网页规则 Tab 可见时绘制，避免通用页残留边框）
             HWND ed = GetDlgItem(h, IDC_EDT_RULES);
-            if (ed) {
+            if (ed && IsWindowVisible(ed)) {
                 RECT er;
                 GetWindowRect(ed, &er);
                 MapWindowPoints(ed, h, (LPPOINT)&er, 2);
@@ -1657,6 +1722,33 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     if (dis->itemState & ODS_FOCUS) DrawFocusRect(dis->hDC, &dis->rcItem);
                     return TRUE;
                 }
+                if (id == IDC_TAB_GENERAL || id == IDC_TAB_WEB) {
+                    // 左侧 Tab 按钮：激活项用强调色高亮，并加左侧竖条
+                    bool active = (id == IDC_TAB_GENERAL) ? (g.settingsTab == 0) : (g.settingsTab == 1);
+                    bool hover = (dis->itemState & ODS_HOTLIGHT) != 0;
+                    HBRUSH bk = CreateSolidBrush(active ? t.menuHi : (hover ? t.editBg : t.menuBg));
+                    FillRect(dis->hDC, &dis->rcItem, bk);
+                    DeleteObject(bk);
+                    HBRUSH bf = CreateSolidBrush(t.divider);
+                    FrameRect(dis->hDC, &dis->rcItem, bf);
+                    DeleteObject(bf);
+                    if (active) {
+                        RECT bar = dis->rcItem;
+                        bar.right = bar.left + S(3);
+                        HBRUSH ab = CreateSolidBrush(t.text);
+                        FillRect(dis->hDC, &bar, ab);
+                        DeleteObject(ab);
+                    }
+                    SetBkMode(dis->hDC, TRANSPARENT);
+                    SetTextColor(dis->hDC, active ? t.text : t.sub);
+                    SelectObject(dis->hDC, g.fInput);
+                    const WCHAR* lbl = (id == IDC_TAB_GENERAL) ? L"常规" : L"网页规则";
+                    RECT tr = dis->rcItem;
+                    tr.left += S(10);
+                    DrawTextW(dis->hDC, lbl, -1, &tr,
+                              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                    return TRUE;
+                }
                 // 普通按钮：深色底，保存按钮用主题强调色
                 bool accent = (id == IDC_BTN_SAVE);
                 bool pressed2 = (dis->itemState & ODS_SELECTED) != 0;
@@ -1730,6 +1822,8 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 else return 0;
                 InvalidateRect(GetDlgItem(h, IDC_CMB_HOTKEY), nullptr, TRUE);
                 if (IsWindowVisible(g.hwnd)) RepaintNow();
+             } else if ((id == IDC_TAB_GENERAL || id == IDC_TAB_WEB) && HIWORD(wp) == BN_CLICKED) {
+                ShowSettingsTab(h, (id == IDC_TAB_GENERAL) ? 0 : 1);
              } else if (id == IDC_CMB_WAKE && HIWORD(wp) == BN_CLICKED) {
                 // 下拉弹出黑暗菜单（复用 StyleDarkMenu 同一套自绘/染色）
                 HMENU m = CreatePopupMenu();
@@ -1808,7 +1902,7 @@ static void OpenSettings() {
     HMONITOR mon = MonitorFromWindow(g.hwnd, MONITOR_DEFAULTTONEAREST);
     UpdateScale(mon);  // 窗口与控件尺寸按当前屏幕比例创建
     // 466/490 为逻辑尺寸（含标题栏余量），实际像素随比例缩放
-    int W = S(466), H = S(490);
+    int W = S(600), H = S(490);
     MONITORINFO mi{};
     mi.cbSize = sizeof(mi);
     GetMonitorInfoW(mon, &mi);
