@@ -10,8 +10,9 @@ rem  产物：<目标目录>\flowtary-<版本号>.exe
 rem  版本号取自 src\version.h 的 FT_VER_DOT（单一来源，改那里即可）
 rem
 rem  说明：exe 用 /MT 静态链接 C 运行时，不依赖 VC++ 运行库；
-rem        所有设置存注册表 HKCU\Software\Flowtary，不往 exe 旁边写任何文件，
-rem        因此只复制这一个 exe 就能用，无需安装。
+rem        所有设置存注册表 HKCU\Software\Flowtary，不往 exe 旁边写任何文件。
+rem  注意：文件对话框跳转模块依赖 filedlg_hook64.dll / filedlg_hook32.dll /
+rem        filedlg_agent32.exe，这三个文件必须与 flowtary-<版本>.exe 同目录部署。
 rem ============================================================
 setlocal
 
@@ -56,14 +57,36 @@ if errorlevel 1 (
     exit /b 1
 )
 
-rem ---- 步骤 3：编译主程序（/MT 静态链接 → 单文件绿色） ----
+rem ---- 步骤 3：编译主程序 + 文件对话框跳转模块（/MT 静态链接 → 单文件绿色） ----
 rem 注：输出到 build\flowtary_new.exe 临时名。开发期托盘实例常占用 build\flowtary.exe，
 rem     若直接写该名会被链接器以 LNK1104 拒斥；输出到临时名可彻底规避此锁冲突。
 echo [3/4] 编译主程序...
+cl /nologo /std:c++17 /O2 /MT /W3 /EHsc /utf-8 /DNDEBUG /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS /c ^
+   "%ROOT%src\main.cpp" /Fo:"%ROOT%build\main.obj"
+if errorlevel 1 exit /b 1
+cl /nologo /std:c++17 /O2 /MT /W3 /EHsc /utf-8 /DNDEBUG /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS /c ^
+   "%ROOT%src\filedlg_jump.cpp" /Fo:"%ROOT%build\filedlg_jump.obj"
+if errorlevel 1 exit /b 1
 cl /nologo /std:c++17 /O2 /MT /W3 /EHsc /utf-8 /DNDEBUG /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS ^
-   "%ROOT%src\main.cpp" "%ROOT%build\flowtary.res" ^
-   /Fe:"%ROOT%build\flowtary_new.exe" /Fo:"%ROOT%build\main.obj" ^
+   "%ROOT%build\main.obj" "%ROOT%build\filedlg_jump.obj" "%ROOT%build\flowtary.res" ^
+   /Fe:"%ROOT%build\flowtary_new.exe" ^
    /link /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF /INCREMENTAL:NO
+if errorlevel 1 exit /b 1
+
+rem ---- 步骤 3b：编译注入 DLL（32/64 位）与 32 位钩子安装助手 ----
+echo [3b] 编译钩子 DLL 与 32 位助手...
+cl /nologo /std:c++17 /O2 /MT /W3 /EHsc /utf-8 /DNDEBUG /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS ^
+   "%ROOT%src\hookdlg.cpp" /Fe:"%ROOT%build\filedlg_hook64.dll" /Fo:"%ROOT%build\hookdlg64.obj" ^
+   /link /DLL /OPT:REF /OPT:ICF /INCREMENTAL:NO
+if errorlevel 1 exit /b 1
+call "%VS%\VC\Auxiliary\Build\vcvars32.bat" >nul
+cl /nologo /std:c++17 /O2 /MT /W3 /EHsc /utf-8 /DNDEBUG /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS ^
+   "%ROOT%src\hookdlg.cpp" /Fe:"%ROOT%build\filedlg_hook32.dll" /Fo:"%ROOT%build\hookdlg32.obj" ^
+   /link /DLL /OPT:REF /OPT:ICF /INCREMENTAL:NO
+if errorlevel 1 exit /b 1
+cl /nologo /std:c++17 /O2 /MT /W3 /EHsc /utf-8 /DNDEBUG /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS ^
+   "%ROOT%src\agent32.cpp" /Fe:"%ROOT%build\filedlg_agent32.exe" /Fo:"%ROOT%build\agent32.obj" ^
+   /link /SUBSYSTEM:WINDOWS user32.lib /OPT:REF /OPT:ICF /INCREMENTAL:NO
 if errorlevel 1 exit /b 1
 
 rem ---- 步骤 4：输出到目标目录（按版本号改名） ----
@@ -74,6 +97,10 @@ if errorlevel 1 (
     echo [error] 复制失败。
     exit /b 1
 )
+rem 文件对话框跳转模块依赖的 32/64 位注入 DLL 与 32 位助手，必须与 exe 同目录
+copy /y "%ROOT%build\filedlg_hook64.dll" "%OUTDIR%\filedlg_hook64.dll" >nul
+copy /y "%ROOT%build\filedlg_hook32.dll" "%OUTDIR%\filedlg_hook32.dll" >nul
+copy /y "%ROOT%build\filedlg_agent32.exe" "%OUTDIR%\filedlg_agent32.exe" >nul
 rem 若 build\flowtary.exe 未被占用则顺手刷新（占用时忽略，不影响发布产物）
 copy /y "%ROOT%build\flowtary_new.exe" "%ROOT%build\flowtary.exe" >nul 2>nul
 
