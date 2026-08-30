@@ -32,8 +32,9 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
 - **设置窗口**（右键托盘 → 设置，黑暗模式自绘，与主界面同风格）：
   - `开机自动启动`：勾选后写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\Flowtary`，
     取消则删除该值
-  - `Alt+字母快捷打开`：结果列表每行右侧显示字母徽章（按 `a`/`s`/`d`… 顺序分配），
-    按 `Alt+对应字母` 直接执行该项；**默认勾选**（存 `HKCU\Software\Flowtary\HotkeyLetters`）
+  - `Alt+数字快捷打开`：结果列表每行右侧显示数字徽章（按结果优先级自上而下 `1`/`2`/`3`… 分配，
+    `1` = 列表最高优先级项），按 `Alt+对应数字`（主键盘或数字小键盘均可）直接执行该项；
+    **默认勾选**（存 `HKCU\Software\Flowtary\HotkeyLetters`）
   - `唤醒位置`：屏幕居中 / 跟随鼠标（存 `HKCU\Software\Flowtary\CenterWake`）
   - `主题样式`：黑色简洁 / 透明Mac黑暗 / 透明蓝色 / 星空风格 / 日出浅白
     （存 `HKCU\Software\Flowtary\Theme`）
