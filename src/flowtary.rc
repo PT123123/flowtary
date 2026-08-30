@@ -1,0 +1,35 @@
+// Flowtary 版本信息资源
+// 由 release.bat / build.bat 用 rc.exe 编译成 .res，再链接进 exe。
+// 版本号等字段统一取自 version.h，不在本文件里硬编码。
+#include <winver.h>
+#include "version.h"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    FT_VER_COMMA
+ PRODUCTVERSION FT_VER_COMMA
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+ FILEFLAGS      0x0L
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_APP
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        // 0804 = 简体中文，04b0 = Unicode(1200) 代码页
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName",      FT_COMPANY
+            VALUE "FileDescription",  FT_FILE_DESC
+            VALUE "FileVersion",      FT_VER_DOT
+            VALUE "InternalName",     "flowtary"
+            VALUE "LegalCopyright",   FT_COPYRIGHT
+            VALUE "OriginalFilename", "flowtary.exe"
+            VALUE "ProductName",      FT_PRODUCT_NAME
+            VALUE "ProductVersion",   FT_VER_DOT
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0804, 1200
+    END
+END
