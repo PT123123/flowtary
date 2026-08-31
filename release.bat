@@ -1,18 +1,19 @@
 @echo off
+@chcp 65001 >nul
 rem ============================================================
-rem  Flowtary ·¢²¼½Å±¾£¨MSVC Release£¬²ú³öµ¥ÎÄ¼þÂÌÉ«°æ£©
+rem  Flowtary ï¿½ï¿½ï¿½ï¿½ï¿½Å±ï¿½ï¿½ï¿½MSVC Releaseï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ä¼ï¿½ï¿½ï¿½É«ï¿½æ£©
 rem
-rem  ÓÃ·¨£º
-rem    release.bat                        ±àÒë²¢Êä³öµ½ ÏîÄ¿Ä¿Â¼\dist\
-rem    release.bat "D:\Tools\Flowtary"    Êä³öµ½Ö¸¶¨Ä¿Â¼
+rem  ï¿½Ã·ï¿½ï¿½ï¿½
+rem    release.bat                        ï¿½ï¿½ï¿½ë²¢ï¿½ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½Ä¿Ä¿Â¼\dist\
+rem    release.bat "D:\Tools\Flowtary"    ï¿½ï¿½ï¿½ï¿½ï¿½Ö¸ï¿½ï¿½Ä¿Â¼
 rem
-rem  ²úÎï£º<Ä¿±êÄ¿Â¼>\flowtary-<°æ±¾ºÅ>.exe
-rem  °æ±¾ºÅÈ¡×Ô src\version.h µÄ FT_VER_DOT£¨µ¥Ò»À´Ô´£¬¸ÄÄÇÀï¼´¿É£©
+rem  ï¿½ï¿½ï¿½ï£º<Ä¿ï¿½ï¿½Ä¿Â¼>\flowtary-<ï¿½æ±¾ï¿½ï¿½>.exe
+rem  ï¿½æ±¾ï¿½ï¿½È¡ï¿½ï¿½ src\version.h ï¿½ï¿½ FT_VER_DOTï¿½ï¿½ï¿½ï¿½Ò»ï¿½ï¿½Ô´ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¼´ï¿½É£ï¿½
 rem
-rem  ËµÃ÷£ºexe ÓÃ /MT ¾²Ì¬Á´½Ó C ÔËÐÐÊ±£¬²»ÒÀÀµ VC++ ÔËÐÐ¿â£»
-rem        ËùÓÐÉèÖÃ´æ×¢²á±í HKCU\Software\Flowtary£¬²»Íù exe ÅÔ±ßÐ´ÈÎºÎÎÄ¼þ¡£
-rem  ×¢Òâ£ºÎÄ¼þ¶Ô»°¿òÌø×ªÄ£¿éÒÀÀµ filedlg_hook64.dll / filedlg_hook32.dll /
-rem        filedlg_agent32.exe£¬ÕâÈý¸öÎÄ¼þ±ØÐëÓë flowtary-<°æ±¾>.exe Í¬Ä¿Â¼²¿Êð¡£
+rem  Ëµï¿½ï¿½ï¿½ï¿½exe ï¿½ï¿½ /MT ï¿½ï¿½Ì¬ï¿½ï¿½ï¿½ï¿½ C ï¿½ï¿½ï¿½ï¿½Ê±ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ VC++ ï¿½ï¿½ï¿½Ð¿â£»
+rem        ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ã´ï¿½×¢ï¿½ï¿½ï¿½ HKCU\Software\Flowtaryï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ exe ï¿½Ô±ï¿½Ð´ï¿½Îºï¿½ï¿½Ä¼ï¿½ï¿½ï¿½
+rem  ×¢ï¿½â£ºï¿½Ä¼ï¿½ï¿½Ô»ï¿½ï¿½ï¿½ï¿½ï¿½×ªÄ£ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ filedlg_hook64.dll / filedlg_hook32.dll /
+rem        filedlg_agent32.exeï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ä¼ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ flowtary-<ï¿½æ±¾>.exe Í¬Ä¿Â¼ï¿½ï¿½ï¿½ï¿½
 rem ============================================================
 setlocal
 
@@ -20,47 +21,48 @@ set "ROOT=%~dp0"
 set "OUTDIR=%~1"
 if "%OUTDIR%"=="" set "OUTDIR=%ROOT%dist"
 
-rem ---- ¶ÁÈ¡°æ±¾ºÅ£¨½âÎö src\version.h µÄ FT_VER_DOT£© ----
-rem ÐÐÐÎÈç£º#define FT_VER_DOT   "1.0.0.0"   ¡ú µÚ 3 ¸ö token£¬%%~v È¥µôÒýºÅ
+rem ---- ï¿½ï¿½È¡ï¿½æ±¾ï¿½Å£ï¿½ï¿½ï¿½ï¿½ï¿½ src\version.h ï¿½ï¿½ FT_VER_DOTï¿½ï¿½ ----
+rem ï¿½ï¿½ï¿½ï¿½ï¿½ç£º#define FT_VER_DOT   "1.0.0.0"   ï¿½ï¿½ ï¿½ï¿½ 3 ï¿½ï¿½ tokenï¿½ï¿½%%~v È¥ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
 set "VER=0.0.0.0"
 for /f "usebackq tokens=3" %%v in (`findstr /c:"#define FT_VER_DOT" "%ROOT%src\version.h"`) do set "VER=%%~v"
 echo [info] version = %VER%
 
-rem ---- ¶¨Î» Visual Studio£¨ÐèÒª C++ ¹¤×÷¸ºÔØ£© ----
+rem ---- ï¿½ï¿½Î» Visual Studioï¿½ï¿½ï¿½ï¿½Òª C++ ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ø£ï¿½ ----
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 set "VS="
 for /f "usebackq delims=" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VS=%%i"
 if "%VS%"=="" (
-    echo [error] Î´ÕÒµ½´ø C++ ¹¤×÷¸ºÔØµÄ Visual Studio¡£
+    echo [error] Î´ï¿½Òµï¿½ï¿½ï¿½ C++ ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Øµï¿½ Visual Studioï¿½ï¿½
     exit /b 1
 )
 call "%VS%\VC\Auxiliary\Build\vcvars64.bat" >nul
 
 if not exist "%ROOT%build" mkdir "%ROOT%build"
 
-rem ---- ²½Öè 1£ºÇåÀíÀúÊ·²ÐÁô£¨»»Ãû¸²¸Ç²úÉúµÄ¾É°æ¡¢µ÷ÊÔÈÕÖ¾/½ØÍ¼¡¢ÖÐ¼äÎÄ¼þ£© ----
-echo [1/4] ÇåÀíÀúÊ·²ÐÁô...
+rem ---- ï¿½ï¿½ï¿½ï¿½ 1ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê·ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ç²ï¿½ï¿½ï¿½ï¿½Ä¾É°æ¡¢ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ö¾/ï¿½ï¿½Í¼ï¿½ï¿½ï¿½Ð¼ï¿½ï¿½Ä¼ï¿½ï¿½ï¿½ ----
+echo [1/4] ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê·ï¿½ï¿½ï¿½ï¿½...
 del /q "%ROOT%build\flowtary_old.exe"    2>nul
 del /q "%ROOT%build\flowtary_new.exe"    2>nul
 del /q "%ROOT%build\flowtary_fixed.exe"  2>nul
 del /q "%ROOT%build\flowtary_test.exe"   2>nul
+del /q "%ROOT%build\*_new.*"             2>nul
 del /q "%ROOT%build\*.manifest"          2>nul
 del /q "%ROOT%build\*.obj"               2>nul
 del /q "%ROOT%build\*.log"               2>nul
 del /q "%ROOT%build\*.png"               2>nul
 
-rem ---- ²½Öè 2£º±àÒë°æ±¾ÐÅÏ¢×ÊÔ´ ----
-echo [2/4] ±àÒë°æ±¾ÐÅÏ¢×ÊÔ´...
+rem ---- ï¿½ï¿½ï¿½ï¿½ 2ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½æ±¾ï¿½ï¿½Ï¢ï¿½ï¿½Ô´ ----
+echo [2/4] ï¿½ï¿½ï¿½ï¿½æ±¾ï¿½ï¿½Ï¢ï¿½ï¿½Ô´...
 rc /nologo /fo "%ROOT%build\flowtary.res" "%ROOT%src\flowtary.rc"
 if errorlevel 1 (
-    echo [error] ×ÊÔ´±àÒëÊ§°Ü¡£
+    echo [error] ï¿½ï¿½Ô´ï¿½ï¿½ï¿½ï¿½Ê§ï¿½Ü¡ï¿½
     exit /b 1
 )
 
-rem ---- ²½Öè 3£º±àÒëÖ÷³ÌÐò + ÎÄ¼þ¶Ô»°¿òÌø×ªÄ£¿é£¨/MT ¾²Ì¬Á´½Ó ¡ú µ¥ÎÄ¼þÂÌÉ«£© ----
-rem ×¢£ºÊä³öµ½ build\flowtary_new.exe ÁÙÊ±Ãû¡£¿ª·¢ÆÚÍÐÅÌÊµÀý³£Õ¼ÓÃ build\flowtary.exe£¬
-rem     ÈôÖ±½ÓÐ´¸ÃÃû»á±»Á´½ÓÆ÷ÒÔ LNK1104 ¾Ü³â£»Êä³öµ½ÁÙÊ±Ãû¿É³¹µ×¹æ±Ü´ËËø³åÍ»¡£
-echo [3/4] ±àÒëÖ÷³ÌÐò...
+rem ---- ï¿½ï¿½ï¿½ï¿½ 3ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ + ï¿½Ä¼ï¿½ï¿½Ô»ï¿½ï¿½ï¿½ï¿½ï¿½×ªÄ£ï¿½é£¨/MT ï¿½ï¿½Ì¬ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ ï¿½ï¿½ï¿½Ä¼ï¿½ï¿½ï¿½É«ï¿½ï¿½ ----
+rem ×¢ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ build\flowtary_new.exe ï¿½ï¿½Ê±ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Êµï¿½ï¿½ï¿½ï¿½Õ¼ï¿½ï¿½ build\flowtary.exeï¿½ï¿½
+rem     ï¿½ï¿½Ö±ï¿½ï¿½Ð´ï¿½ï¿½ï¿½ï¿½ï¿½á±»ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ LNK1104 ï¿½Ü³â£»ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê±ï¿½ï¿½ï¿½É³ï¿½ï¿½×¹ï¿½Ü´ï¿½ï¿½ï¿½ï¿½ï¿½Í»ï¿½ï¿½
+echo [3/4] ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½...
 cl /nologo /std:c++17 /O2 /MT /W3 /EHsc /utf-8 /DNDEBUG /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS /c ^
    "%ROOT%src\main.cpp" /Fo:"%ROOT%build\main.obj"
 if errorlevel 1 exit /b 1
@@ -73,43 +75,58 @@ cl /nologo /std:c++17 /O2 /MT /W3 /EHsc /utf-8 /DNDEBUG /DUNICODE /D_UNICODE /D_
    /link /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF /INCREMENTAL:NO
 if errorlevel 1 exit /b 1
 
-rem ---- ²½Öè 3b£º±àÒë×¢Èë DLL£¨32/64 Î»£©Óë 32 Î»¹³×Ó°²×°ÖúÊÖ ----
-echo [3b] ±àÒë¹³×Ó DLL Óë 32 Î»ÖúÊÖ...
+rem ---- ï¿½ï¿½ï¿½ï¿½ 3bï¿½ï¿½ï¿½ï¿½ï¿½ï¿½×¢ï¿½ï¿½ DLLï¿½ï¿½32/64 Î»ï¿½ï¿½ï¿½ï¿½ 32 Î»ï¿½ï¿½ï¿½Ó°ï¿½×°ï¿½ï¿½ï¿½ï¿½ ----
+echo [3b] ï¿½ï¿½ï¿½ë¹³ï¿½ï¿½ DLL ï¿½ï¿½ 32 Î»ï¿½ï¿½ï¿½ï¿½...
 cl /nologo /std:c++17 /O2 /MT /W3 /EHsc /utf-8 /DNDEBUG /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS ^
-   "%ROOT%src\hookdlg.cpp" /Fe:"%ROOT%build\filedlg_hook64.dll" /Fo:"%ROOT%build\hookdlg64.obj" ^
+   "%ROOT%src\hookdlg.cpp" /Fe:"%ROOT%build\filedlg_hook64_new.dll" /Fo:"%ROOT%build\hookdlg64.obj" ^
    /link /DLL /OPT:REF /OPT:ICF /INCREMENTAL:NO
 if errorlevel 1 exit /b 1
 call "%VS%\VC\Auxiliary\Build\vcvars32.bat" >nul
 cl /nologo /std:c++17 /O2 /MT /W3 /EHsc /utf-8 /DNDEBUG /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS ^
-   "%ROOT%src\hookdlg.cpp" /Fe:"%ROOT%build\filedlg_hook32.dll" /Fo:"%ROOT%build\hookdlg32.obj" ^
+   "%ROOT%src\hookdlg.cpp" /Fe:"%ROOT%build\filedlg_hook32_new.dll" /Fo:"%ROOT%build\hookdlg32.obj" ^
    /link /DLL /OPT:REF /OPT:ICF /INCREMENTAL:NO
 if errorlevel 1 exit /b 1
 cl /nologo /std:c++17 /O2 /MT /W3 /EHsc /utf-8 /DNDEBUG /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS ^
-   "%ROOT%src\agent32.cpp" /Fe:"%ROOT%build\filedlg_agent32.exe" /Fo:"%ROOT%build\agent32.obj" ^
+   "%ROOT%src\agent32.cpp" /Fe:"%ROOT%build\filedlg_agent32_new.exe" /Fo:"%ROOT%build\agent32.obj" ^
    /link /SUBSYSTEM:WINDOWS user32.lib /OPT:REF /OPT:ICF /INCREMENTAL:NO
 if errorlevel 1 exit /b 1
 
-rem ---- ²½Öè 4£ºÊä³öµ½Ä¿±êÄ¿Â¼£¨°´°æ±¾ºÅ¸ÄÃû£© ----
-echo [4/4] Êä³öµ½ %OUTDIR% ...
+rem ---- ï¿½ï¿½ï¿½ï¿½ 4ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ä¿ï¿½ï¿½Ä¿Â¼ï¿½ï¿½ï¿½ï¿½ï¿½æ±¾ï¿½Å¸ï¿½ï¿½ï¿½ï¿½ï¿½ ----
+echo [4/4] ï¿½ï¿½ï¿½ï¿½ï¿½ %OUTDIR% ...
 if not exist "%OUTDIR%" mkdir "%OUTDIR%"
 copy /y "%ROOT%build\flowtary_new.exe" "%OUTDIR%\flowtary-%VER%.exe" >nul
 if errorlevel 1 (
-    echo [error] ¸´ÖÆÊ§°Ü¡£
+    echo [error] ï¿½ï¿½ï¿½ï¿½Ê§ï¿½Ü¡ï¿½
     exit /b 1
 )
-rem ÎÄ¼þ¶Ô»°¿òÌø×ªÄ£¿éÒÀÀµµÄ 32/64 Î»×¢Èë DLL Óë 32 Î»ÖúÊÖ£¬±ØÐëÓë exe Í¬Ä¿Â¼
-copy /y "%ROOT%build\filedlg_hook64.dll" "%OUTDIR%\filedlg_hook64.dll" >nul
-copy /y "%ROOT%build\filedlg_hook32.dll" "%OUTDIR%\filedlg_hook32.dll" >nul
-copy /y "%ROOT%build\filedlg_agent32.exe" "%OUTDIR%\filedlg_agent32.exe" >nul
-rem Èô build\flowtary.exe Î´±»Õ¼ÓÃÔòË³ÊÖË¢ÐÂ£¨Õ¼ÓÃÊ±ºöÂÔ£¬²»Ó°Ïì·¢²¼²úÎï£©
+rem ï¿½Ä¼ï¿½ï¿½Ô»ï¿½ï¿½ï¿½ï¿½ï¿½×ªÄ£ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ 32/64 Î»×¢ï¿½ï¿½ DLL ï¿½ï¿½ 32 Î»ï¿½ï¿½ï¿½Ö£ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ exe Í¬Ä¿Â¼
+copy /y "%ROOT%build\filedlg_hook64_new.dll" "%OUTDIR%\filedlg_hook64.dll" >nul
+if errorlevel 1 (
+    echo [error] copy filedlg_hook64.dll failed: close ALL running Flowtary instances and retry.
+    exit /b 1
+)
+copy /y "%ROOT%build\filedlg_hook32_new.dll" "%OUTDIR%\filedlg_hook32.dll" >nul
+if errorlevel 1 (
+    echo [error] copy filedlg_hook32.dll failed: close ALL running Flowtary instances (incl. filedlg_agent32.exe) and retry.
+    exit /b 1
+)
+copy /y "%ROOT%build\filedlg_agent32_new.exe" "%OUTDIR%\filedlg_agent32.exe" >nul
+if errorlevel 1 (
+    echo [error] copy filedlg_agent32.exe failed: close ALL running Flowtary instances and retry.
+    exit /b 1
+)
+rem ï¿½ï¿½ build\flowtary.exe Î´ï¿½ï¿½Õ¼ï¿½ï¿½ï¿½ï¿½Ë³ï¿½ï¿½Ë¢ï¿½Â£ï¿½Õ¼ï¿½ï¿½Ê±ï¿½ï¿½ï¿½Ô£ï¿½ï¿½ï¿½Ó°ï¿½ì·¢ï¿½ï¿½ï¿½ï¿½ï¿½ï£©
 copy /y "%ROOT%build\flowtary_new.exe" "%ROOT%build\flowtary.exe" >nul 2>nul
+copy /y "%ROOT%build\filedlg_hook64_new.dll" "%ROOT%build\filedlg_hook64.dll" >nul 2>nul
+copy /y "%ROOT%build\filedlg_hook32_new.dll" "%ROOT%build\filedlg_hook32.dll" >nul 2>nul
+copy /y "%ROOT%build\filedlg_agent32_new.exe" "%ROOT%build\filedlg_agent32.exe" >nul 2>nul
 
 echo.
 echo [ok] %OUTDIR%\flowtary-%VER%.exe
 echo.
-echo ÌáÊ¾£º
-echo   1) ÏÈ°ÑÕâ¸ö exe ·Åµ½×îÖÕ¹Ì¶¨µÄÎ»ÖÃ£¬ÔÙÔËÐÐËü£»
-echo   2) È»ºóÔÚ¡¸ÍÐÅÌÓÒ¼ü ¡ú ÉèÖÃ ¡ú ³£¹æ¡¹¹´Ñ¡¡¸¿ª»ú×Ô¶¯Æô¶¯¡¹¡ª¡ª
-echo      ¸Ã×¢²á±íÏî¼ÇÂ¼µÄÊÇ¹´Ñ¡ÄÇÒ»¿ÌµÄ exe ¾ø¶ÔÂ·¾¶£¬ÏÈ¹´ºóÅ²»áµ¼ÖÂ¿ª»úÆô¶¯Ê§Ð§£»
-echo   3) Èô¾É°æ±¾ÕýÔÚºóÌ¨ÔËÐÐ£¬Ö±½ÓÔËÐÐÐÂ°æ»á×Ô¶¯µ¯´°ÌáÊ¾²¢½Ó¹Ü£¨ÎÞÐèÊÖ¶¯ÍË³ö¾É°æ£©¡£
+echo ï¿½ï¿½Ê¾ï¿½ï¿½
+echo   1) ï¿½È°ï¿½ï¿½ï¿½ï¿½ exe ï¿½Åµï¿½ï¿½ï¿½ï¿½Õ¹Ì¶ï¿½ï¿½ï¿½Î»ï¿½Ã£ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+echo   2) È»ï¿½ï¿½ï¿½Ú¡ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ò¼ï¿½ ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ ï¿½ï¿½ï¿½æ¡¹ï¿½ï¿½Ñ¡ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ô¶ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+echo      ï¿½ï¿½×¢ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Â¼ï¿½ï¿½ï¿½Ç¹ï¿½Ñ¡ï¿½ï¿½Ò»ï¿½Ìµï¿½ exe ï¿½ï¿½ï¿½ï¿½Â·ï¿½ï¿½ï¿½ï¿½ï¿½È¹ï¿½ï¿½ï¿½Å²ï¿½áµ¼ï¿½Â¿ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê§Ð§ï¿½ï¿½
+echo   3) ï¿½ï¿½ï¿½É°æ±¾ï¿½ï¿½ï¿½Úºï¿½Ì¨ï¿½ï¿½ï¿½Ð£ï¿½Ö±ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Â°ï¿½ï¿½ï¿½Ô¶ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê¾ï¿½ï¿½ï¿½Ó¹Ü£ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ö¶ï¿½ï¿½Ë³ï¿½ï¿½É°æ£©ï¿½ï¿½
 exit /b 0
