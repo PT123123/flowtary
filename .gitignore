@@ -1,10 +1,18 @@
-# Flowtary 构建产物
+# Build outputs
+dist/
 build/
-dist/          # release.bat 的发布输出目录
-*.obj
-*.exe
-*.pdb
-*.ilk
-
-# 本地项目记忆（仅本机，勿入库）
 .workbuddy/
+
+# Object files
+*.obj
+*.o
+
+# Build / smoke logs
+build_log.txt
+release_log.txt
+smoke_result.txt
+phaseA_build.log
+phaseB_build.log
+phaseE_build.log
+phaseE_build2.log
+phaseX_build.log
