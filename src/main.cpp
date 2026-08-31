@@ -293,7 +293,7 @@ struct App {
                                // 因为 BS_OWNERDRAW 按钮的 Button_GetCheck/SetCheck 不生效）
     bool startupSaved = false; // 设置窗打开时的初始值（取消时回退）
     int hotkeyModeSaved = 0;   // 同上，结果项快捷键方案（取消时回退）
-    int settingsTab = 0;        // 设置窗当前 Tab：0=常规, 1=网页规则, 2=主题, 3=一键, 4=搜索权重（关闭后仍记住上次选择）
+    int settingsTab = 0;        // 设置窗当前 Tab：0=常规, 1=网页规则, 2=主题, 3=一键, 4=搜索权重, 5=排除路径（关闭后仍记住上次选择）
     int themeIdx = 0;          // 当前主题索引（设置窗切换后、保存前为暂存值）
     int themeSaved = 0;        // 设置窗打开时的初始主题（取消时回退）
     bool beautify = true;      // 界面美化：暗色标题栏 + 圆角窗口 + 强制暗色菜单（默认开）
@@ -338,8 +338,16 @@ struct App {
     std::vector<CmdGroup> groupsLaunch;  // 一键启动组：关键字 → 文件列表
     std::vector<CmdGroup> groupsKill;    // 一键关闭组：关键字 → 进程名列表
 
+    // 排除路径（设置可编辑）：小写+路径分隔符归一化后的通配符模式列表。
+    // 命中 Everything 结果路径或程序 .lnk/.exe 完整路径时丢弃该项。
+    // 仅在 Everything 模式（d/f）与程序模式生效；网页/一键组不参与过滤。
+    std::vector<std::wstring> excludePaths;
+
     std::wstring text;
     size_t caret = 0;
+    size_t selStart = 0;
+    size_t selEnd = 0;
+    bool dragging = false;       // 输入框内左键拖拽选区中
     int scrollX = 0;
     bool caretOn = true;
     std::wstring compText;     // IME 组合中（未上屏）文本：内联渲染，不弹系统浮窗
@@ -756,6 +764,66 @@ static std::wstring TrimW(const std::wstring& s) {
     return s.substr(b, e - b);
 }
 
+// ---------------- 排除路径（通配符 * ?，大小写不敏感） ----------------
+// 通配符匹配：* 匹配任意长（含空），? 匹配单个字符；其他字符大小写不敏感相等即匹配
+static bool MatchWildcardI(const wchar_t* pat, const wchar_t* s) {
+    // 经典 DP 匹配：pat[i..] vs s[j..]
+    size_t pn = wcslen(pat), sn = wcslen(s);
+    std::vector<std::vector<bool>> dp(pn + 1, std::vector<bool>(sn + 1, false));
+    dp[0][0] = true;
+    for (size_t i = 1; i <= pn; ++i) {
+        if (pat[i - 1] == L'*') dp[i][0] = dp[i - 1][0];
+        for (size_t j = 1; j <= sn; ++j) {
+            wchar_t pc = pat[i - 1];
+            if (pc == L'*')
+                dp[i][j] = dp[i - 1][j] || dp[i][j - 1];
+            else if (pc == L'?')
+                dp[i][j] = dp[i - 1][j - 1];
+            else
+                dp[i][j] = dp[i - 1][j - 1] &&
+                           (std::towlower(pc) == std::towlower(s[j - 1]));
+        }
+    }
+    return dp[pn][sn];
+}
+
+// 路径归一化：反斜杠统一为 '\\'、去除末尾分隔符、整体转小写，便于大小写不敏感比较
+static std::wstring NormalizePathForExclude(const std::wstring& s) {
+    std::wstring r;
+    r.reserve(s.size());
+    for (auto c : s) {
+        if (c == L'/') c = L'\\';
+        r.push_back(c);
+    }
+    while (r.size() > 3 /* 保留盘符 C:\ */ && r.back() == L'\\') r.pop_back();
+    for (auto& c : r) c = (wchar_t)std::towlower(c);
+    return r;
+}
+
+// 通配符模式归一化：与路径同样规则；用户输入的 * 仍作 wildcard
+static std::wstring NormalizePatternForExclude(const std::wstring& s) {
+    return NormalizePathForExclude(s);
+}
+
+// 路径是否被排除：与 g.excludePaths 任一模式匹配（模式不含通配符时按前缀匹配）
+static bool IsPathExcluded(const std::wstring& path) {
+    if (g.excludePaths.empty() || path.empty()) return false;
+    std::wstring np = NormalizePathForExclude(path);
+    for (const auto& pat : g.excludePaths) {
+        // 含 * / ? 走通配符，否则按「路径以前缀开头」匹配（直觉：填一个目录就排除整棵）
+        if (pat.find(L'*') != std::wstring::npos || pat.find(L'?') != std::wstring::npos) {
+            if (MatchWildcardI(pat.c_str(), np.c_str())) return true;
+        } else {
+            size_t pn = pat.size();
+            if (np.size() >= pn && np.compare(0, pn, pat) == 0) {
+                // 命中后还要确认是「目录边界」：完全相等，或紧随其后的字符是 '\\'
+                if (np.size() == pn || np[pn] == L'\\') return true;
+            }
+        }
+    }
+    return false;
+}
+
 static bool EndsWithI(const std::wstring& s, const WCHAR* suf) {
     size_t n = wcslen(suf);
     if (s.size() < n) return false;
@@ -1000,6 +1068,7 @@ static void SearchPrograms(const std::wstring& query) {
         r.title = cands[i].p->name;
         r.sub = cands[i].p->path;
         r.action = cands[i].p->path;
+        if (IsPathExcluded(r.action)) continue;  // 排除命中：跳过该程序
         g.items.push_back(std::move(r));
     }
 }
@@ -1057,6 +1126,8 @@ static void Show() {
     g.text.clear();
     g.compText.clear();
     g.caret = 0;
+    g.selStart = g.selEnd = 0;
+    g.dragging = false;
     g.scrollX = 0;
     g.items.clear();
     g.sel = 0;
@@ -1084,6 +1155,8 @@ static void Show() {
 static void Hide() {
     if (!IsWindowVisible(g.hwnd)) return;
     KillTimer(g.hwnd, kTimerDebounce);
+    g.dragging = false;
+    g.selStart = g.selEnd = 0;
     // 若正在组词，先取消 IME 组合，避免残留未上屏状态
     HIMC hIMC = ImmGetContext(g.hwnd);
     if (hIMC) {
@@ -1155,7 +1228,9 @@ static void HandleEverythingReply(const COPYDATASTRUCT* cds) {
     DWORD n = (std::min)(list->numitems, ev::kMaxResults);
     size_t headerBytes = sizeof(ev::List) - sizeof(ev::Item) + (size_t)n * sizeof(ev::Item);
     if (headerBytes > cds->cbData) n = 0;
-    for (DWORD i = 0; i < n; ++i) {
+    int kept = 0;  // 排除路径过滤后仍向 Everything 索取的最大条数（保证展示满 10 行）
+    int want = (int)ev::kMaxResults;
+    for (DWORD i = 0; i < n && kept < want; ++i) {
         const ev::Item& it = list->items[i];
         if (it.filename_offset >= cds->cbData || it.path_offset >= cds->cbData) continue;
         const WCHAR* fn = (const WCHAR*)((const BYTE*)list + it.filename_offset);
@@ -1171,7 +1246,9 @@ static void HandleEverythingReply(const COPYDATASTRUCT* cds) {
         } else {
             r.action = r.sub + L"\\" + r.title;
         }
+        if (IsPathExcluded(r.action)) continue;  // 排除命中：直接丢弃
         g.items.push_back(std::move(r));
+        ++kept;
     }
     // 点击加权重排：同一有效搜索词下点过的文件/文件夹排前面（权重相同保持 Everything 原序）
     if (g.weightEnabled && !g.evTermKey.empty() && g.items.size() > 1) {
@@ -1468,6 +1545,22 @@ static int CompTextWidth(HDC hdc) {
     SelectObject(hdc, old);
     return sz.cx;
 }
+static int SelectionStartWidth(HDC hdc) {
+    HGDIOBJ old = SelectObject(hdc, g.fInput);
+    std::wstring s = g.text.substr(0, g.selStart);
+    SIZE sz{};
+    if (!s.empty()) GetTextExtentPoint32W(hdc, s.c_str(), (int)s.size(), &sz);
+    SelectObject(hdc, old);
+    return sz.cx;
+}
+static int SelectionEndWidth(HDC hdc) {
+    HGDIOBJ old = SelectObject(hdc, g.fInput);
+    std::wstring s = g.text.substr(0, g.selEnd);
+    SIZE sz{};
+    if (!s.empty()) GetTextExtentPoint32W(hdc, s.c_str(), (int)s.size(), &sz);
+    SelectObject(hdc, old);
+    return sz.cx;
+}
 
 static void EnsureCaretVisible() {
     HDC hdc = GetDC(g.hwnd);
@@ -1479,6 +1572,45 @@ static void EnsureCaretVisible() {
     if (cw - g.scrollX > avail) g.scrollX = cw - avail;
     if (cw < g.scrollX) g.scrollX = cw;
     if (g.scrollX < 0) g.scrollX = 0;
+}
+
+// 根据输入行内的 x 坐标反查最近字符索引（按字形宽度累加近似）。
+// 用于鼠标点击 / 拖拽 / 双击选词时光标定位。
+static size_t CaretFromX(int clientX) {
+    HDC hdc = GetDC(g.hwnd);
+    SelectObject(hdc, g.fInput);
+    int targetX = clientX - S(kBasePad) + g.scrollX;
+    if (targetX <= 0) {
+        ReleaseDC(g.hwnd, hdc);
+        return 0;
+    }
+    size_t best = g.text.size();
+    int prevW = 0;
+    for (size_t i = 1; i <= g.text.size(); ++i) {
+        SIZE sz{};
+        GetTextExtentPoint32W(hdc, g.text.c_str(), (int)i, &sz);
+        if (sz.cx > targetX) {
+            // 在 i-1 与 i 之间取中点更接近的那一侧
+            best = (sz.cx - targetX < targetX - prevW) ? i : i - 1;
+            break;
+        }
+        prevW = sz.cx;
+    }
+    ReleaseDC(g.hwnd, hdc);
+    return best;
+}
+
+// 找出光标位置处的“词”边界（连续非空白字符）。用于双击选词。
+static void WordBoundsAt(size_t pos, size_t& a, size_t& b) {
+    a = b = pos;
+    if (g.text.empty()) return;
+    if (pos > g.text.size()) pos = g.text.size();
+    auto isSep = [](WCHAR c) {
+        return c == L' ' || c == L'\t' || c == L',' || c == L';' || c == L'/'
+            || c == L'\\' || c == L'|' || c == L'\'' || c == L'"';
+    };
+    while (a > 0 && !isSep(g.text[a - 1])) a--;
+    while (b < g.text.size() && !isSep(g.text[b])) b++;
 }
 
 // IME 定位：组合窗口与候选窗口都锚定到光标右下（客户区坐标，不可转屏幕坐标——
@@ -1512,8 +1644,20 @@ static void AfterEdit() {
     Refresh();
 }
 
+// 删除当前选区（若有）；返回是否进行了删减。
+static bool DeleteSelection() {
+    if (g.selStart == g.selEnd) return false;
+    size_t a = (g.selStart < g.selEnd) ? g.selStart : g.selEnd;
+    size_t b = (g.selStart < g.selEnd) ? g.selEnd : g.selStart;
+    g.text.erase(a, b - a);
+    g.caret = a;
+    g.selStart = g.selEnd = a;
+    return true;
+}
+
 static void InsertChars(const WCHAR* s, size_t n) {
     if (n == 0) return;
+    DeleteSelection();
     g.text.insert(g.caret, s, n);
     g.caret += n;
     AfterEdit();
@@ -1521,6 +1665,17 @@ static void InsertChars(const WCHAR* s, size_t n) {
 
 static void CopyAll() {
     CopyTextToClipboard(g.text);
+}
+
+// 复制当前选区；无选区时退化为全选复制（与原来 Ctrl+C 行为一致）
+static void CopySelection() {
+    if (g.selStart != g.selEnd) {
+        size_t a = (g.selStart < g.selEnd) ? g.selStart : g.selEnd;
+        size_t b = (g.selStart < g.selEnd) ? g.selEnd : g.selStart;
+        CopyTextToClipboard(g.text.substr(a, b - a));
+    } else {
+        CopyAll();
+    }
 }
 
 static void Paste() {
@@ -1532,6 +1687,14 @@ static void Paste() {
         GlobalUnlock(h);
     }
     CloseClipboard();
+}
+
+// 全选：移动光标到末尾，选区覆盖整段文本
+static void SelectAll() {
+    g.selStart = 0;
+    g.selEnd = g.text.size();
+    g.caret = g.text.size();
+    AfterEdit();
 }
 
 // ---------------- 托盘 / 注册表 / 圆角 ----------------
@@ -1966,6 +2129,85 @@ static void LoadGroupRules() {
     g.groupsKill = ParseGroups(LoadRegText(L"GroupKill"));
 }
 
+// ---------------- 排除路径 ----------------
+// 文本 → 模式列表：每行一个（支持通配符 * ?），# 开头为注释，空行忽略。
+// 模式按文本原样保留通配符，匹配时再归一化（反斜杠/小写）。
+static std::vector<std::wstring> ParseExcludePaths(const std::wstring& text) {
+    std::vector<std::wstring> out;
+    size_t i = 0, n = text.size();
+    while (i < n) {
+        size_t j = text.find_first_of(L"\r\n", i);
+        if (j == std::wstring::npos) j = n;
+        std::wstring line = TrimW(text.substr(i, j - i));
+        i = j + 1;
+        if (line.empty() || line[0] == L'#') continue;
+        // 跳过重复：同一归一化模式只保留第一次出现的原文
+        std::wstring norm = NormalizePatternForExclude(line);
+        bool dup = false;
+        for (auto& e : out)
+            if (NormalizePatternForExclude(e) == norm) { dup = true; break; }
+        if (!dup) out.push_back(line);
+    }
+    return out;
+}
+
+static std::wstring ExcludePathsToText(const std::vector<std::wstring>& pats) {
+    std::wstring t;
+    // 顶部一行注释：提示用户语法与作用范围
+    t += L"# 排除路径：每行一条，支持通配符 * ?。路径以排除项开头即视为命中（含整棵子树）。\r\n";
+    t += L"# 作用于 Everything 搜索（d/f 前缀）与本地程序搜索的结果，网页与一键组不受影响。\r\n";
+    for (auto& p : pats) t += p + L"\r\n";
+    return t;
+}
+
+// 默认排除项：每个本地盘符的回收站 + 系统还原信息 + 旧式 RECYCLER。
+// 用 GetLogicalDrives 动态展开，确保多盘用户也覆盖到。
+static std::wstring DefaultExcludePathsText() {
+    std::wstring t =
+        L"# 排除路径：每行一条，支持通配符 * ?。路径以排除项开头即视为命中（含整棵子树）。\r\n"
+        L"# 作用于 Everything 搜索（d/f 前缀）与本地程序搜索的结果，网页与一键组不受影响。\r\n"
+        L"# 默认已排除各盘符下的回收站、系统还原信息等系统目录，可继续追加自定义路径。\r\n";
+    DWORD bits = GetLogicalDrives();
+    for (int i = 0; i < 26; ++i) {
+        if (!(bits & (1u << i))) continue;
+        WCHAR letter = (WCHAR)(L'A' + i);
+        t += letter;
+        t += L":\\$RECYCLE.BIN\r\n";
+    }
+    t += L"*\\System Volume Information\\*\r\n";
+    t += L"*\\RECYCLER\\*\r\n";
+    return t;
+}
+
+// 「恢复默认」按钮用的纯默认（不含用户自定义项）
+static std::vector<std::wstring> DefaultExcludePaths() {
+    std::vector<std::wstring> out;
+    DWORD bits = GetLogicalDrives();
+    for (int i = 0; i < 26; ++i) {
+        if (!(bits & (1u << i))) continue;
+        std::wstring s;
+        s.push_back((WCHAR)(L'A' + i));
+        s += L":\\$RECYCLE.BIN";
+        out.push_back(s);
+    }
+    out.push_back(L"*\\System Volume Information\\*");
+    out.push_back(L"*\\RECYCLER\\*");
+    return out;
+}
+
+static void LoadExcludePaths() {
+    std::wstring text = LoadRegText(L"ExcludePaths");
+    if (text.empty()) {
+        // 首次启动：写入默认项文本（便于用户在编辑器看到默认行为），并把默认模式灌入内存
+        std::wstring def = DefaultExcludePathsText();
+        SaveRegText(L"ExcludePaths", def);
+        g.excludePaths = DefaultExcludePaths();
+        return;
+    }
+    auto parsed = ParseExcludePaths(text);
+    g.excludePaths = parsed.empty() ? DefaultExcludePaths() : parsed;
+}
+
 static const CmdGroup* FindGroup(const std::vector<CmdGroup>& gs, const std::wstring& key) {
     for (auto& g : gs)
         if (g.key == key) return &g;
@@ -2261,6 +2503,16 @@ static void Paint(HDC hdc) {
         RECT r{textX, 0, W + 4096, inputH};
         SaveDC(mem);
         IntersectClipRect(mem, 0, 0, W, inputH);
+        // 选区矩形：在文本下方作为高亮底色
+        if (g.selStart != g.selEnd) {
+            int x1 = pad - g.scrollX + SelectionStartWidth(mem);
+            int x2 = pad - g.scrollX + SelectionEndWidth(mem);
+            if (x2 < x1) std::swap(x1, x2);
+            RECT sr{x1, inputH / 2 - S(13), x2, inputH / 2 + S(13)};
+            HBRUSH selTextBr = CreateSolidBrush(Blend(t.bgCard, t.accent, 0.35f));
+            FillRect(mem, &sr, selTextBr);
+            DeleteObject(selTextBr);
+        }
         if (g.text.empty() && g.compText.empty()) {
             SetTextColor(mem, t.textDis);
             DrawTextW(mem, L"f/d 搜文件 · bd/bili/zhihu… 搜网页 · 直接输入启动程序", -1, &r,
@@ -2428,6 +2680,12 @@ constexpr int IDC_TRK_BLUR = 3044;   // 毛玻璃浓度滑块 0-255
 constexpr int IDC_LBL_BLUR = 3045;   // 毛玻璃浓度滑块标签
 constexpr int IDC_TRK_RADIUS = 3046; // 圆角半径滑块 0-14
 constexpr int IDC_LBL_RADIUS = 3047; // 圆角半径滑块标签
+// 排除路径 Tab（索引 5）：自定义编辑器 + 「恢复默认」按钮
+constexpr int IDC_TAB_EXCLUDE = 3048;       // 左侧 Tab：排除路径
+constexpr int IDC_EDT_EXCLUDE = 3049;        // 多行编辑器：每行一条，支持 * ?
+constexpr int IDC_BTN_EXCLUDE_DEFAULT = 3050; // 「恢复默认」按钮：填入系统默认排除项
+constexpr int IDC_LBL_EXCLUDEHINT = 3051;    // 排除路径说明：语法、作用范围、命中规则
+constexpr int IDC_LBL_EXCLUDECOUNT = 3052;   // 当前已记忆 N 条排除项
 constexpr int IDM_THEME_BASE = 4200;  // 主题下拉菜单指令基值
 constexpr int IDM_FLUSH_BASE = 4410;  // 写入时机下拉菜单指令基值
 constexpr int IDM_MAXENT_BASE = 4420; // 条目上限下拉菜单指令基值
@@ -2479,6 +2737,11 @@ static void ShowSettingsTab(HWND h, int tab) {
     vis(IDC_BTN_WIPE, weight);
     vis(IDC_LBL_WCOUNT, weight);
     vis(IDC_LBL_WEIHINT, weight);
+    bool exclude = (tab == 5);
+    vis(IDC_LBL_EXCLUDEHINT, exclude);
+    vis(IDC_EDT_EXCLUDE, exclude);
+    vis(IDC_BTN_EXCLUDE_DEFAULT, exclude);
+    vis(IDC_LBL_EXCLUDECOUNT, exclude);
     // 保存/取消/恢复默认：始终显示，贴底并整行居中（由 LayoutSettings 统一处理）
     LayoutSettings(h);
     InvalidateRect(h, nullptr, TRUE);
@@ -2580,6 +2843,15 @@ static void ApplyLayoutRule(int id, CtlGeom& cg) {
         case IDC_LBL_WCOUNT:
         case IDC_LBL_WEIHINT:
             cg.stretchW = true;  // 权重页说明/计数：宽度跟随
+            break;
+        case IDC_EDT_EXCLUDE:  // 排除路径编辑器：跟随宽和高（占满剩余纵向区域）
+            cg.stretchW = true;
+            cg.stretchH = true;
+            break;
+        case IDC_LBL_EXCLUDEHINT:
+        case IDC_LBL_EXCLUDECOUNT:
+        case IDC_BTN_EXCLUDE_DEFAULT:
+            cg.stretchW = true;  // 排除路径页提示/计数/按钮：宽度跟随
             break;
         case IDC_LST_THEME:
         case IDC_LBL_TUNE:
@@ -2734,6 +3006,11 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                                 S(10), S(200), S(120), S(36), h,
                                 (HMENU)(INT_PTR)IDC_TAB_WEIGHT, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+            c = CreateWindowExW(0, L"BUTTON", L"排除路径",
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                S(10), S(244), S(120), S(36), h,
+                                (HMENU)(INT_PTR)IDC_TAB_EXCLUDE, g.inst, nullptr);
             SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
 
             c = CreateWindowExW(0, L"BUTTON", L"开机自动启动",
@@ -2986,6 +3263,39 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                                 (HMENU)(INT_PTR)IDC_LBL_WEIHINT, g.inst, nullptr);
             SendMessageW(c, WM_SETFONT, (WPARAM)g.fList, TRUE);
 
+            // 排除路径 Tab（索引 5）：多行编辑器 + 「恢复默认」按钮 + 提示 + 当前条数
+            c = CreateWindowExW(0, L"STATIC",
+                                L"每行一条路径，支持通配符 * ?。以排除项开头的文件/文件夹/程序会被过滤。"
+                                L"网页与一键组不受影响。保存后生效。",
+                                WS_CHILD | WS_VISIBLE, margin, S(20), contentW, S(36), h,
+                                (HMENU)(INT_PTR)IDC_LBL_EXCLUDEHINT, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fList, TRUE);
+
+            c = CreateWindowExW(0, L"EDIT", nullptr,
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_MULTILINE |
+                                    ES_AUTOVSCROLL | WS_VSCROLL,
+                                margin, S(60), contentW, S(220), h,
+                                (HMENU)(INT_PTR)IDC_EDT_EXCLUDE, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fList, TRUE);
+            SetWindowTextW(c, ExcludePathsToText(g.excludePaths).c_str());
+            SetWindowTheme(c, L"DarkMode_Explorer", nullptr);
+
+            c = CreateWindowExW(0, L"BUTTON", L"恢复默认",
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                margin, S(290), S(96), S(28), h,
+                                (HMENU)(INT_PTR)IDC_BTN_EXCLUDE_DEFAULT, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+
+            {
+                std::wstring cnt = L"当前已记忆 " + std::to_wstring(g.excludePaths.size()) +
+                                   L" 条排除项";
+                c = CreateWindowExW(0, L"STATIC", cnt.c_str(),
+                                    WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
+                                    margin + S(108), S(290), contentW - S(108), S(28), h,
+                                    (HMENU)(INT_PTR)IDC_LBL_EXCLUDECOUNT, g.inst, nullptr);
+                SendMessageW(c, WM_SETFONT, (WPARAM)g.fList, TRUE);
+            }
+
             RecordSettingsLayout(h);            // 记录初始几何，之后可随窗口缩放重排
             ShowSettingsTab(h, g.settingsTab);  // 按当前 Tab 初始化分组可见性并重排
             return 0;
@@ -3045,7 +3355,8 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             }
 
             // 编辑框自绘 1px 描边（仅当前 Tab 可见时绘制，避免其它页残留边框）
-            const int kEditIds[] = {IDC_EDT_RULES, IDC_EDT_LAUNCH, IDC_EDT_KILL};
+            const int kEditIds[] = {IDC_EDT_RULES, IDC_EDT_LAUNCH, IDC_EDT_KILL,
+                                    IDC_EDT_EXCLUDE};
             HBRUSH brFrame = CreateSolidBrush(RGB(70, 70, 70));
             for (int eid : kEditIds) {
                 HWND ed = GetDlgItem(h, eid);
@@ -3078,7 +3389,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             HDC hdc = (HDC)wp;
             HWND w = (HWND)lp;
             if (w == GetDlgItem(h, IDC_EDT_RULES) || w == GetDlgItem(h, IDC_EDT_LAUNCH) ||
-                w == GetDlgItem(h, IDC_EDT_KILL)) {
+                w == GetDlgItem(h, IDC_EDT_KILL) || w == GetDlgItem(h, IDC_EDT_EXCLUDE)) {
                 const Theme& te = *g.theme;
                 if (!g.brEditBg) g.brEditBg = CreateSolidBrush(te.editBg);
                 SetTextColor(hdc, te.text);
@@ -3256,13 +3567,14 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     return TRUE;
                 }
                 if (id == IDC_TAB_GENERAL || id == IDC_TAB_WEB || id == IDC_TAB_THEME ||
-                    id == IDC_TAB_GROUP || id == IDC_TAB_WEIGHT) {
+                    id == IDC_TAB_GROUP || id == IDC_TAB_WEIGHT || id == IDC_TAB_EXCLUDE) {
                     // 左侧 Tab 按钮：激活项用强调色高亮，并加左侧竖条
                     int idx = (id == IDC_TAB_GENERAL) ? 0
                             : (id == IDC_TAB_WEB)     ? 1
                             : (id == IDC_TAB_THEME)   ? 2
                             : (id == IDC_TAB_GROUP)   ? 3
-                                                      : 4;
+                            : (id == IDC_TAB_WEIGHT)  ? 4
+                                                      : 5;
                     bool active = (g.settingsTab == idx);
                     bool hover = (dis->itemState & ODS_HOTLIGHT) != 0;
                     HBRUSH bk = CreateSolidBrush(active ? t.menuHi : (hover ? t.editBg : t.menuBg));
@@ -3285,7 +3597,8 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                                      : (id == IDC_TAB_WEB)     ? L"网页规则"
                                      : (id == IDC_TAB_THEME)   ? L"主题"
                                      : (id == IDC_TAB_GROUP)   ? L"一键"
-                                                               : L"搜索权重";
+                                     : (id == IDC_TAB_WEIGHT)  ? L"搜索权重"
+                                                               : L"排除路径";
                     RECT tr = dis->rcItem;
                     tr.left += S(10);
                     DrawTextW(dis->hDC, lbl, -1, &tr,
@@ -3383,6 +3696,15 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 killText.resize(lenK);
                 SaveRegText(L"GroupKill", killText);
                 g.groupsKill = ParseGroups(killText);
+                // 排除路径：解析编辑器文本并落盘（注释/空行被忽略），失败回退到当前内存值
+                HWND eE = GetDlgItem(h, IDC_EDT_EXCLUDE);
+                int lenE = GetWindowTextLengthW(eE);
+                std::wstring exclText(lenE + 1, 0);
+                GetWindowTextW(eE, &exclText[0], lenE + 1);
+                exclText.resize(lenE);
+                auto parsedExcl = ParseExcludePaths(exclText);
+                if (!parsedExcl.empty()) g.excludePaths = parsedExcl;
+                SaveRegText(L"ExcludePaths", ExcludePathsToText(g.excludePaths));
                 if (IsWindowVisible(g.hwnd)) LayoutAndRepaint();
                 DestroyWindow(h);
             } else if (id == IDC_CHK_START && HIWORD(wp) == BN_CLICKED) {
@@ -3489,14 +3811,16 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     SetWindowTextW(GetDlgItem(h, IDC_LBL_WCOUNT), cnt.c_str());
                 }
                 InvalidateRect(GetDlgItem(h, IDC_BTN_WIPE), nullptr, TRUE);
-            } else if ((id == IDC_TAB_GENERAL || id == IDC_TAB_WEB || id == IDC_TAB_THEME ||
-                         id == IDC_TAB_GROUP || id == IDC_TAB_WEIGHT) &&
-                        HIWORD(wp) == BN_CLICKED) {
+} else if ((id == IDC_TAB_GENERAL || id == IDC_TAB_WEB || id == IDC_TAB_THEME ||
+                          id == IDC_TAB_GROUP || id == IDC_TAB_WEIGHT ||
+                          id == IDC_TAB_EXCLUDE) &&
+                         HIWORD(wp) == BN_CLICKED) {
                 ShowSettingsTab(h, (id == IDC_TAB_GENERAL) ? 0
                                  : (id == IDC_TAB_WEB)    ? 1
                                  : (id == IDC_TAB_THEME)  ? 2
                                  : (id == IDC_TAB_GROUP)  ? 3
-                                                          : 4);
+                                 : (id == IDC_TAB_WEIGHT) ? 4
+                                                          : 5);
              } else if (id == IDC_CMB_WAKE && HIWORD(wp) == BN_CLICKED) {
                 // 下拉弹出黑暗菜单（复用 StyleDarkMenu 同一套自绘/染色）
                 HMENU m = CreatePopupMenu();
@@ -3555,6 +3879,15 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 DestroyWindow(h);
             } else if (id == IDC_BTN_RESET) {
                 SetWindowTextW(GetDlgItem(h, IDC_EDT_RULES), DefaultRulesText().c_str());
+            } else if (id == IDC_BTN_EXCLUDE_DEFAULT && HIWORD(wp) == BN_CLICKED) {
+                // 「恢复默认」：把排除路径编辑器重置为系统默认（含所有盘符的回收站等）。
+                // 注意：此处只更新编辑器文本与计数标签，不立即落盘——保存按钮按下时再持久化。
+                SetWindowTextW(GetDlgItem(h, IDC_EDT_EXCLUDE),
+                               DefaultExcludePathsText().c_str());
+                std::wstring cnt = L"当前已记忆 " +
+                                   std::to_wstring(DefaultExcludePaths().size()) +
+                                   L" 条排除项";
+                SetWindowTextW(GetDlgItem(h, IDC_LBL_EXCLUDECOUNT), cnt.c_str());
             }
             return 0;
         }
@@ -3850,6 +4183,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         case WM_KEYDOWN: {
             bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
             // Alt+数字 由 WM_SYSKEYDOWN（Alt 组合键消息）统一处理，详见下方 case。
             switch (wParam) {
                 case VK_RETURN:
@@ -3870,40 +4204,91 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                         RepaintNow();
                     }
                     return 0;
-                case VK_LEFT:
-                    if (g.caret > 0) g.caret--;
+case VK_LEFT:
+                    if (shift) {
+                        if (g.selStart == g.selEnd) {
+                            g.selStart = g.selEnd = g.caret;
+                        }
+                        if (g.caret > 0) g.caret--;
+                        g.selEnd = g.caret;
+                    } else {
+                        if (g.selStart != g.selEnd) {
+                            g.caret = (g.selStart < g.selEnd) ? g.selStart : g.selEnd;
+                            g.selStart = g.selEnd = g.caret;
+                        } else if (g.caret > 0) {
+                            g.caret--;
+                        }
+                    }
                     AfterEdit();
                     return 0;
                 case VK_RIGHT:
-                    if (g.caret < g.text.size()) g.caret++;
+                    if (shift) {
+                        if (g.selStart == g.selEnd) {
+                            g.selStart = g.selEnd = g.caret;
+                        }
+                        if (g.caret < g.text.size()) g.caret++;
+                        g.selEnd = g.caret;
+                    } else {
+                        if (g.selStart != g.selEnd) {
+                            g.caret = (g.selStart > g.selEnd) ? g.selStart : g.selEnd;
+                            g.selStart = g.selEnd = g.caret;
+                        } else if (g.caret < g.text.size()) {
+                            g.caret++;
+                        }
+                    }
                     AfterEdit();
                     return 0;
                 case VK_HOME:
+                    if (shift) {
+                        if (g.selStart == g.selEnd) g.selStart = g.caret;
+                        g.selEnd = 0;
+                    } else {
+                        g.selStart = g.selEnd = 0;
+                    }
                     g.caret = 0;
                     AfterEdit();
                     return 0;
                 case VK_END:
+                    if (shift) {
+                        if (g.selStart == g.selEnd) g.selStart = g.caret;
+                        g.selEnd = g.text.size();
+                    } else {
+                        g.selStart = g.selEnd = g.text.size();
+                    }
                     g.caret = g.text.size();
                     AfterEdit();
                     return 0;
                 case VK_BACK:
-                    if (g.caret > 0) {
+                    if (DeleteSelection()) {
+                        AfterEdit();
+                    } else if (g.caret > 0) {
                         g.text.erase(g.caret - 1, 1);
                         g.caret--;
                         AfterEdit();
                     }
                     return 0;
                 case VK_DELETE:
-                    if (g.caret < g.text.size()) {
+                    if (DeleteSelection()) {
+                        AfterEdit();
+                    } else if (g.caret < g.text.size()) {
                         g.text.erase(g.caret, 1);
                         AfterEdit();
                     }
+                    return 0;
+                case 'A':
+                    if (ctrl) SelectAll();
                     return 0;
                 case 'V':
                     if (ctrl) Paste();
                     return 0;
                 case 'C':
-                    if (ctrl) CopyAll();
+                    if (ctrl) CopySelection();
+                    return 0;
+                case 'X':
+                    if (ctrl) {
+                        CopySelection();
+                        if (DeleteSelection()) AfterEdit();
+                    }
                     return 0;
                 default:
                     break;
@@ -4006,8 +4391,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
 
         case WM_MOUSEMOVE: {
+            int x = GET_X_LPARAM(lParam);
             int y = GET_Y_LPARAM(lParam);
             int inputH = S(kBaseInputH), rowH = S(kBaseRowH);
+            // 拖拽选区中：随鼠标移动扩展 selEnd，光标跟到末尾
+            if (g.dragging) {
+                size_t pos = CaretFromX(x);
+                g.selEnd = pos;
+                g.caret = pos;
+                RepaintNow();
+                return 0;
+            }
             int idx = -1;
             if (y >= inputH && !g.items.empty()) {
                 idx = (y - inputH) / rowH;
@@ -4037,6 +4431,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
 
         case WM_LBUTTONDOWN: {
+            int x = GET_X_LPARAM(lParam);
             int y = GET_Y_LPARAM(lParam);
             int inputH = S(kBaseInputH), rowH = S(kBaseRowH);
             if (y >= inputH && !g.items.empty()) {
@@ -4048,7 +4443,33 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     ExecuteSelected();
                 }
             } else {
+                // 输入行：放置光标，准备拖拽选区
                 SetFocus(hwnd);
+                size_t pos = CaretFromX(x);
+                g.caret = pos;
+                if (!(GetKeyState(VK_SHIFT) & 0x8000)) {
+                    g.selStart = g.selEnd = pos;
+                } else {
+                    g.selEnd = pos;  // 锚点 selStart 不变，扩展到 pos
+                }
+                g.dragging = true;
+                SetCapture(hwnd);
+                Refresh();
+            }
+            return 0;
+        }
+
+        case WM_LBUTTONDBLCLK: {
+            int y = GET_Y_LPARAM(lParam);
+            if (y < S(kBaseInputH)) {
+                SetFocus(hwnd);
+                size_t pos = CaretFromX(GET_X_LPARAM(lParam));
+                size_t a, b;
+                WordBoundsAt(pos, a, b);
+                g.selStart = a;
+                g.selEnd = b;
+                g.caret = b;
+                Refresh();
             }
             return 0;
         }
@@ -4057,6 +4478,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (g.pressRow != -1) {
                 g.pressRow = -1;
                 StartTween(&g.pressT, 0.0, 120);
+            }
+            if (g.dragging) {
+                g.dragging = false;
+                ReleaseCapture();
             }
             return 0;
         }
@@ -4322,6 +4747,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
 
     LoadWebRules();
     LoadGroupRules();
+    LoadExcludePaths();  // 排除路径（设置可编辑），作用于 Everything + 程序搜索结果
     LoadClickWeights();  // 点击权重数据（%APPDATA%\Flowtary\weights.dat）
     EnableDarkMenus();  // 按主题深浅强制弹出菜单（托盘/右键） 绘制
     g.msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
