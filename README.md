@@ -21,6 +21,7 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
 | `zhihu {q}` | 知乎 `https://www.zhihu.com/search?q={q}` |
 | `douban {q}` | 豆瓣 `https://www.douban.com/search?q={q}` |
 | `google {q}` | Google `https://www.google.com/search?q={q}` |
+| `top` | 置顶/取消置顶当前窗口（切换「唤醒前的前台窗口」置顶，在目标窗口位置弹出轻量提示（已置顶/取消置顶）；需在设置「常规」中开启，默认开） |
 | 其他任意输入 | 程序搜索（见下），回车启动 |
 | **一键组关键字** | 整串精确命中「启动组 / 关闭组」关键字时，结果最前面出现 `一键启动：xxx` / `一键关闭：xxx`，回车即执行（详见「一键」Tab） |
 
@@ -57,6 +58,8 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
     - `文件对话框跳转`：在系统标准文件对话框中直接用 Flowtary 定位/跳转到某个文件夹（类 Listary
       Quick-Switch），**默认勾选**。勾选状态存 `HKCU\Software\Flowtary\FileDlgJump`（`1`=开 / `0`=关，
       缺省为开）；取消则不再劫持文件对话框。**本项已从托盘右键菜单移除，仅在此设置页调整**
+    - `top 命令`：勾选后输入 `top` 回车对「唤醒前的前台窗口」切换置顶/取消置顶（`WS_EX_TOPMOST`），
+      结果在目标窗口位置弹出快速消失的轻量提示「已置顶/取消置顶」；**默认勾选**。存 `HKCU\Software\Flowtary\TopCmd`（`1`=开 / `0`=关）
   - `网页规则` 页：
     - `网页搜索规则`：多行编辑器，保存所有网页跳转规则，每行一条
       `前缀 空格 链接模板`（`{q}` 为关键词占位符，如 `bing https://www.bing.com/search?q={q}`）；

@@ -18,6 +18,7 @@
 #include <new>
 
 #include <algorithm>
+#include <map>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
@@ -137,10 +138,6 @@ struct Theme {
     int shHoverX = 5, shHoverY = 8, shHoverBlur = 20, shHoverA = 40; COLORREF shHoverColor = RGB(0, 0, 0);
     int shInset = 6;  // 内阴影深度（输入凹陷/玻璃高光用，统一弱值）
 
-    // —— 4. 材质（真实 DWM，Win11；Win10 回退 Matte）——
-    enum class Material { Matte, Acrylic, Metal, Mica };
-    Material material = Material::Acrylic;  // 默认真实亚克力（仅 Win11；Win10 回退 Matte）；新主题用 Mica
-
     // —— 7. 动效 ——
     int animMs = 200;    // 过渡时长 150-350，ease-out
     int animCurve = 0;   // 0=ease-out-cubic，1=ease-out-quad
@@ -149,8 +146,6 @@ struct Theme {
     bool accentStrip = true;   // 顶部强调色条
     bool cornerGlow  = false;  // 低透明度角部辉光
     bool iconFilled  = false;  // 图标风格：false=线性描边 / true=填充
-
-    int blurStrength = 0x55;   // 亚克力浓度（ACCENT GradientColor 高 8 位；滑块可调）
 };
 
 static Theme kThemes[] = {
@@ -182,7 +177,7 @@ static Theme kThemes[] = {
      4, 5, 16, 51, RGB(0x82,0x9C,0xB3),
      5, 8, 20, 40, RGB(0x82,0x9C,0xB3),
      2, 3, 10, 30, RGB(0x82,0x9C,0xB3),
-     6, Theme::Material::Mica, 220, 0, true, false, false, 0x55},
+     6, 220, 0, true, false, false},
 
     // 6. Ice-Quartz（浅冷色，真实 Mica / Win10 回退哑光）
     {L"Ice-Quartz", false, 255, 16, 13,
@@ -197,7 +192,7 @@ static Theme kThemes[] = {
      4, 5, 16, 51, RGB(0x82,0x9C,0xB3),
      5, 8, 20, 40, RGB(0x82,0x9C,0xB3),
      2, 3, 10, 30, RGB(0x82,0x9C,0xB3),
-     6, Theme::Material::Mica, 220, 0, true, false, false, 0x55},
+     6, 220, 0, true, false, false},
 
     // 7. Obsidian（极深暗黑工具风，真实 Mica + 微弱蓝辉光）
     {L"Obsidian", true, 255, 16, 13,
@@ -212,7 +207,7 @@ static Theme kThemes[] = {
      2, 3, 12, 89, RGB(0,0,0),
      0, 0, 8, 20, RGB(0,0,0),
      1, 2, 6, 22, RGB(0,0,0),
-     6, Theme::Material::Mica, 200, 0, true, true, false, 0x55},
+     6, 200, 0, true, true, false},
 
     // 8. Honey-Amber（暖暗色，真实 Mica / Win10 回退哑光）
     {L"Honey-Amber", true, 255, 16, 13,
@@ -227,13 +222,12 @@ static Theme kThemes[] = {
      3, 4, 14, 66, RGB(0x0A,0x08,0x06),
      1, 2, 7, 24, RGB(0x0A,0x08,0x06),
      1, 2, 7, 24, RGB(0x0A,0x08,0x06),
-     6, Theme::Material::Mica, 200, 0, true, false, false, 0x55},
+     6, 200, 0, true, false, false},
 };
 
-// 主题微调快照（透明度/毛玻璃浓度/圆角半径），随主题索引一一对应，持久化到注册表 ThemeTune blob
+// 主题微调快照（透明度/圆角半径），随主题索引一一对应，持久化到注册表 ThemeTune blob
 struct ThemeTune {
-    int alpha = 255;     // 透明度 0-255（影响弹窗等离屏层；主窗为真实 DWM 材质，不依赖此项）
-    int blur = 0x55;     // 亚克力浓度（DWM GradientColor 高 8 位）
+    int alpha = 255;     // 透明度 0-255（影响弹窗等离屏层）
     int radius = 10;     // 窗体圆角（卡片/按钮/输入按比例推导）
 };
 static std::vector<ThemeTune> sTune;      // 当前生效值（滑块实时预览会改 kThemes，这里只作回退/读写中转）
@@ -257,16 +251,23 @@ struct Program {
 };
 
 struct Row {
-    enum Kind { File, Folder, Web, Prog, EvFallback, Hint, Group };
+    enum Kind { File, Folder, Web, Prog, EvFallback, Hint, Group, Shell, Window, Top };
     Kind kind = Hint;
     std::wstring title;
     std::wstring sub;     // 路径 / URL 说明
-    std::wstring action;  // 打开目标；EvFallback 时为 Everything 命令行参数
+    std::wstring action;  // 打开目标；EvFallback 时为 Everything 命令行参数；
+                          // Shell 时为命令行文本；Window 时为 HWND 十六进制串
     Program* prog = nullptr;
     // 一键组（Row::Group）：groupKill=false 启动 groupTargets 里的文件；
     // groupKill=true 结束 groupTargets 里的进程名
     bool groupKill = false;
     std::vector<std::wstring> groupTargets;
+    // —— Shell 命令（kind=Shell）：整条命令行见 action ——
+    // —— 窗口切换（kind=Window）——
+    HWND winHwnd = nullptr;        // 目标窗口句柄
+    std::wstring procName;         // 进程名（副标题显示）
+    bool winIsGroup = false;       // 是否为同进程分组头
+    std::vector<HWND> winMembers;  // 分组头：成员窗口列表
 };
 
 // 一键组：关键字 → 目标列表（启动组存文件路径，关闭组存进程名）
@@ -275,7 +276,17 @@ struct CmdGroup {
     std::vector<std::wstring> targets;
 };
 
-enum class Mode { None, Everything, Web, Programs };
+enum class Mode { None, Everything, Web, Programs, Shell, Window, Top };
+
+// 窗口枚举缓存项
+struct WinInfo {
+    HWND hwnd = nullptr;
+    std::wstring title;
+    std::wstring processName;
+    std::wstring className;
+    DWORD pid = 0;
+    bool isUwp = false;
+};
 
 struct App {
     HWND hwnd = nullptr;
@@ -292,16 +303,19 @@ struct App {
     bool startupWanted = false;// 设置窗“开机自动启动”勾选状态（自绘复选框用变量驱动，
                                // 因为 BS_OWNERDRAW 按钮的 Button_GetCheck/SetCheck 不生效）
     bool startupSaved = false; // 设置窗打开时的初始值（取消时回退）
+    bool hotkeyWake = true;    // 唤起快捷键总开关（托盘菜单切换；关闭时不再注册 Alt+Space 等）
     int hotkeyModeSaved = 0;   // 同上，结果项快捷键方案（取消时回退）
     int settingsTab = 0;        // 设置窗当前 Tab：0=常规, 1=网页规则, 2=主题, 3=一键, 4=搜索权重, 5=排除路径（关闭后仍记住上次选择）
     int themeIdx = 0;          // 当前主题索引（设置窗切换后、保存前为暂存值）
     int themeSaved = 0;        // 设置窗打开时的初始主题（取消时回退）
     bool beautify = true;      // 界面美化：暗色标题栏 + 圆角窗口 + 强制暗色菜单（默认开）
     bool beautifySaved = true; // 设置窗打开时的初始值（取消时回退）
-    bool glass = true;         // 毛玻璃（亚克力）背景，仅在 beautify 开启时生效（默认开）
-    bool glassSaved = true;    // 设置窗打开时的初始值（取消时回退）
+    bool antiGhost = false;    // 抗残影双缓冲（实验性）：开启 WS_EX_COMPOSITED 整窗双缓冲，消除切换 Tab 残影
+    bool antiGhostSaved = false; // 设置窗打开时的初始值（取消时回退）
     bool fdjEnabled = true;    // 文件对话框跳转总开关（默认开；UI 在设置「常规」Tab，不再放托盘菜单）
     bool fdjEnabledSaved = true;  // 设置窗打开时的初始值（取消时回退）
+    bool topEnabled = true;    // top 命令开关（默认开：输入 top 回车置顶/取消置顶当前窗口）
+    bool topEnabledSaved = true;  // 设置窗打开时的初始值（取消时回退）
     // ---- 点击加权排序（性能参数在设置「搜索权重」Tab） ----
     bool weightEnabled = true; // 点击权重记忆总开关（默认开）
     int weightFlush = 1;       // 写盘时机：0=每次点击立即写入, 1=延迟合并写入, 2=仅退出时写入
@@ -368,7 +382,33 @@ struct App {
     HICON hTrayIcon = nullptr;
     HICON hAppIcon = nullptr;  // 窗口图标（与托盘同款，字体绘制，不依赖 .ico 资源）
     HWND hSettings = nullptr;  // 设置窗口
+    HWND prevForeground = nullptr;  // 唤醒前的前台窗口（top 命令的目标窗口）
     UINT msgTaskbarCreated = 0;
+
+    // —— Shell 命令 & 窗口切换配置（设置「Shell 与窗口」Tab）——
+    int shellType = 0;            // 0=cmd, 1=powershell, 2=git-bash, 3=自定义
+    std::wstring shellCustomPath; // 自定义 shell 程序完整路径
+    std::wstring shellCustomArgs; // 自定义启动参数模板（{c} 替换为命令）
+    int shellDefaultCwd = 0;      // 0=用户目录, 1=系统默认(System32), 2=桌面
+    bool shellShowWindow = true;   // 前台显示输出窗口（否则后台静默执行）默认勾选
+    // 窗口切换
+    bool winGroupProc = true;     // 合并同进程窗口
+    bool winShowUwp = true;       // 显示 UWP 应用窗口
+    bool winShowProc = true;      // 副标题显示进程名
+    int winCacheSec = 5;          // 窗口枚举缓存刷新间隔（秒）
+    // 取消时回退用
+    int shellTypeSaved = 0;
+    std::wstring shellCustomPathSaved;
+    std::wstring shellCustomArgsSaved;
+    int shellDefaultCwdSaved = 0;
+    bool shellShowWindowSaved = true;
+    bool winGroupProcSaved = true;
+    bool winShowUwpSaved = true;
+    bool winShowProcSaved = true;
+    int winCacheSecSaved = 5;
+    // 窗口枚举缓存（避免频繁 EnumWindows 卡顿）
+    std::vector<WinInfo> windowCache;
+    DWORD windowCacheTick = 0;
 } g;
 
 constexpr int kBaseW = 600, kBaseInputH = 56, kBaseRowH = 30, kBasePad = 12;
@@ -386,10 +426,17 @@ constexpr int WM_APP_QUIT = WM_APP + 3;  // 新版本接管：通知旧实例退
 constexpr int IDM_SETTINGS = 2001;
 constexpr int IDM_EXIT = 2002;
 constexpr int IDM_REFRESH = 2003;   // 托盘菜单：刷新应用缓存
+constexpr int IDM_WAKE_HOTKEY = 2004;  // 托盘菜单：开启/关闭唤起快捷键
 constexpr int IDM_OPEN = 2011;      // 结果右键菜单：打开
 constexpr int IDM_OPENLOC = 2012;   // 结果右键菜单：打开所在文件夹
 constexpr int IDM_COPYPATH = 2013;  // 结果右键菜单：复制路径
 constexpr int IDM_RUNAS = 2014;     // 结果右键菜单：以管理员模式打开
+constexpr int IDM_WIN_SWITCH = 2021;  // 窗口项：切换到此窗口
+constexpr int IDM_WIN_CLOSE = 2022;   // 窗口项：关闭窗口
+constexpr int IDM_WIN_KILL = 2023;    // 窗口项：结束进程
+constexpr int IDM_SHELL_ADMIN = 2024; // Shell 项：以管理员运行
+constexpr int IDM_COPYTITLE = 2025;   // 复制窗口标题
+constexpr int IDM_COPYPROC = 2026;    // 复制进程名
 
 // 结果项快捷键方案：
 //   方案0 Alt+数字：按结果优先级自上而下分配 1..9,0（列表最多 10 行，1=最高优先级）
@@ -397,9 +444,16 @@ constexpr int IDM_RUNAS = 2014;     // 结果右键菜单：以管理员模式�
 static const WCHAR* kHotkeyOrder = L"1234567890";
 static const WCHAR* kHotkeyLetterOrder = L"ABCDEFGHIJ";
 
+// 唤起快捷键候选（依次尝试）：Alt+Space -> Alt+Q -> Ctrl+Alt+Space
+// （避免与其他启动器冲突导致完全不可用；注册成功即停）
+static const struct { UINT mod, vk; const WCHAR* name; } kWakeHotkeys[] = {
+    {MOD_ALT | MOD_NOREPEAT, VK_SPACE, L"Alt+Space"},
+    {MOD_ALT | MOD_NOREPEAT, 'Q', L"Alt+Q"},
+    {MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_SPACE, L"Ctrl+Alt+Space"},
+};
+
 // 前置声明（后文定义，ApplyTheme 需要）
 static void EnableDarkMenus();
-static void ApplyGlass();
 static const CmdGroup* FindGroup(const std::vector<CmdGroup>& gs, const std::wstring& key);
 static int KillProcessesByName(const std::wstring& name);
 static void LayoutSettings(HWND h);
@@ -413,6 +467,9 @@ static std::wstring NormalizeSearchTerm(const std::wstring& s);
 static int GetClickWeight(const std::wstring& term, const std::wstring& path);
 static void RecordClickWeight(const Row& r);
 static void SaveClickWeightsNow();
+static void TrayBalloon(const std::wstring& title, const std::wstring& msg);
+static HWND TopTargetWindow();  // top 命令的目标窗口（唤醒前的前台窗口）
+static void ShowTopToast(HWND target, const std::wstring& text);  // top 命令轻量 toast
 
 // 行 → 可触发序号（Hint 行不算）：返回第几个可执行项（用于分配数字徽章），-1=不可触发
 static int HotkeySeq(int itemIdx) {
@@ -492,11 +549,7 @@ static void UpdateScale(HMONITOR mon) {
     if (g.hSettings) SendMessageW(g.hSettings, WM_CLOSE, 0, 0);  // 尺寸随比例变化，下次打开重建
 }
 
-// 主窗已非分层窗口，毛玻璃走 DWM 系统亚克力（见 ApplyGlassTo）；透明键色 kGlassKey 不再需要。
-
-// 强制整窗重绘并触发 DWM 重新合成：切换毛玻璃/主题/美化时，DWMWA_SYSTEMBACKDROP_TYPE 与
-// 可能残留的 accent 都改的是 DWM 合成层，主动刷新可避免切换瞬间旧材质/旧模糊的残影。
-// 先 RDW_ERASE|RDW_INVALIDATE 让 GDI 位图与新材质对齐，再 SWP_FRAMECHANGED nudge DWM 重合成。
+// 强制整窗重绘并触发 DWM 重新合成：切换主题/美化时主动刷新可避免残影。
 static void RefreshComposition(HWND h) {
     if (!h || !IsWindow(h)) return;
     RedrawWindow(h, nullptr, nullptr, RDW_ERASE | RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN);
@@ -511,13 +564,9 @@ static void RefreshComposition(HWND h) {
     g.fInput = g.fontPool[FontSlot(t.fontInput)];
     g.fList = g.fontPool[FontSlot(t.fontList)];
     if (g.hwnd) {
-        // 主窗已非分层窗口：毛玻璃由 ApplyGlass 走 DWMWA_SYSTEMBACKDROP_TYPE（系统亚克力），
-        // 整体透明度/COLORKEY 已不适用；仅刷新分隔线刷子。
         if (g.brDivider) { DeleteObject(g.brDivider); g.brDivider = nullptr; }
         g.brDivider = CreateSolidBrush(t.divider);
     }
-    // 设置窗已非分层窗口，透明度由 DWM 亚克力材质负责，这里不再调用
-    // SetLayeredWindowAttributes（对无 WS_EX_LAYERED 的窗口无效）。
     if (g.brMenuBg) { DeleteObject(g.brMenuBg); g.brMenuBg = nullptr; }
     g.brMenuBg = CreateSolidBrush(t.menuBg);
     if (g.brEditBg) { DeleteObject(g.brEditBg); g.brEditBg = nullptr; }
@@ -540,13 +589,12 @@ static void RefreshComposition(HWND h) {
     if (g.penBorder) DeleteObject(g.penBorder);
     g.penBorder = CreatePen(PS_SOLID, t.borderWidth, t.border);
     EnableDarkMenus();
-    ApplyGlass();  // 毛玻璃背景随美化开关/玻璃开关与主题底色刷新
     // 切换主题后同步标题栏明暗（深色↔浅色主题时标题栏要跟着变）
     if (g.hSettings && g.beautify) ApplyDarkTitlebar(g.hSettings);
     if (t.stars) GenerateStars();
     if (g.hSettings && repaint) {
         EnumChildWindows(g.hSettings, RefreshChildFont, 0);
-        RefreshComposition(g.hSettings);  // 设置窗亚克力切换也强制重合成（含 SWP_FRAMECHANGED），消除残影
+        RefreshComposition(g.hSettings);  // 切换主题/美化后强制重合成（含 SWP_FRAMECHANGED），消除残影
     }
     if (g.hwnd && repaint) {
         Layout();
@@ -1047,9 +1095,12 @@ static void SearchPrograms(const std::wstring& query) {
     std::wstring ql = NormalizeSearchTerm(query);  // 与权重 key 同款标准化（去首尾空格+小写）
     struct Cand { Program* p; int score; int w; };
     std::vector<Cand> cands;
+    // 单字符查询只保留精确(4)/前缀(3)：带上「包含/子序列」时命中面过宽
+    // （实测 d 命中全部程序的 32%），刚敲第一个字母就撑满 10 行噪音结果。
+    const bool prefixOnly = (ql.size() < 2);
     for (auto& p : g.programs) {
         int s = MatchScore(ToLowerW(p.name), ql);
-        if (s > 0) {
+        if (s > 0 && !(prefixOnly && s < 3)) {
             int w = g.weightEnabled ? GetClickWeight(ql, p.path) : 0;
             cands.push_back({&p, s, w});
         }
@@ -1144,6 +1195,7 @@ static void Show() {
     // 前台被其他进程占用时，借助 AttachThreadInput 提高抢占成功率
     DWORD myTid = GetCurrentThreadId();
     HWND fg = GetForegroundWindow();
+    g.prevForeground = fg;  // 记录唤醒前的前台窗口（top 命令的目标窗口）
     DWORD fgTid = fg ? GetWindowThreadProcessId(fg, nullptr) : 0;
     bool attached = fgTid && fgTid != myTid && AttachThreadInput(myTid, fgTid, TRUE);
     ShowWindow(g.hwnd, SW_SHOW);
@@ -1295,6 +1347,171 @@ static std::wstring BuildModifierQuery(const std::wstring& mod, const std::wstri
     return out;
 }
 
+// ---------------- Shell 命令 & 窗口切换 ----------------
+enum class ExecKind { Normal, Close, Kill, Admin };
+
+// 取窗口所属进程的可执行文件名（basename）
+static std::wstring ModuleBaseName(HWND hwnd) {
+    WCHAR path[MAX_PATH] = {0};
+    if (!GetWindowModuleFileNameW(hwnd, path, MAX_PATH)) return L"";
+    std::wstring p = path;
+    size_t s = p.find_last_of(L"\\/");
+    return (s == std::wstring::npos) ? p : p.substr(s + 1);
+}
+
+// Shell 命令默认工作目录
+static std::wstring GetShellCwd() {
+    WCHAR buf[MAX_PATH];
+    if (g.shellDefaultCwd == 0) {            // 用户目录
+        if (GetEnvironmentVariableW(L"USERPROFILE", buf, MAX_PATH)) return buf;
+    } else if (g.shellDefaultCwd == 1) {     // 系统默认目录 (System32)
+        if (GetSystemDirectoryW(buf, MAX_PATH)) return buf;
+    } else {                                 // 桌面目录
+        std::wstring up;
+        if (GetEnvironmentVariableW(L"USERPROFILE", buf, MAX_PATH)) up = buf;
+        return up.empty() ? L"" : up + L"\\Desktop";
+    }
+    return L"";
+}
+
+// 查找 Git Bash 可执行文件（常见安装位置，回退到 PATH 上的 bash.exe）
+static std::wstring FindGitBash() {
+    const WCHAR* envs[] = { L"ProgramFiles", L"ProgramFiles(x86)" };
+    for (auto e : envs) {
+        WCHAR pf[MAX_PATH] = {0};
+        if (GetEnvironmentVariableW(e, pf, MAX_PATH)) {
+            std::wstring p = std::wstring(pf) + L"\\Git\\bin\\bash.exe";
+            if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) return p;
+        }
+    }
+    return L"bash.exe";
+}
+
+static void KillProcessByPid(DWORD pid) {
+    HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+    if (h) { TerminateProcess(h, 0); CloseHandle(h); }
+}
+
+// 依据当前 shell 配置构造要执行的 exe / 参数 / cwd
+static void BuildShellCommand(const std::wstring& cmd, bool admin,
+                              std::wstring& exe, std::wstring& args, std::wstring& cwd) {
+    exe.clear(); args.clear(); cwd = GetShellCwd();
+    bool visible = g.shellShowWindow || admin;  // 提权时必然可见（UAC 弹窗）
+    if (g.shellType == 0) {            // 命令提示符
+        exe = L"cmd.exe";
+        args = (visible ? L"/k " : L"/c ") + cmd;
+    } else if (g.shellType == 1) {     // PowerShell
+        exe = L"powershell.exe";
+        args = (visible ? L"-NoExit -NoProfile -Command " : L"-NoProfile -Command ") + cmd;
+    } else if (g.shellType == 2) {     // Git Bash
+        exe = FindGitBash();
+        if (visible) args = L"-c \"" + cmd + L"; exec bash\"";
+        else        args = L"-c \"" + cmd + L"\"";
+    } else {                           // 自定义
+        exe = g.shellCustomPath.empty() ? L"cmd.exe" : g.shellCustomPath;
+        std::wstring t = g.shellCustomArgs;
+        size_t p = t.find(L"{c}");
+        if (p != std::wstring::npos) t.replace(p, 3, cmd);
+        else t = t + (t.empty() ? L"" : L" ") + cmd;
+        args = t;
+    }
+}
+
+static BOOL CALLBACK EnumWinProc(HWND hwnd, LPARAM lp) {
+    auto* out = (std::vector<WinInfo>*)lp;
+    if (!IsWindowVisible(hwnd)) return TRUE;
+    if (GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) return TRUE;
+    WCHAR title[512];
+    if (!GetWindowTextW(hwnd, title, 512) || title[0] == 0) return TRUE;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == GetCurrentProcessId()) return TRUE;   // 排除自身
+    WCHAR cls[64];
+    GetClassNameW(hwnd, cls, 64);
+    std::wstring cs = cls;
+    if (cs == L"Progman" || cs == L"WorkerW" || cs == L"Shell_TrayWnd") return TRUE;
+    WinInfo wi;
+    wi.hwnd = hwnd;
+    wi.title = title;
+    wi.className = cs;
+    wi.pid = pid;
+    wi.processName = ModuleBaseName(hwnd);
+    wi.isUwp = (cs == L"Windows.UI.Core.CoreWindow");
+    out->push_back(std::move(wi));
+    return TRUE;
+}
+
+// 枚举 + 缓存 + 匹配 + （可选）分组，生成 Row::Window 结果
+static void SearchWindows(const std::wstring& query) {
+    DWORD now = GetTickCount();
+    if (g.windowCache.empty() || now - g.windowCacheTick >= (DWORD)(g.winCacheSec * 1000)) {
+        std::vector<WinInfo> all;
+        EnumWindows(EnumWinProc, (LPARAM)&all);
+        g.windowCache = std::move(all);
+        g.windowCacheTick = now;
+    }
+    std::wstring q = ToLowerW(TrimW(query));
+    struct Cand { int score; size_t idx; };
+    std::vector<Cand> cands;
+    for (size_t i = 0; i < g.windowCache.size(); ++i) {
+        const WinInfo& w = g.windowCache[i];
+        if (!g.winShowUwp && w.isUwp) continue;
+        int s = 0;
+        if (q.empty()) {
+            s = 1;
+        } else {
+            int a = MatchScore(ToLowerW(w.title), q);
+            int b = MatchScore(ToLowerW(w.processName), q);
+            int c = MatchScore(ToLowerW(w.className), q);
+            s = a; if (b > s) s = b; if (c > s) s = c;
+        }
+        if (s > 0) cands.push_back({s, i});
+    }
+    std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {
+        if (a.score != b.score) return a.score > b.score;
+        return g.windowCache[a.idx].title < g.windowCache[b.idx].title;
+    });
+    if (g.winGroupProc) {
+        std::map<DWORD, std::vector<size_t>> groups;
+        std::vector<DWORD> order;
+        for (size_t k = 0; k < cands.size(); ++k) {
+            DWORD pid = g.windowCache[cands[k].idx].pid;
+            if (groups.find(pid) == groups.end()) order.push_back(pid);
+            groups[pid].push_back(k);
+        }
+        for (DWORD pid : order) {
+            auto& idxs = groups[pid];
+            if (idxs.size() == 1) {
+                const WinInfo& w = g.windowCache[cands[idxs[0]].idx];
+                Row r; r.kind = Row::Window; r.winHwnd = w.hwnd;
+                r.title = w.title; r.procName = w.processName;
+                r.sub = g.winShowProc ? w.processName : L"";
+                r.action = std::to_wstring((uintptr_t)w.hwnd);
+                g.items.push_back(std::move(r));
+            } else {
+                Row r; r.kind = Row::Window; r.winIsGroup = true;
+                for (size_t k : idxs) r.winMembers.push_back(g.windowCache[cands[k].idx].hwnd);
+                const WinInfo& rep = g.windowCache[cands[idxs[0]].idx];
+                r.title = L"▶ " + rep.processName + L" (" + std::to_wstring(idxs.size()) + L")";
+                r.procName = rep.processName;
+                r.sub = g.winShowProc ? rep.processName : L"";
+                g.items.push_back(std::move(r));
+            }
+            if (g.items.size() >= ev::kMaxResults) break;
+        }
+    } else {
+        for (auto& c : cands) {
+            const WinInfo& w = g.windowCache[c.idx];
+            Row r; r.kind = Row::Window; r.winHwnd = w.hwnd;
+            r.title = w.title; r.procName = w.processName;
+            r.sub = g.winShowProc ? w.processName : L"";
+            r.action = std::to_wstring((uintptr_t)w.hwnd);
+            g.items.push_back(std::move(r));
+            if (g.items.size() >= ev::kMaxResults) break;
+        }
+    }
+}
+
 static void Refresh() {
     KillTimer(g.hwnd, kTimerDebounce);
     g.items.clear();
@@ -1308,8 +1525,49 @@ static void Refresh() {
         size_t sp = t.find(L' ');
         std::wstring tok = ToLowerW(sp == std::wstring::npos ? t : t.substr(0, sp));
         std::wstring rest = sp == std::wstring::npos ? L"" : TrimW(t.substr(sp + 1));
+        // 以 > 或 < 开头视为 Shell/窗口前缀，后面整段（去首尾空格）即参数，无需强制空格
+        if (!t.empty() && (t[0] == L'>' || t[0] == L'<')) {
+            tok = std::wstring(1, t[0]);
+            rest = TrimW(t.substr(1));
+        }
 
-        if (sp != std::wstring::npos && (tok == L"d" || tok == L"f")) {
+        if (tok == L">") {
+            g.mode = Mode::Shell;
+            if (rest.empty()) {
+                AddHint(L"输入 Shell 命令，回车执行；Ctrl+Shift+Enter 以管理员运行");
+            } else {
+                Row r;
+                r.kind = Row::Shell;
+                r.title = L"> " + rest;
+                r.action = rest;
+                r.sub = L"Shell 命令";
+                g.items.push_back(std::move(r));
+            }
+        } else if (tok == L"<") {
+            g.mode = Mode::Window;
+            if (rest.empty()) {
+                AddHint(L"输入窗口标题/进程名切换；回车切换，Ctrl+Enter 关闭，Ctrl+Shift+Enter 结束进程");
+            } else {
+                SearchWindows(rest);
+            }
+        } else if (g.topEnabled && tok == L"top" && rest.empty()) {
+            // top 命令：整串恰好为 top（忽略大小写）时，回车对「唤醒前的前台窗口」切换置顶
+            g.mode = Mode::Top;
+            Row r;
+            r.kind = Row::Top;
+            r.action = L"top";
+            HWND target = TopTargetWindow();
+            bool valid = target != nullptr;
+            bool isTop = false;
+            WCHAR winTitle[256] = {};
+            if (valid && GetWindowTextW(target, winTitle, 256) == 0) winTitle[0] = 0;
+            if (valid) isTop = (GetWindowLongPtrW(target, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
+            r.title = valid ? (isTop ? L"取消置顶当前窗口" : L"置顶当前窗口")
+                            : L"置顶当前窗口";
+            r.sub = valid ? (std::wstring(isTop ? L"已置顶：" : L"目标：") + winTitle)
+                          : L"未检测到可置顶的窗口";
+            g.items.push_back(std::move(r));
+        } else if (tok == L"d" || tok == L"f") {
             g.mode = Mode::Everything;
             if (rest.empty()) {
                 AddHint(tok == L"f" ? L"输入关键词搜索文件" : L"输入关键词搜索文件夹");
@@ -1319,7 +1577,7 @@ static void Refresh() {
                 AddHint(L"正在搜索…");
                 SetTimer(g.hwnd, kTimerDebounce, kDebounceMs, nullptr);
             }
-        } else if (sp != std::wstring::npos && FindWebCmd(tok)) {
+        } else if (FindWebCmd(tok)) {
             const WebCmd* w = FindWebCmd(tok);
             g.mode = Mode::Web;
             if (rest.empty()) {
@@ -1362,7 +1620,20 @@ static void Refresh() {
 }
 
 // ---------------- 执行 ----------------
-static bool ExecuteRow(Row& r) {
+// top 命令的目标窗口：唤醒前的前台窗口；排除桌面/任务栏/自身等无效目标
+static HWND TopTargetWindow() {
+    HWND h = g.prevForeground;
+    if (!h || !IsWindow(h) || h == g.hwnd) return nullptr;
+    WCHAR cls[64];
+    if (GetClassNameW(h, cls, 64)) {
+        if (wcscmp(cls, L"Progman") == 0 || wcscmp(cls, L"WorkerW") == 0 ||
+            wcscmp(cls, L"Shell_TrayWnd") == 0)
+            return nullptr;
+    }
+    return h;
+}
+
+static bool ExecuteRow(Row& r, ExecKind ek = ExecKind::Normal) {
     switch (r.kind) {
         case Row::Folder:
             // 若当前有系统文件对话框处于焦点，则把该对话框原地跳转到所选文件夹，
@@ -1400,16 +1671,89 @@ static bool ExecuteRow(Row& r) {
             }
             return true;
         }
+        case Row::Shell: {
+            std::wstring exe, args, cwd;
+            BuildShellCommand(r.action, ek == ExecKind::Admin, exe, args, cwd);
+            if (exe.empty()) return false;
+            HINSTANCE h = ShellExecuteW(nullptr, ek == ExecKind::Admin ? L"runas" : L"open",
+                                       exe.c_str(), args.empty() ? nullptr : args.c_str(),
+                                       cwd.empty() ? nullptr : cwd.c_str(),
+                                       ek == ExecKind::Admin ? SW_SHOWNORMAL
+                                                           : (g.shellShowWindow ? SW_SHOWNORMAL
+                                                                                : SW_HIDE));
+            return (INT_PTR)h > 32;
+        }
+        case Row::Top: {
+            // top 命令：对唤醒前的前台窗口切换置顶（WS_EX_TOPMOST），
+            // 并在目标窗口位置弹一个快速消失的轻量 toast（不走系统通知）
+            HWND target = TopTargetWindow();
+            if (!target) {
+                ShowTopToast(nullptr, L"未找到可置顶的窗口");
+                return true;
+            }
+            LONG_PTR ex = GetWindowLongPtrW(target, GWL_EXSTYLE);
+            bool wasTop = (ex & WS_EX_TOPMOST) != 0;
+            SetWindowPos(target, wasTop ? HWND_NOTOPMOST : HWND_TOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            WCHAR winTitle[256] = {};
+            if (GetWindowTextW(target, winTitle, 256) == 0) winTitle[0] = 0;
+            std::wstring toast = wasTop ? L"取消置顶" : L"已置顶";
+            if (winTitle[0]) toast += L"：" + std::wstring(winTitle);
+            ShowTopToast(target, toast);
+            return true;
+        }
+        case Row::Window: {
+            if (ek == ExecKind::Close) {
+                if (r.winIsGroup) {
+                    for (HWND m : r.winMembers) PostMessageW(m, WM_CLOSE, 0, 0);
+                } else if (IsWindow(r.winHwnd)) {
+                    PostMessageW(r.winHwnd, WM_CLOSE, 0, 0);
+                }
+                return true;
+            }
+            if (ek == ExecKind::Kill) {
+                DWORD pid = 0;
+                if (r.winIsGroup && !r.winMembers.empty())
+                    GetWindowThreadProcessId(r.winMembers.front(), &pid);
+                else if (r.winHwnd)
+                    GetWindowThreadProcessId(r.winHwnd, &pid);
+                if (pid) KillProcessByPid(pid);
+                return true;
+            }
+            // 普通切换：分组头切到首个成员，单窗切到自身
+            HWND target = r.winIsGroup ? (r.winMembers.empty() ? nullptr : r.winMembers.front())
+                                       : r.winHwnd;
+            if (target && IsWindow(target)) {
+                if (IsIconic(target)) ShowWindow(target, SW_RESTORE);
+                SetForegroundWindow(target);
+                return true;
+            }
+            return false;
+        }
         case Row::Hint:
             break;
     }
     return false;
 }
 
-static void ExecuteSelected() {
+// 依据当前选中行与修饰键解析执行方式
+static ExecKind ResolveExecKind(bool ctrl, bool shift) {
+    ExecKind ek = ExecKind::Normal;
+    if (ctrl && shift) ek = ExecKind::Admin;
+    else if (ctrl) ek = ExecKind::Close;
+    if (g.sel >= 0 && g.sel < (int)g.items.size() && g.items[g.sel].kind == Row::Window) {
+        // 窗口项：Ctrl+Enter=关闭，Ctrl+Shift+Enter=结束进程（覆盖默认的提权语义）
+        if (ctrl && shift) ek = ExecKind::Kill;
+        else if (ctrl) ek = ExecKind::Close;
+        else ek = ExecKind::Normal;
+    }
+    return ek;
+}
+
+static void ExecuteSelected(ExecKind ek = ExecKind::Normal) {
     if (g.sel < 0 || g.sel >= (int)g.items.size()) return;
     RecordClickWeight(g.items[g.sel]);  // 点击/回车/快捷键选中即记权重（内部过滤非本地条目与不保存的前缀）
-    if (ExecuteRow(g.items[g.sel])) Hide();
+    if (ExecuteRow(g.items[g.sel], ek)) Hide();
 }
 
 // 以管理员（提升权限）模式打开：仅对可执行项（程序 / 文件）有意义，使用 runas 动词提权
@@ -1480,14 +1824,26 @@ static void ShowRowMenu(HWND hwnd) {
     if (r.kind == Row::Hint) return;
 
     HMENU menu = CreatePopupMenu();
-    AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_OPEN, (LPCWSTR)L"打开");
-    if (r.kind == Row::File || r.kind == Row::Folder || r.kind == Row::Prog)
-        AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_OPENLOC, (LPCWSTR)L"打开所在文件夹");
-    if (r.kind == Row::File || r.kind == Row::Prog)
-        AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_RUNAS, (LPCWSTR)L"以管理员模式打开");
-    AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_COPYPATH,
-                (LPCWSTR)(r.kind == Row::Web ? L"复制链接" : L"复制路径"));
-    SetMenuDefaultItem(menu, IDM_OPEN, FALSE);
+    if (r.kind == Row::Window) {
+        AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_WIN_SWITCH, (LPCWSTR)L"切换到此窗口");
+        AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_WIN_CLOSE, (LPCWSTR)L"关闭窗口");
+        AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_WIN_KILL, (LPCWSTR)L"结束进程");
+        AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_COPYTITLE, (LPCWSTR)L"复制标题");
+        AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_COPYPROC, (LPCWSTR)L"复制进程名");
+        SetMenuDefaultItem(menu, IDM_WIN_SWITCH, FALSE);
+    } else {
+        AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_OPEN, (LPCWSTR)L"打开");
+        if (r.kind == Row::File || r.kind == Row::Folder || r.kind == Row::Prog)
+            AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_OPENLOC, (LPCWSTR)L"打开所在文件夹");
+        if (r.kind == Row::File || r.kind == Row::Prog)
+            AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_RUNAS, (LPCWSTR)L"以管理员模式打开");
+        if (r.kind == Row::Shell)
+            AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_SHELL_ADMIN, (LPCWSTR)L"以管理员运行");
+        AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_COPYPATH,
+                    (LPCWSTR)(r.kind == Row::Web ? L"复制链接"
+                              : r.kind == Row::Shell ? L"复制命令" : L"复制路径"));
+        SetMenuDefaultItem(menu, IDM_OPEN, FALSE);
+    }
     StyleDarkMenu(menu);
 
     POINT p;
@@ -1520,6 +1876,24 @@ static void ShowRowMenu(HWND hwnd) {
             break;
         case IDM_COPYPATH:
             CopyTextToClipboard(r.action);  // Web 行复制的是链接
+            break;
+        case IDM_WIN_SWITCH:
+            ExecuteRow(r);  // Normal → SetForegroundWindow
+            break;
+        case IDM_WIN_CLOSE:
+            ExecuteRow(r, ExecKind::Close);
+            break;
+        case IDM_WIN_KILL:
+            ExecuteRow(r, ExecKind::Kill);
+            break;
+        case IDM_COPYTITLE:
+            CopyTextToClipboard(r.title);
+            break;
+        case IDM_COPYPROC:
+            CopyTextToClipboard(r.procName);
+            break;
+        case IDM_SHELL_ADMIN:
+            ExecuteRow(r, ExecKind::Admin);
             break;
         default:
             done = false;  // 未选择任何项
@@ -1707,64 +2081,6 @@ static void ApplyRoundCorners(HWND h) {
         g.dwmBorderOk = true;
 }
 
-// ---------------- 毛玻璃（亚克力）背景 ----------------
-// 毛玻璃实现说明：主窗与设置窗现在都是「非分层窗口」，统一走文档化
-// DWMWA_SYSTEMBACKDROP_TYPE(38) 系统亚克力材质（Win11 有效）：3=TransientWindow(亚克力) 生效、1=None 关闭。
-// 客户区背景由 Paint 在玻璃开启时不铺底而自然透出亚克力；OS 原生合成，切换主题/开关均无残留。
-// 历史未公开的 SetWindowCompositionAttribute/BLURBEHIND 方案在分层窗上会与亚克力冲突且切换残留，已弃用，
-// 仅保留「清残留 accent」的兜底调用（见 ApplyGlassTo）。
-struct AccentPolicy {
-    int AccentState;
-    int AccentFlags;
-    int GradientColor;
-    int AnimationId;
-};
-struct WinCompAttrData {
-    int Attribute;
-    void* Data;
-    ULONG SizeOfData;
-};
-typedef BOOL(WINAPI* SetWindowCompositionAttributeFn)(HWND, WinCompAttrData*);
-
-static void ApplyGlassTo(HWND h) {
-    if (!h) return;
-    const bool on = g.beautify && g.glass;
-    // 主窗与设置窗现已统一为「非分层窗口」，均走文档化 DWM 亚克力材质：
-    // DWMWA_SYSTEMBACKDROP_TYPE=3(TransientWindow/亚克力) 生效，1=None 关闭。
-    // 由 OS 原生合成，切换主题/开关毛玻璃均无残留。
-    DWORD backdrop = 1;  // 默认 None（哑光 / 关毛玻璃 / Win10）
-    if (on && g.theme) {
-        // 仅 Win11 的 DWMWA_SYSTEMBACKDROP_TYPE 支持 Mica/Acrylic；Win10 下该属性被忽略，
-        // 窗口走 Paint 实铺底色（即 Matte 回退），无需额外处理。
-        switch (g.theme->material) {
-            case Theme::Material::Mica:    backdrop = 2; break;  // 2=Mica（哑光，汲取桌面壁纸色调）
-            case Theme::Material::Acrylic: backdrop = 3; break;  // 3=TransientWindow/亚克力（半透）
-            case Theme::Material::Metal:   backdrop = 3; break;  // Metal 暂用亚克力近似（Paint 另加微弱渐变）
-            case Theme::Material::Matte:   backdrop = 1; break;  // 无材质
-        }
-    }
-    DwmSetWindowAttribute(h, 38 /*DWMWA_SYSTEMBACKDROP_TYPE*/, &backdrop, sizeof(backdrop));
-    // 清掉可能残留的未公开 accent（历史 BLURBEHIND 缓存会叠加在亚克力上，必须清掉）
-    HMODULE u = GetModuleHandleW(L"user32.dll");
-    if (u) {
-        auto fn = (SetWindowCompositionAttributeFn)GetProcAddress(u, "SetWindowCompositionAttribute");
-        if (fn) {
-            AccentPolicy ap{};
-            ap.AccentState = 0;  // ACCENT_DISABLED
-            WinCompAttrData d{19 /*WCA_ACCENT_POLICY*/, &ap, sizeof(ap)};
-            fn(h, &d);
-        }
-    }
-    RefreshComposition(h);
-}
-
-static void ApplyGlass() {
-    ApplyGlassTo(g.hwnd);
-    ApplyGlassTo(g.hSettings);
-}
-
-// 注：主窗已非分层窗口，不再有整体 alpha 透明度，故无 EffectiveAlpha 压暗逻辑。
-
 // 图标一律用系统自带字体现场绘制：优先 Segoe MDL2 Assets / Segoe Fluent Icons 的
 // 放大镜字形（U+E721），图标字体缺失时回退 Segoe UI 粗体字母「F」。
 // 不引入任何 .ico 资源，零额外图标开销。
@@ -1858,7 +2174,8 @@ static void TrayAdd() {
     g.nid.uCallbackMessage = WM_APP_TRAY;
     g.nid.hIcon = g.hTrayIcon;
     std::wstring tip = g.startingUp ? L"Flowtary — 正在启动中…"
-                                    : (L"Flowtary — " + g.hotkeyName + L" 唤出");
+                                    : (g.hotkeyWake ? (L"Flowtary — " + g.hotkeyName + L" 唤出")
+                                                    : L"Flowtary — 左键点击唤出");
     lstrcpynW(g.nid.szTip, tip.c_str(), ARRAYSIZE(g.nid.szTip));
     Shell_NotifyIconW(NIM_ADD, &g.nid);
 }
@@ -1866,7 +2183,8 @@ static void TrayAdd() {
 static void TrayUpdateTip() {
     if (!g.hwnd) return;
     std::wstring tip = g.startingUp ? L"Flowtary — 正在启动中…"
-                                    : (L"Flowtary — " + g.hotkeyName + L" 唤出");
+                                    : (g.hotkeyWake ? (L"Flowtary — " + g.hotkeyName + L" 唤出")
+                                                    : L"Flowtary — 左键点击唤出");
     lstrcpynW(g.nid.szTip, tip.c_str(), ARRAYSIZE(g.nid.szTip));
     Shell_NotifyIconW(NIM_MODIFY, &g.nid);
 }
@@ -1880,6 +2198,36 @@ static void TrayBalloon(const std::wstring& title, const std::wstring& msg) {
     Shell_NotifyIconW(NIM_MODIFY, &g.nid);
     // 短暂展示后清除 szInfo，避免后续 NIM_MODIFY（如提示文案更新）再次弹出
     SetTimer(g.hwnd, kTimerBalloon, 3500, nullptr);
+}
+
+// 注册唤起快捷键（依次尝试候选组合，成功即停），返回是否注册成功
+static bool RegisterWakeHotkey() {
+    for (int i = 0; i < 3; ++i) {
+        if (RegisterHotKey(g.hwnd, 1, kWakeHotkeys[i].mod, kWakeHotkeys[i].vk)) {
+            g.hotkeyName = kWakeHotkeys[i].name;
+            return true;
+        }
+    }
+    return false;
+}
+
+// 托盘菜单：切换唤起快捷键开关（关闭=注销热键，开启=重新依次尝试注册）
+static void ToggleWakeHotkey() {
+    if (!g.hwnd) return;
+    if (g.hotkeyWake) {
+        UnregisterHotKey(g.hwnd, 1);  // 关闭：注销唤起热键
+        g.hotkeyWake = false;
+    } else {
+        if (!RegisterWakeHotkey()) {
+            TrayBalloon(L"Flowtary", L"唤起快捷键注册失败，可能被其他程序占用");
+            return;  // 注册失败：保持关闭状态
+        }
+        g.hotkeyWake = true;
+    }
+    DWORD v = g.hotkeyWake ? 1 : 0;
+    RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"HotkeyWake", REG_DWORD, &v,
+                    sizeof(v));
+    TrayUpdateTip();  // 提示文案随开关状态刷新
 }
 
 static void TrayRemove() {
@@ -1923,6 +2271,7 @@ static void SetStartup(bool on) {
     }
 }
 
+static std::wstring LoadRegText(const WCHAR* name);  // 前向声明（定义见下方）
 static void LoadSettings() {
     g.centerWake = true;
     g.hotkeyMode = 0;  // 默认 Alt+数字
@@ -1939,6 +2288,12 @@ static void LoadSettings() {
         g.hotkeyMode = v ? 0 : 2;  // 兼容旧键：1=数字(0)，0=关闭(2)
     }
     if (g.hotkeyMode < 0 || g.hotkeyMode > 2) g.hotkeyMode = 0;
+    // 唤起快捷键总开关（托盘菜单可切换；默认开）
+    v = 1;
+    cb = sizeof(v);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"HotkeyWake",
+                     RRF_RT_REG_DWORD, nullptr, &v, &cb) == ERROR_SUCCESS)
+        g.hotkeyWake = v != 0;
     v = (DWORD)g.themeIdx;
     cb = sizeof(v);
     if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"Theme", RRF_RT_REG_DWORD,
@@ -1953,13 +2308,15 @@ static void LoadSettings() {
         g.beautify = v != 0;
     else
         g.beautify = true;  // 默认开
+    // 抗残影双缓冲（实验性）：默认关，需用户手动开启；开启后整窗双缓冲消除残影
     cb = sizeof(v);
-    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"Glass", RRF_RT_REG_DWORD,
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"AntiGhost", RRF_RT_REG_DWORD,
                      nullptr, &v, &cb) == ERROR_SUCCESS)
-        g.glass = v != 0;
+        g.antiGhost = v != 0;
     else
-        g.glass = true;  // 默认开
-    // 主题微调（透明度/毛玻璃浓度/圆角）：按主题读回 blob；主题数量变化时整体忽略（用预设默认）
+        g.antiGhost = false;  // 默认关（实验性）
+    cb = sizeof(v);
+    // 主题微调（透明度/圆角）：按主题读回 blob；主题数量变化时整体忽略（用预设默认）
     {
         const int n = (int)(sizeof(kThemes) / sizeof(kThemes[0]));
         DWORD cbT = 0;
@@ -1971,10 +2328,8 @@ static void LoadSettings() {
                              RRF_RT_REG_BINARY, nullptr, sTune.data(), &cbT) == ERROR_SUCCESS) {
                 for (int i = 0; i < n; ++i) {
                     int a = (std::max)(0, (std::min)(255, sTune[i].alpha));
-                    int b = (std::max)(0, (std::min)(255, sTune[i].blur));
                     int r = (std::max)(0, (std::min)(14, sTune[i].radius));
                     kThemes[i].alpha = (BYTE)a;
-                    kThemes[i].blurStrength = b;
                     kThemes[i].radiusWindow = r;
                     kThemes[i].radiusCard = (int)(r * 0.8);
                     kThemes[i].radiusButton = (int)(r * 0.6);
@@ -2004,6 +2359,58 @@ static void LoadSettings() {
         g.weightMaxEntries = (int)v;
     if (g.weightMaxEntries < 100) g.weightMaxEntries = 5000;
     if (g.weightMaxEntries > 200000) g.weightMaxEntries = 200000;
+
+    // top 命令开关（输入 top 回车置顶/取消置顶当前窗口；默认开）
+    cb = sizeof(v);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"TopCmd", RRF_RT_REG_DWORD,
+                     nullptr, &v, &cb) == ERROR_SUCCESS)
+        g.topEnabled = v != 0;
+    else
+        g.topEnabled = true;
+
+    // —— Shell 与窗口设置 ——
+    DWORD vv = 0; DWORD cbv = sizeof(vv);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"ShellType",
+                     RRF_RT_REG_DWORD, nullptr, &vv, &cbv) == ERROR_SUCCESS) {
+        g.shellType = (int)vv;
+        if (g.shellType < 0 || g.shellType > 3) g.shellType = 0;
+    }
+    g.shellCustomPath = LoadRegText(L"ShellCustomPath");
+    g.shellCustomArgs = LoadRegText(L"ShellCustomArgs");
+    cbv = sizeof(vv);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"ShellDefaultCwd",
+                     RRF_RT_REG_DWORD, nullptr, &vv, &cbv) == ERROR_SUCCESS) {
+        g.shellDefaultCwd = (int)vv;
+        if (g.shellDefaultCwd < 0 || g.shellDefaultCwd > 2) g.shellDefaultCwd = 0;
+    }
+    cbv = sizeof(vv);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"ShellShowWindow",
+                     RRF_RT_REG_DWORD, nullptr, &vv, &cbv) == ERROR_SUCCESS)
+        g.shellShowWindow = vv != 0;
+    cbv = sizeof(vv);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"WinGroupProc",
+                     RRF_RT_REG_DWORD, nullptr, &vv, &cbv) == ERROR_SUCCESS)
+        g.winGroupProc = vv != 0;
+    else
+        g.winGroupProc = true;  // 默认开
+    cbv = sizeof(vv);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"WinShowUwp",
+                     RRF_RT_REG_DWORD, nullptr, &vv, &cbv) == ERROR_SUCCESS)
+        g.winShowUwp = vv != 0;
+    else
+        g.winShowUwp = true;
+    cbv = sizeof(vv);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"WinShowProc",
+                     RRF_RT_REG_DWORD, nullptr, &vv, &cbv) == ERROR_SUCCESS)
+        g.winShowProc = vv != 0;
+    else
+        g.winShowProc = true;
+    cbv = sizeof(vv);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"WinCacheSec",
+                     RRF_RT_REG_DWORD, nullptr, &vv, &cbv) == ERROR_SUCCESS) {
+        g.winCacheSec = (int)vv;
+        if (g.winCacheSec < 1 || g.winCacheSec > 60) g.winCacheSec = 5;
+    }
 }
 
 // ---------------- 网页规则解析与持久化 ----------------
@@ -2279,15 +2686,14 @@ static bool WeightTermFromInput(std::wstring& termOut) {
     termOut.clear();
     const std::wstring& t = g.text;
     size_t sp = t.find(L' ');
-    if (sp != std::wstring::npos) {
-        std::wstring tok = ToLowerW(t.substr(0, sp));
-        std::wstring rest = TrimW(t.substr(sp + 1));
-        if (tok == L"d" || tok == L"f") {
-            termOut = NormalizeSearchTerm(rest);
-            return !termOut.empty();
-        }
-        if (FindWebCmd(tok)) return false;  // gg 等网页前缀：本次点击不记录权重
+    std::wstring tok = ToLowerW(sp == std::wstring::npos ? t : t.substr(0, sp));
+    std::wstring rest = sp == std::wstring::npos ? L"" : TrimW(t.substr(sp + 1));
+    // 与 Refresh() 对齐：无空格时首词同样可能是命令关键字（f/d 或网页前缀）
+    if (tok == L"d" || tok == L"f") {
+        termOut = NormalizeSearchTerm(rest);
+        return !termOut.empty();
     }
+    if (FindWebCmd(tok)) return false;  // gg 等网页前缀：本次点击不记录权重
     termOut = NormalizeSearchTerm(t);
     return !termOut.empty();
 }
@@ -2438,22 +2844,14 @@ static void Paint(HDC hdc) {
     int pad = S(kBasePad), inputH = S(kBaseInputH), rowH = S(kBaseRowH);
     const Theme& t = *g.theme;
 
-    bool glassOn = g.beautify && g.glass;
     HDC mem;
     HBITMAP bmp = nullptr;
     HGDIOBJ oldBmp = nullptr;
-    if (glassOn) {
-        // 毛玻璃开启：直接画到窗口 DC 且不铺背景，让 DWM 系统亚克力材质透出；
-        // 文字/列表/边框照常绘制（整体 alpha/COLORKEY 在主窗已不适用）。
-        mem = hdc;
-    } else {
-        mem = CreateCompatibleDC(hdc);
-        bmp = CreateCompatibleBitmap(hdc, W, H);
-        oldBmp = SelectObject(mem, bmp);
-        // 非玻璃态按主题铺底（双缓冲离屏，再 BitBlt 到窗口 DC）
-        if (t.bg2 != t.bg) FillVGradient(mem, 0, 0, W, H, t.bg, t.bg2);
-        else { HBRUSH bgBr = CreateSolidBrush(t.bg); FillRect(mem, &rc, bgBr); DeleteObject(bgBr); }
-    }
+    mem = CreateCompatibleDC(hdc);
+    bmp = CreateCompatibleBitmap(hdc, W, H);
+    oldBmp = SelectObject(mem, bmp);
+    if (t.bg2 != t.bg) FillVGradient(mem, 0, 0, W, H, t.bg, t.bg2);
+    else { HBRUSH bgBr = CreateSolidBrush(t.bg); FillRect(mem, &rc, bgBr); DeleteObject(bgBr); }
     if (t.stars) {
         HBRUSH starB[3];
         starB[0] = CreateSolidBrush(RGB(255, 255, 255));
@@ -2626,13 +3024,10 @@ static void Paint(HDC hdc) {
         StrokeRoundRect(mem, fr, S(t.radiusWindow), g.penBorder);
     }
 
-    if (!glassOn) {
-        // 仅非玻璃态（离屏双缓冲）需把位图拷到窗口 DC；玻璃态直接画在窗口 DC 上
-        BitBlt(hdc, 0, 0, W, H, mem, 0, 0, SRCCOPY);
-        SelectObject(mem, oldBmp);
-        DeleteObject(bmp);
-        DeleteDC(mem);
-    }
+    BitBlt(hdc, 0, 0, W, H, mem, 0, 0, SRCCOPY);
+    SelectObject(mem, oldBmp);
+    DeleteObject(bmp);
+    DeleteDC(mem);
 }
 
 // ---------------- 设置窗口（黑暗模式，全部尺寸随 S() 比例） ----------------
@@ -2651,7 +3046,8 @@ constexpr int IDC_TAB_GENERAL = 3014;
 constexpr int IDC_TAB_WEB = 3015;
 constexpr int IDC_TAB_THEME = 3016;
 constexpr int IDC_CHK_BEAUTIFY = 3017;  // 主题页：界面美化开关
-constexpr int IDC_CHK_GLASS = 3018;     // 主题页：毛玻璃背景开关
+constexpr int IDC_CHK_GHOST = 3053;     // 主题页：抗残影双缓冲开关（实验性）
+constexpr int IDC_LBL_GHOSTHINT = 3054; // 主题页：抗残影开关的「实验性」说明
 // 一键启动 / 一键关闭 Tab（索引 3）
 constexpr int IDC_TAB_GROUP = 3019;
 constexpr int IDC_LBL_LAUNCH = 3020;    // 「启动组」标题
@@ -2671,13 +3067,12 @@ constexpr int IDC_BTN_WIPE = 3031;       // 清空权重数据（两步确认）
 constexpr int IDC_LBL_WCOUNT = 3032;     // 当前已记忆条数
 constexpr int IDC_LBL_WEIHINT = 3033;    // 权重页说明文字
 constexpr int IDC_CHK_FILEDLGJUMP = 3034;  // 常规页：文件对话框跳转开关
+constexpr int IDC_CHK_TOP = 3035;          // 常规页：top 命令开关（输入 top 回车置顶/取消置顶当前窗口）
 // 主题页：自绘主题选择器（色板列表）+ 3 个微调滑块（实时预览，保存后生效）
 constexpr int IDC_LST_THEME = 3040;  // 主题选择器：自绘列表框
 constexpr int IDC_LBL_TUNE = 3041;   // 「微调」说明标签
 constexpr int IDC_TRK_ALPHA = 3042;  // 透明度滑块 0-255
 constexpr int IDC_LBL_ALPHA = 3043;  // 透明度滑块标签
-constexpr int IDC_TRK_BLUR = 3044;   // 毛玻璃浓度滑块 0-255
-constexpr int IDC_LBL_BLUR = 3045;   // 毛玻璃浓度滑块标签
 constexpr int IDC_TRK_RADIUS = 3046; // 圆角半径滑块 0-14
 constexpr int IDC_LBL_RADIUS = 3047; // 圆角半径滑块标签
 // 排除路径 Tab（索引 5）：自定义编辑器 + 「恢复默认」按钮
@@ -2689,6 +3084,37 @@ constexpr int IDC_LBL_EXCLUDECOUNT = 3052;   // 当前已记忆 N 条排除项
 constexpr int IDM_THEME_BASE = 4200;  // 主题下拉菜单指令基值
 constexpr int IDM_FLUSH_BASE = 4410;  // 写入时机下拉菜单指令基值
 constexpr int IDM_MAXENT_BASE = 4420; // 条目上限下拉菜单指令基值
+
+// Shell 与窗口 Tab（索引 6）
+constexpr int IDC_TAB_SHELL = 3060;        // 左侧 Tab：Shell 与窗口
+constexpr int IDC_LBL_SHELLTYPE = 3061;    // 「Shell 程序」标签
+constexpr int IDC_CMB_SHELLTYPE = 3062;    // Shell 程序下拉（cmd/PowerShell/Git Bash/自定义）
+constexpr int IDC_LBL_SHELLPATH = 3063;    // 「自定义路径」标签
+constexpr int IDC_EDT_SHELLPATH = 3064;    // 自定义 Shell 程序路径编辑框
+constexpr int IDC_LBL_SHELLARGS = 3065;    // 「自定义参数」标签
+constexpr int IDC_EDT_SHELLARGS = 3066;    // 自定义启动参数模板编辑框（{c}=命令）
+constexpr int IDC_LBL_SHELLCWD = 3067;     // 「默认工作目录」标签
+constexpr int IDC_CMB_SHELLCWD = 3068;     // 默认工作目录下拉
+constexpr int IDC_CHK_SHOWWIN = 3069;      // 前台显示输出窗口
+constexpr int IDC_CHK_WINGROUP = 3070;     // 合并同进程窗口
+constexpr int IDC_CHK_WINUWP = 3071;       // 显示 UWP 应用窗口
+constexpr int IDC_CHK_WINPROC = 3072;      // 副标题显示进程名
+constexpr int IDC_LBL_WINCACHE = 3073;     // 「缓存刷新间隔」标签
+constexpr int IDC_CMB_WINCACHE = 3074;     // 缓存刷新间隔下拉
+constexpr int IDC_LBL_SHELLHINT = 3075;    // 说明文字
+
+// Shell 与窗口 Tab 下拉项的当前文字
+static const WCHAR* ShellTypeName(int t) {
+    return t == 0 ? L"命令提示符 (cmd)"
+         : t == 1 ? L"PowerShell"
+         : t == 2 ? L"Git Bash"
+                  : L"自定义…";
+}
+static const WCHAR* ShellCwdName(int t) {
+    return t == 0 ? L"用户目录 (%USERPROFILE%)"
+         : t == 1 ? L"系统默认目录 (System32)"
+                  : L"桌面目录";
+}
 
 // 设置窗口 Tab 切换：按 g.settingsTab 显示/隐藏对应分组控件，
 // 并把「保存/取消」按钮位置随 Tab 调整（通用页按钮上移，避免大片留白）。
@@ -2705,6 +3131,7 @@ static void ShowSettingsTab(HWND h, int tab) {
     vis(IDC_LBL_WAKE, general);
     vis(IDC_CMB_WAKE, general);
     vis(IDC_CHK_FILEDLGJUMP, general);
+    vis(IDC_CHK_TOP, general);
     bool web = (tab == 1);
     vis(IDC_LBL_RULES, web);
     vis(IDC_EDT_RULES, web);
@@ -2712,14 +3139,13 @@ static void ShowSettingsTab(HWND h, int tab) {
     vis(IDC_BTN_RESET, web);
     bool theme = (tab == 2);
     vis(IDC_CHK_BEAUTIFY, theme);
-    vis(IDC_CHK_GLASS, theme);
+    vis(IDC_CHK_GHOST, theme);
+    vis(IDC_LBL_GHOSTHINT, theme);
     vis(IDC_LBL_THEME, theme);
     vis(IDC_LST_THEME, theme);
     vis(IDC_LBL_TUNE, theme);
     vis(IDC_TRK_ALPHA, theme);
     vis(IDC_LBL_ALPHA, theme);
-    vis(IDC_TRK_BLUR, theme);
-    vis(IDC_LBL_BLUR, theme);
     vis(IDC_TRK_RADIUS, theme);
     vis(IDC_LBL_RADIUS, theme);
     bool group = (tab == 3);
@@ -2742,6 +3168,22 @@ static void ShowSettingsTab(HWND h, int tab) {
     vis(IDC_EDT_EXCLUDE, exclude);
     vis(IDC_BTN_EXCLUDE_DEFAULT, exclude);
     vis(IDC_LBL_EXCLUDECOUNT, exclude);
+    bool shell = (tab == 6);
+    vis(IDC_LBL_SHELLTYPE, shell);
+    vis(IDC_CMB_SHELLTYPE, shell);
+    vis(IDC_LBL_SHELLPATH, shell);
+    vis(IDC_EDT_SHELLPATH, shell);
+    vis(IDC_LBL_SHELLARGS, shell);
+    vis(IDC_EDT_SHELLARGS, shell);
+    vis(IDC_LBL_SHELLCWD, shell);
+    vis(IDC_CMB_SHELLCWD, shell);
+    vis(IDC_CHK_SHOWWIN, shell);
+    vis(IDC_CHK_WINGROUP, shell);
+    vis(IDC_CHK_WINUWP, shell);
+    vis(IDC_CHK_WINPROC, shell);
+    vis(IDC_LBL_WINCACHE, shell);
+    vis(IDC_CMB_WINCACHE, shell);
+    vis(IDC_LBL_SHELLHINT, shell);
     // 保存/取消/恢复默认：始终显示，贴底并整行居中（由 LayoutSettings 统一处理）
     LayoutSettings(h);
     InvalidateRect(h, nullptr, TRUE);
@@ -2770,7 +3212,6 @@ static void ApplyBeautify() {
         DwmSetWindowAttribute(g.hSettings, DWMWA_WINDOW_CORNER_PREFERENCE, &pref, sizeof(pref));
     }
     EnableDarkMenus();  // 菜单深浅随美化开关与主题
-    ApplyGlass();       // 毛玻璃随美化开关一起开关
 }
 
 static void DrawCheckGlyph(HDC hdc, const RECT& r, COLORREF color) {
@@ -2831,9 +3272,9 @@ static void ApplyLayoutRule(int id, CtlGeom& cg) {
         case IDC_LBL_RULES:
         case IDC_CHK_START:
         case IDC_CHK_BEAUTIFY:
-        case IDC_CHK_GLASS:
         case IDC_CHK_WEIGHTON:
         case IDC_CHK_FILEDLGJUMP:
+        case IDC_CHK_TOP:
         case IDC_CMB_HOTKEY:
         case IDC_CMB_WAKE:
         case IDC_CMB_FLUSH:
@@ -2853,10 +3294,30 @@ static void ApplyLayoutRule(int id, CtlGeom& cg) {
         case IDC_BTN_EXCLUDE_DEFAULT:
             cg.stretchW = true;  // 排除路径页提示/计数/按钮：宽度跟随
             break;
+        // Shell 与窗口页：标签/下拉/编辑宽度跟随内容区
+        case IDC_LBL_SHELLTYPE:
+        case IDC_CMB_SHELLTYPE:
+        case IDC_LBL_SHELLPATH:
+        case IDC_EDT_SHELLPATH:
+        case IDC_LBL_SHELLARGS:
+        case IDC_EDT_SHELLARGS:
+        case IDC_LBL_SHELLCWD:
+        case IDC_CMB_SHELLCWD:
+        case IDC_CHK_SHOWWIN:
+        case IDC_CHK_WINGROUP:
+        case IDC_CHK_WINUWP:
+        case IDC_CHK_WINPROC:
+        case IDC_LBL_WINCACHE:
+        case IDC_CMB_WINCACHE:
+            cg.stretchW = true;  // 宽度跟随内容区
+            break;
+        case IDC_LBL_SHELLHINT:
+            cg.stretchW = true;   // 宽度跟随内容区
+            cg.anchorBottom = true;  // 提示行贴底（始终位于按钮行上方，窗口缩放时也不与按钮重叠）
+            break;
         case IDC_LST_THEME:
         case IDC_LBL_TUNE:
         case IDC_TRK_ALPHA:
-        case IDC_TRK_BLUR:
         case IDC_TRK_RADIUS:
             cg.stretchW = true;  // 主题页：列表框与滑块宽度跟随内容区
             break;
@@ -2900,29 +3361,23 @@ static void RecordSettingsLayout(HWND h) {
     }
 }
 
-// 主题微调滑块：把当前主题的 alpha/blur/radius 同步到滑块位置与标签
+// 主题微调滑块：把当前主题的 alpha/radius 同步到滑块位置与标签
 static void UpdateTuneLabel(HWND h, int tid, int v) {
-    int lid = (tid == IDC_TRK_ALPHA) ? IDC_LBL_ALPHA
-            : (tid == IDC_TRK_BLUR)  ? IDC_LBL_BLUR
-                                     : IDC_LBL_RADIUS;
+    int lid = (tid == IDC_TRK_ALPHA) ? IDC_LBL_ALPHA : IDC_LBL_RADIUS;
     HWND lab = GetDlgItem(h, lid);
     if (!lab) return;
-    const WCHAR* name = (tid == IDC_TRK_ALPHA) ? L"透明度"
-                       : (tid == IDC_TRK_BLUR)  ? L"毛玻璃浓度"
-                                                : L"圆角半径";
+    const WCHAR* name = (tid == IDC_TRK_ALPHA) ? L"透明度" : L"圆角半径";
     WCHAR buf[48];
     swprintf_s(buf, L"%s：%d", name, v);
     SetWindowTextW(lab, buf);
 }
 static void SyncTuneSliders(HWND h) {
     if (!g.theme) return;
-    HWND a = GetDlgItem(h, IDC_TRK_ALPHA), b = GetDlgItem(h, IDC_TRK_BLUR),
+    HWND a = GetDlgItem(h, IDC_TRK_ALPHA),
           r = GetDlgItem(h, IDC_TRK_RADIUS);
     if (a) SendMessageW(a, TBM_SETPOS, TRUE, g.theme->alpha);
-    if (b) SendMessageW(b, TBM_SETPOS, TRUE, g.theme->blurStrength);
     if (r) SendMessageW(r, TBM_SETPOS, TRUE, g.theme->radiusWindow);
     UpdateTuneLabel(h, IDC_TRK_ALPHA, g.theme->alpha);
-    UpdateTuneLabel(h, IDC_TRK_BLUR, g.theme->blurStrength);
     UpdateTuneLabel(h, IDC_TRK_RADIUS, g.theme->radiusWindow);
 }
 
@@ -2979,6 +3434,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             g.weightMaxSaved = g.weightMaxEntries;
             g.fdjEnabled = fdj_enabled();         // 初始化自注册表（默认开）
             g.fdjEnabledSaved = g.fdjEnabled;
+            g.topEnabledSaved = g.topEnabled;     // top 命令开关（取消时回退）
             HWND c;
 
             // 左侧 Tab 栏（自绘按钮）：常规 / 网页规则 / 主题
@@ -3011,6 +3467,11 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                                 S(10), S(244), S(120), S(36), h,
                                 (HMENU)(INT_PTR)IDC_TAB_EXCLUDE, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+            c = CreateWindowExW(0, L"BUTTON", L"Shell 与窗口",
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                S(10), S(288), S(120), S(36), h,
+                                (HMENU)(INT_PTR)IDC_TAB_SHELL, g.inst, nullptr);
             SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
 
             c = CreateWindowExW(0, L"BUTTON", L"开机自动启动",
@@ -3052,6 +3513,15 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                                 (HMENU)(INT_PTR)IDC_CHK_FILEDLGJUMP, g.inst, nullptr);
             SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
 
+            // top 命令开关（自绘复选框，状态由 g.topEnabled 驱动；输入 top 回车
+            // 置顶/取消置顶「唤醒前的前台窗口」，结果以托盘气泡提示）
+            c = CreateWindowExW(0, L"BUTTON",
+                                L"top 命令（输入 top 回车，置顶/取消置顶当前窗口）",
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                margin, S(140), contentW, S(24), h,
+                                (HMENU)(INT_PTR)IDC_CHK_TOP, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+
             c = CreateWindowExW(0, L"STATIC", L"主题：",
                                 WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE, margin, S(92), S(90),
                                 S(28), h, (HMENU)(INT_PTR)IDC_LBL_THEME, g.inst, nullptr);
@@ -3090,34 +3560,21 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             SendMessageW(c, TBM_SETRANGE, TRUE, MAKELONG(0, 255));
             SendMessageW(c, TBM_SETPOS, TRUE, g.theme ? g.theme->alpha : 255);
 
-            c = CreateWindowExW(0, L"STATIC", L"毛玻璃浓度",
-                                WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE, margin, S(314), S(64),
-                                S(20), h, (HMENU)(INT_PTR)IDC_LBL_BLUR, g.inst, nullptr);
-            SendMessageW(c, WM_SETFONT, (WPARAM)g.fList, TRUE);
-            c = CreateWindowExW(0, TRACKBAR_CLASS, nullptr,
-                                WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS | TBS_BOTH,
-                                margin + S(68), S(314), contentW - S(68), S(20), h,
-                                (HMENU)(INT_PTR)IDC_TRK_BLUR, g.inst, nullptr);
-            SendMessageW(c, TBM_SETRANGE, TRUE, MAKELONG(0, 255));
-            SendMessageW(c, TBM_SETPOS, TRUE, g.theme ? g.theme->blurStrength : 0x55);
-
             c = CreateWindowExW(0, L"STATIC", L"圆角半径",
-                                WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE, margin, S(338), S(64),
+                                WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE, margin, S(314), S(64),
                                 S(20), h, (HMENU)(INT_PTR)IDC_LBL_RADIUS, g.inst, nullptr);
             SendMessageW(c, WM_SETFONT, (WPARAM)g.fList, TRUE);
             c = CreateWindowExW(0, TRACKBAR_CLASS, nullptr,
                                 WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS | TBS_BOTH,
-                                margin + S(68), S(338), contentW - S(68), S(20), h,
+                                margin + S(68), S(314), contentW - S(68), S(20), h,
                                 (HMENU)(INT_PTR)IDC_TRK_RADIUS, g.inst, nullptr);
             SendMessageW(c, TBM_SETRANGE, TRUE, MAKELONG(0, 14));
             SendMessageW(c, TBM_SETPOS, TRUE, g.theme ? g.theme->radiusWindow : 10);
             SyncTuneSliders(h);  // 标签显示「名称：当前值」，与滑块位置对齐
 
-            // 微调滑块依赖界面美化（毛玻璃/材质）：初始按美化开关置灰/恢复
+            // 微调滑块依赖界面美化：初始按美化开关置灰/恢复
             if (!g.beautify) {
                 EnableWindow(GetDlgItem(h, IDC_TRK_ALPHA), FALSE);
-                EnableWindow(GetDlgItem(h, IDC_TRK_BLUR), FALSE);
-                EnableWindow(GetDlgItem(h, IDC_TRK_RADIUS), FALSE);
             }
 
             // 界面美化开关（自绘复选框，状态由 g.beautify 驱动；移入「主题」Tab）
@@ -3128,12 +3585,18 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                                 (HMENU)(INT_PTR)IDC_CHK_BEAUTIFY, g.inst, nullptr);
             SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
 
-            // 毛玻璃背景开关（仅在界面美化开启时可勾选）
-            c = CreateWindowExW(0, L"BUTTON", L"毛玻璃背景（亚克力模糊）",
+            // 抗残影双缓冲（实验性）：自绘复选框，状态由 g.antiGhost 驱动
+            c = CreateWindowExW(0, L"BUTTON",
+                                L"启用抗残影双缓冲（实验性）",
                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-                                margin, S(52), contentW, S(24), h,
-                                (HMENU)(INT_PTR)IDC_CHK_GLASS, g.inst, nullptr);
+                                margin, S(48), contentW, S(22), h,
+                                (HMENU)(INT_PTR)IDC_CHK_GHOST, g.inst, nullptr);
             SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+            c = CreateWindowExW(0, L"STATIC",
+                                L"实验性：开启整窗双缓冲消除残影；个别控件可能偶发闪烁",
+                                WS_CHILD | WS_VISIBLE, margin, S(72), contentW, S(16), h,
+                                (HMENU)(INT_PTR)IDC_LBL_GHOSTHINT, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fList, TRUE);
 
             c = CreateWindowExW(0, L"STATIC", L"网页搜索规则：",
                                 WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE, margin, S(136), contentW,
@@ -3296,6 +3759,109 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 SendMessageW(c, WM_SETFONT, (WPARAM)g.fList, TRUE);
             }
 
+            // Shell 与窗口 Tab（索引 6）
+            // 纵向布局：行间统一留 S(6) 间距、标签/编辑对之间 S(2)，提示行底部锚定在按钮上方，
+            // 避免说明文字与底部「恢复默认/保存/取消」按钮行重叠（原布局提示行 y=S(380) 会压到按钮）。
+            c = CreateWindowExW(0, L"STATIC", L"Shell 程序：",
+                                WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE, margin, S(18), S(110),
+                                S(28), h, (HMENU)(INT_PTR)IDC_LBL_SHELLTYPE, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+            c = CreateWindowExW(0, L"BUTTON", nullptr,
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                margin + S(110), S(18), contentW - S(110), S(28), h,
+                                (HMENU)(INT_PTR)IDC_CMB_SHELLTYPE, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+
+            c = CreateWindowExW(0, L"STATIC", L"自定义 Shell 路径：",
+                                WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE, margin, S(52), S(150),
+                                S(24), h, (HMENU)(INT_PTR)IDC_LBL_SHELLPATH, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+            c = CreateWindowExW(0, L"EDIT", nullptr,
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                                margin, S(78), contentW, S(24), h,
+                                (HMENU)(INT_PTR)IDC_EDT_SHELLPATH, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fList, TRUE);
+            SetWindowTheme(c, L"DarkMode_Explorer", nullptr);
+
+            c = CreateWindowExW(0, L"STATIC", L"自定义启动参数：",
+                                WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE, margin, S(106), S(150),
+                                S(24), h, (HMENU)(INT_PTR)IDC_LBL_SHELLARGS, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+            c = CreateWindowExW(0, L"EDIT", nullptr,
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                                margin, S(132), contentW, S(24), h,
+                                (HMENU)(INT_PTR)IDC_EDT_SHELLARGS, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fList, TRUE);
+            SetWindowTheme(c, L"DarkMode_Explorer", nullptr);
+
+            c = CreateWindowExW(0, L"STATIC", L"默认工作目录：",
+                                WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE, margin, S(162), S(140),
+                                S(28), h, (HMENU)(INT_PTR)IDC_LBL_SHELLCWD, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+            c = CreateWindowExW(0, L"BUTTON", nullptr,
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                margin + S(140), S(162), contentW - S(140), S(28), h,
+                                (HMENU)(INT_PTR)IDC_CMB_SHELLCWD, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+
+            c = CreateWindowExW(0, L"BUTTON",
+                                L"前台显示输出窗口（否则后台静默执行）",
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                margin, S(196), contentW, S(24), h,
+                                (HMENU)(INT_PTR)IDC_CHK_SHOWWIN, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+
+            c = CreateWindowExW(0, L"BUTTON", L"合并同进程窗口（多窗口进程显示为分组）",
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                margin, S(226), contentW, S(24), h,
+                                (HMENU)(INT_PTR)IDC_CHK_WINGROUP, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+            c = CreateWindowExW(0, L"BUTTON", L"显示 UWP 应用窗口",
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                margin, S(256), contentW, S(24), h,
+                                (HMENU)(INT_PTR)IDC_CHK_WINUWP, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+            c = CreateWindowExW(0, L"BUTTON", L"结果副标题显示进程名",
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                margin, S(286), contentW, S(24), h,
+                                (HMENU)(INT_PTR)IDC_CHK_WINPROC, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+
+            c = CreateWindowExW(0, L"STATIC", L"窗口缓存刷新间隔(秒)：",
+                                WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE, margin, S(316), S(160),
+                                S(28), h, (HMENU)(INT_PTR)IDC_LBL_WINCACHE, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+            c = CreateWindowExW(0, L"BUTTON", nullptr,
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                margin + S(160), S(316), contentW - S(160), S(28), h,
+                                (HMENU)(INT_PTR)IDC_CMB_WINCACHE, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+
+            c = CreateWindowExW(0, L"STATIC",
+                                L"提示：输入框键入 “> 命令” 执行 Shell，键入 “< 关键词” 切换窗口。",
+                                WS_CHILD | WS_VISIBLE, margin, S(350), contentW, S(22), h,
+                                (HMENU)(INT_PTR)IDC_LBL_SHELLHINT, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fList, TRUE);
+
+            // Shell/窗口设置初始值（取消时回退）与自定义路径/参数初始文本
+            g.shellTypeSaved = g.shellType;
+            g.shellCustomPathSaved = g.shellCustomPath;
+            g.shellCustomArgsSaved = g.shellCustomArgs;
+            g.shellDefaultCwdSaved = g.shellDefaultCwd;
+            g.shellShowWindowSaved = g.shellShowWindow;
+            g.winGroupProcSaved = g.winGroupProc;
+            g.winShowUwpSaved = g.winShowUwp;
+            g.winShowProcSaved = g.winShowProc;
+            g.winCacheSecSaved = g.winCacheSec;
+            SetWindowTextW(GetDlgItem(h, IDC_EDT_SHELLPATH), g.shellCustomPath.c_str());
+            SetWindowTextW(GetDlgItem(h, IDC_EDT_SHELLARGS), g.shellCustomArgs.c_str());
+            if (g.shellType != 3) {  // 非自定义时隐藏路径/参数行
+                ShowWindow(GetDlgItem(h, IDC_LBL_SHELLPATH), SW_HIDE);
+                ShowWindow(GetDlgItem(h, IDC_EDT_SHELLPATH), SW_HIDE);
+                ShowWindow(GetDlgItem(h, IDC_LBL_SHELLARGS), SW_HIDE);
+                ShowWindow(GetDlgItem(h, IDC_EDT_SHELLARGS), SW_HIDE);
+            }
+
             RecordSettingsLayout(h);            // 记录初始几何，之后可随窗口缩放重排
             ShowSettingsTab(h, g.settingsTab);  // 按当前 Tab 初始化分组可见性并重排
             return 0;
@@ -3334,14 +3900,8 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             HDC hdc = BeginPaint(h, &ps);
             RECT rc;
             GetClientRect(h, &rc);
-            // 毛玻璃开启时：不铺底，让 DWM 亚克力材质（含主题色调）透出，
-            // 原生标题栏与正文共用同一材质 / 同色，整窗统一。
-            // 关闭毛玻璃时：用主题底色铺满客户区，外观依旧协调。
-            bool glassOn = g.beautify && g.glass;
-            if (!glassOn) {
-                FillRect(hdc, &rc,
-                         g.brSettingsBg ? g.brSettingsBg : (HBRUSH)GetStockObject(BLACK_BRUSH));
-            }
+            FillRect(hdc, &rc,
+                     g.brSettingsBg ? g.brSettingsBg : (HBRUSH)GetStockObject(BLACK_BRUSH));
             // 左侧 Tab 栏背景（深色），与内容区分隔
             if (g.theme) {
                 HBRUSH sbBg = CreateSolidBrush(g.theme->menuBg);
@@ -3356,7 +3916,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 
             // 编辑框自绘 1px 描边（仅当前 Tab 可见时绘制，避免其它页残留边框）
             const int kEditIds[] = {IDC_EDT_RULES, IDC_EDT_LAUNCH, IDC_EDT_KILL,
-                                    IDC_EDT_EXCLUDE};
+                                    IDC_EDT_EXCLUDE, IDC_EDT_SHELLPATH, IDC_EDT_SHELLARGS};
             HBRUSH brFrame = CreateSolidBrush(RGB(70, 70, 70));
             for (int eid : kEditIds) {
                 HWND ed = GetDlgItem(h, eid);
@@ -3389,7 +3949,8 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             HDC hdc = (HDC)wp;
             HWND w = (HWND)lp;
             if (w == GetDlgItem(h, IDC_EDT_RULES) || w == GetDlgItem(h, IDC_EDT_LAUNCH) ||
-                w == GetDlgItem(h, IDC_EDT_KILL) || w == GetDlgItem(h, IDC_EDT_EXCLUDE)) {
+                w == GetDlgItem(h, IDC_EDT_KILL) || w == GetDlgItem(h, IDC_EDT_EXCLUDE) ||
+                w == GetDlgItem(h, IDC_EDT_SHELLPATH) || w == GetDlgItem(h, IDC_EDT_SHELLARGS)) {
                 const Theme& te = *g.theme;
                 if (!g.brEditBg) g.brEditBg = CreateSolidBrush(te.editBg);
                 SetTextColor(hdc, te.text);
@@ -3410,11 +3971,10 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             // 主题微调滑块（trackbar 发 WM_HSCROLL，不进 WM_COMMAND）
             HWND tb = (HWND)lp;
             int tid = GetDlgCtrlID(tb);
-            if (tid == IDC_TRK_ALPHA || tid == IDC_TRK_BLUR || tid == IDC_TRK_RADIUS) {
+            if (tid == IDC_TRK_ALPHA || tid == IDC_TRK_RADIUS) {
                 if (!g.beautify || !g.theme) break;
                 int v = (int)SendMessageW(tb, TBM_GETPOS, 0, 0);
                 if (tid == IDC_TRK_ALPHA) g.theme->alpha = (BYTE)v;
-                else if (tid == IDC_TRK_BLUR) g.theme->blurStrength = v;
                 else {
                     g.theme->radiusWindow = v;
                     g.theme->radiusCard = (int)(v * 0.8);
@@ -3484,8 +4044,11 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (dis->CtlType == ODT_BUTTON) {
                 int id = (int)dis->CtlID;
                 const Theme& t = *g.theme;
-                if (id == IDC_CHK_START || id == IDC_CHK_BEAUTIFY || id == IDC_CHK_GLASS ||
-                    id == IDC_CHK_WEIGHTON || id == IDC_CHK_FILEDLGJUMP) {
+                if (id == IDC_CHK_START || id == IDC_CHK_BEAUTIFY ||
+                    id == IDC_CHK_WEIGHTON || id == IDC_CHK_FILEDLGJUMP ||
+                    id == IDC_CHK_TOP || id == IDC_CHK_GHOST ||
+                    id == IDC_CHK_SHOWWIN || id == IDC_CHK_WINGROUP ||
+                    id == IDC_CHK_WINUWP || id == IDC_CHK_WINPROC) {
                     // 复选框：自绘方框 + 对勾 + 文字
                     FillRect(dis->hDC, &dis->rcItem, g.brMenuBg);
                     RECT box = dis->rcItem;
@@ -3500,14 +4063,18 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     DeleteObject(fb2);
                     bool checked = (id == IDC_CHK_START) ? g.startupWanted
                                  : (id == IDC_CHK_BEAUTIFY) ? g.beautify
-                                 : (id == IDC_CHK_GLASS) ? g.glass
                                  : (id == IDC_CHK_FILEDLGJUMP) ? g.fdjEnabled
-                                                               : g.weightEnabled;
+                                 : (id == IDC_CHK_TOP) ? g.topEnabled
+                                 : (id == IDC_CHK_GHOST) ? g.antiGhost
+                                 : (id == IDC_CHK_SHOWWIN) ? g.shellShowWindow
+                                 : (id == IDC_CHK_WINGROUP) ? g.winGroupProc
+                                 : (id == IDC_CHK_WINUWP) ? g.winShowUwp
+                                 : (id == IDC_CHK_WINPROC) ? g.winShowProc
+                                                            : g.weightEnabled;
                     if (checked)
                         DrawCheckGlyph(dis->hDC, box, t.text);
                     SetBkMode(dis->hDC, TRANSPARENT);
-                    // 毛玻璃依附于界面美化：美化关闭时整项置灰
-                    SetTextColor(dis->hDC, (id == IDC_CHK_GLASS && !g.beautify) ? t.sub : t.text);
+                    SetTextColor(dis->hDC, t.text);
                     SelectObject(dis->hDC, g.fInput);
                     WCHAR label[128]{};
                     GetWindowTextW(dis->hwndItem, label, 128);
@@ -3527,7 +4094,9 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     return TRUE;
                 }
                 if (id == IDC_CMB_WAKE || id == IDC_CMB_THEME || id == IDC_CMB_HOTKEY ||
-                    id == IDC_CMB_FLUSH || id == IDC_CMB_MAXENT) {
+                    id == IDC_CMB_FLUSH || id == IDC_CMB_MAXENT ||
+                    id == IDC_CMB_SHELLTYPE || id == IDC_CMB_SHELLCWD ||
+                    id == IDC_CMB_WINCACHE) {
                     // 下拉按钮：深底 + 描边 + 当前项文字 + ▾ 箭头（唤醒位置/主题/快捷键方案/权重参数共用）
                     bool pressed = (dis->itemState & ODS_SELECTED) != 0;
                     HBRUSH bks = CreateSolidBrush(pressed ? t.editBg : t.menuBg);
@@ -3545,6 +4114,9 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                       : id == IDC_CMB_THEME ? g.theme->name
                       : id == IDC_CMB_HOTKEY ? HotkeyModeText(g.hotkeyMode)
                       : id == IDC_CMB_FLUSH ? WeightFlushText(g.weightFlush)
+                      : id == IDC_CMB_SHELLTYPE ? ShellTypeName(g.shellType)
+                      : id == IDC_CMB_SHELLCWD ? ShellCwdName(g.shellDefaultCwd)
+                      : id == IDC_CMB_WINCACHE ? (swprintf_s(maxBuf, L"%d 秒", g.winCacheSec), maxBuf)
                       : (swprintf_s(maxBuf, L"%d 条", g.weightMaxEntries), maxBuf);
                     RECT tr = dis->rcItem;
                     tr.left += S(10);
@@ -3567,14 +4139,16 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     return TRUE;
                 }
                 if (id == IDC_TAB_GENERAL || id == IDC_TAB_WEB || id == IDC_TAB_THEME ||
-                    id == IDC_TAB_GROUP || id == IDC_TAB_WEIGHT || id == IDC_TAB_EXCLUDE) {
+                    id == IDC_TAB_GROUP || id == IDC_TAB_WEIGHT || id == IDC_TAB_EXCLUDE ||
+                    id == IDC_TAB_SHELL) {
                     // 左侧 Tab 按钮：激活项用强调色高亮，并加左侧竖条
                     int idx = (id == IDC_TAB_GENERAL) ? 0
                             : (id == IDC_TAB_WEB)     ? 1
                             : (id == IDC_TAB_THEME)   ? 2
                             : (id == IDC_TAB_GROUP)   ? 3
                             : (id == IDC_TAB_WEIGHT)  ? 4
-                                                      : 5;
+                            : (id == IDC_TAB_EXCLUDE) ? 5
+                                                      : 6;
                     bool active = (g.settingsTab == idx);
                     bool hover = (dis->itemState & ODS_HOTLIGHT) != 0;
                     HBRUSH bk = CreateSolidBrush(active ? t.menuHi : (hover ? t.editBg : t.menuBg));
@@ -3598,7 +4172,8 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                                      : (id == IDC_TAB_THEME)   ? L"主题"
                                      : (id == IDC_TAB_GROUP)   ? L"一键"
                                      : (id == IDC_TAB_WEIGHT)  ? L"搜索权重"
-                                                               : L"排除路径";
+                                     : (id == IDC_TAB_EXCLUDE) ? L"排除路径"
+                                                               : L"Shell 与窗口";
                     RECT tr = dis->rcItem;
                     tr.left += S(10);
                     DrawTextW(dis->hDC, lbl, -1, &tr,
@@ -3645,13 +4220,12 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 DWORD vt = (DWORD)g.themeIdx;
                 RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"Theme", REG_DWORD,
                                 &vt, sizeof(vt));
-                // 每个主题的微调（透明度/毛玻璃浓度/圆角）以 blob 持久化
+                // 每个主题的微调（透明度/圆角）以 blob 持久化
                 {
                     int n = (int)(sizeof(kThemes) / sizeof(kThemes[0]));
                     sTune.assign(n, ThemeTune());
                     for (int i = 0; i < n; ++i) {
                         sTune[i].alpha = kThemes[i].alpha;
-                        sTune[i].blur = kThemes[i].blurStrength;
                         sTune[i].radius = kThemes[i].radiusWindow;
                     }
                     RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"ThemeTune",
@@ -3661,8 +4235,8 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 DWORD vb = g.beautify ? 1 : 0;
                 RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"Beautify",
                                 REG_DWORD, &vb, sizeof(vb));
-                DWORD vg = g.glass ? 1 : 0;
-                RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"Glass",
+                DWORD vg = g.antiGhost ? 1 : 0;  // 抗残影双缓冲（实验性）持久化
+                RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"AntiGhost",
                                 REG_DWORD, &vg, sizeof(vg));
                 DWORD vwe = g.weightEnabled ? 1 : 0;
                 RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"WeightEnabled",
@@ -3675,6 +4249,9 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                                 REG_DWORD, &vwm, sizeof(vwm));
                 fdj_set_enabled(g.fdjEnabled);  // 文件对话框跳转开关持久化到注册表
                 SetStartup(g.startupWanted);
+                DWORD vtop = g.topEnabled ? 1 : 0;
+                RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"TopCmd",
+                                REG_DWORD, &vtop, sizeof(vtop));
                 int len = GetWindowTextLengthW(GetDlgItem(h, IDC_EDT_RULES));
                 std::wstring rulesText(len + 1, 0);
                 GetWindowTextW(GetDlgItem(h, IDC_EDT_RULES), &rulesText[0], len + 1);
@@ -3705,6 +4282,47 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 auto parsedExcl = ParseExcludePaths(exclText);
                 if (!parsedExcl.empty()) g.excludePaths = parsedExcl;
                 SaveRegText(L"ExcludePaths", ExcludePathsToText(g.excludePaths));
+                // —— Shell 与窗口设置持久化 ——
+                if (g.shellType == 3) {  // 仅自定义时读取并保存路径/参数
+                    HWND eP = GetDlgItem(h, IDC_EDT_SHELLPATH);
+                    int lenP = GetWindowTextLengthW(eP);
+                    std::wstring sp(lenP + 1, 0);
+                    GetWindowTextW(eP, &sp[0], lenP + 1);
+                    sp.resize(lenP);
+                    g.shellCustomPath = sp;
+                    HWND eA = GetDlgItem(h, IDC_EDT_SHELLARGS);
+                    int lenA = GetWindowTextLengthW(eA);
+                    std::wstring sa(lenA + 1, 0);
+                    GetWindowTextW(eA, &sa[0], lenA + 1);
+                    sa.resize(lenA);
+                    g.shellCustomArgs = sa;
+                } else {
+                    g.shellCustomPath.clear();
+                    g.shellCustomArgs.clear();
+                }
+                DWORD vs = (DWORD)g.shellType;
+                RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"ShellType",
+                               REG_DWORD, &vs, sizeof(vs));
+                SaveRegText(L"ShellCustomPath", g.shellCustomPath);
+                SaveRegText(L"ShellCustomArgs", g.shellCustomArgs);
+                vs = (DWORD)g.shellDefaultCwd;
+                RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"ShellDefaultCwd",
+                               REG_DWORD, &vs, sizeof(vs));
+                vs = g.shellShowWindow ? 1 : 0;
+                RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"ShellShowWindow",
+                               REG_DWORD, &vs, sizeof(vs));
+                vs = g.winGroupProc ? 1 : 0;
+                RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"WinGroupProc",
+                               REG_DWORD, &vs, sizeof(vs));
+                vs = g.winShowUwp ? 1 : 0;
+                RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"WinShowUwp",
+                               REG_DWORD, &vs, sizeof(vs));
+                vs = g.winShowProc ? 1 : 0;
+                RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"WinShowProc",
+                               REG_DWORD, &vs, sizeof(vs));
+                vs = (DWORD)g.winCacheSec;
+                RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"WinCacheSec",
+                               REG_DWORD, &vs, sizeof(vs));
                 if (IsWindowVisible(g.hwnd)) LayoutAndRepaint();
                 DestroyWindow(h);
             } else if (id == IDC_CHK_START && HIWORD(wp) == BN_CLICKED) {
@@ -3715,17 +4333,22 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 ApplyBeautify();  // 即时预览：标题栏 / 圆角 / 菜单深浅立即切换
                 InvalidateRect(GetDlgItem(h, IDC_CHK_BEAUTIFY), nullptr, TRUE);
                 InvalidateRect(GetDlgItem(h, IDC_LST_THEME), nullptr, TRUE);  // 同步置灰/恢复
-                InvalidateRect(GetDlgItem(h, IDC_CHK_GLASS), nullptr, TRUE);
-                // 微调滑块依赖界面美化（毛玻璃/材质）；关闭时一并置灰
+                // 微调滑块（透明度/圆角）依赖界面美化；关闭时一并置灰
                 bool en = g.beautify;
                 EnableWindow(GetDlgItem(h, IDC_TRK_ALPHA), en);
-                EnableWindow(GetDlgItem(h, IDC_TRK_BLUR), en);
                 EnableWindow(GetDlgItem(h, IDC_TRK_RADIUS), en);
-            } else if (id == IDC_CHK_GLASS && HIWORD(wp) == BN_CLICKED) {
-                if (!g.beautify) return 0;  // 美化关闭时毛玻璃不可切换
-                g.glass = !g.glass;
-                ApplyTheme();  // 内部会调 ApplyGlass，并重算窗口透明度让模糊透出来
-                InvalidateRect(GetDlgItem(h, IDC_CHK_GLASS), nullptr, TRUE);
+            } else if (id == IDC_CHK_GHOST && HIWORD(wp) == BN_CLICKED) {
+                // 抗残影双缓冲（实验性）：实时切换 WS_EX_COMPOSITED 整窗双缓冲
+                g.antiGhost = !g.antiGhost;
+                LONG_PTR ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+                if (g.antiGhost) ex |= WS_EX_COMPOSITED;
+                else ex &= ~WS_EX_COMPOSITED;
+                SetWindowLongPtrW(h, GWL_EXSTYLE, ex);
+                SetWindowPos(h, nullptr, 0, 0, 0, 0,
+                             SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                                 SWP_NOACTIVATE);
+                RefreshComposition(h);  // 立即整窗重绘，清除切换瞬间可能残留的残影
+                InvalidateRect(GetDlgItem(h, IDC_CHK_GHOST), nullptr, TRUE);
             } else if (id == IDC_CMB_HOTKEY && HIWORD(wp) == BN_CLICKED) {
                 // 结果项快捷键方案下拉：列 数字/字母/关闭，当前项打勾；选择后即时预览
                 HMENU m = CreatePopupMenu();
@@ -3754,6 +4377,21 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             } else if (id == IDC_CHK_FILEDLGJUMP && HIWORD(wp) == BN_CLICKED) {
                 g.fdjEnabled = !g.fdjEnabled;
                 InvalidateRect(GetDlgItem(h, IDC_CHK_FILEDLGJUMP), nullptr, TRUE);
+            } else if (id == IDC_CHK_TOP && HIWORD(wp) == BN_CLICKED) {
+                g.topEnabled = !g.topEnabled;
+                InvalidateRect(GetDlgItem(h, IDC_CHK_TOP), nullptr, TRUE);
+            } else if (id == IDC_CHK_SHOWWIN && HIWORD(wp) == BN_CLICKED) {
+                g.shellShowWindow = !g.shellShowWindow;
+                InvalidateRect(GetDlgItem(h, IDC_CHK_SHOWWIN), nullptr, TRUE);
+            } else if (id == IDC_CHK_WINGROUP && HIWORD(wp) == BN_CLICKED) {
+                g.winGroupProc = !g.winGroupProc;
+                InvalidateRect(GetDlgItem(h, IDC_CHK_WINGROUP), nullptr, TRUE);
+            } else if (id == IDC_CHK_WINUWP && HIWORD(wp) == BN_CLICKED) {
+                g.winShowUwp = !g.winShowUwp;
+                InvalidateRect(GetDlgItem(h, IDC_CHK_WINUWP), nullptr, TRUE);
+            } else if (id == IDC_CHK_WINPROC && HIWORD(wp) == BN_CLICKED) {
+                g.winShowProc = !g.winShowProc;
+                InvalidateRect(GetDlgItem(h, IDC_CHK_WINPROC), nullptr, TRUE);
             } else if (id == IDC_CMB_FLUSH && HIWORD(wp) == BN_CLICKED) {
                 // 写入时机下拉：立即 / 延迟合并 / 退出时，当前项打勾
                 HMENU m = CreatePopupMenu();
@@ -3813,14 +4451,15 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 InvalidateRect(GetDlgItem(h, IDC_BTN_WIPE), nullptr, TRUE);
 } else if ((id == IDC_TAB_GENERAL || id == IDC_TAB_WEB || id == IDC_TAB_THEME ||
                           id == IDC_TAB_GROUP || id == IDC_TAB_WEIGHT ||
-                          id == IDC_TAB_EXCLUDE) &&
+                          id == IDC_TAB_EXCLUDE || id == IDC_TAB_SHELL) &&
                          HIWORD(wp) == BN_CLICKED) {
                 ShowSettingsTab(h, (id == IDC_TAB_GENERAL) ? 0
                                  : (id == IDC_TAB_WEB)    ? 1
                                  : (id == IDC_TAB_THEME)  ? 2
                                  : (id == IDC_TAB_GROUP)  ? 3
                                  : (id == IDC_TAB_WEIGHT) ? 4
-                                                          : 5);
+                                 : (id == IDC_TAB_EXCLUDE) ? 5
+                                                           : 6);
              } else if (id == IDC_CMB_WAKE && HIWORD(wp) == BN_CLICKED) {
                 // 下拉弹出黑暗菜单（复用 StyleDarkMenu 同一套自绘/染色）
                 HMENU m = CreatePopupMenu();
@@ -3838,6 +4477,69 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 if (cmd == 4101) g.centerWake = true;
                 else if (cmd == 4102) g.centerWake = false;
                 InvalidateRect(GetDlgItem(h, IDC_CMB_WAKE), nullptr, TRUE);
+            } else if (id == IDC_CMB_SHELLTYPE && HIWORD(wp) == BN_CLICKED) {
+                // Shell 程序下拉：cmd / PowerShell / Git Bash / 自定义，当前项打勾
+                static const WCHAR* opts[] = {L"命令提示符 (cmd)", L"PowerShell",
+                                             L"Git Bash", L"自定义…"};
+                HMENU m = CreatePopupMenu();
+                for (int i = 0; i < 4; ++i)
+                    AppendMenuW(m, MF_STRING | (g.shellType == i ? MF_CHECKED : 0),
+                                4500 + i, opts[i]);
+                StyleDarkMenu(m);
+                RECT r;
+                GetWindowRect(GetDlgItem(h, IDC_CMB_SHELLTYPE), &r);
+                SetForegroundWindow(h);
+                int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
+                                         r.left, r.bottom, 0, h, nullptr);
+                DestroyMenu(m);
+                if (cmd >= 4500 && cmd < 4504) {
+                    g.shellType = cmd - 4500;
+                    InvalidateRect(GetDlgItem(h, IDC_CMB_SHELLTYPE), nullptr, TRUE);
+                    bool custom = (g.shellType == 3);
+                    ShowWindow(GetDlgItem(h, IDC_LBL_SHELLPATH), custom ? SW_SHOW : SW_HIDE);
+                    ShowWindow(GetDlgItem(h, IDC_EDT_SHELLPATH), custom ? SW_SHOW : SW_HIDE);
+                    ShowWindow(GetDlgItem(h, IDC_LBL_SHELLARGS), custom ? SW_SHOW : SW_HIDE);
+                    ShowWindow(GetDlgItem(h, IDC_EDT_SHELLARGS), custom ? SW_SHOW : SW_HIDE);
+                } else
+                    return 0;
+            } else if (id == IDC_CMB_SHELLCWD && HIWORD(wp) == BN_CLICKED) {
+                // 默认工作目录下拉
+                static const WCHAR* opts[] = {L"用户目录 (%USERPROFILE%)",
+                                             L"系统默认目录 (System32)", L"桌面目录"};
+                HMENU m = CreatePopupMenu();
+                for (int i = 0; i < 3; ++i)
+                    AppendMenuW(m, MF_STRING | (g.shellDefaultCwd == i ? MF_CHECKED : 0),
+                                4520 + i, opts[i]);
+                StyleDarkMenu(m);
+                RECT r;
+                GetWindowRect(GetDlgItem(h, IDC_CMB_SHELLCWD), &r);
+                SetForegroundWindow(h);
+                int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
+                                         r.left, r.bottom, 0, h, nullptr);
+                DestroyMenu(m);
+                if (cmd >= 4520 && cmd < 4523) g.shellDefaultCwd = cmd - 4520;
+                else return 0;
+                InvalidateRect(GetDlgItem(h, IDC_CMB_SHELLCWD), nullptr, TRUE);
+            } else if (id == IDC_CMB_WINCACHE && HIWORD(wp) == BN_CLICKED) {
+                // 窗口枚举缓存刷新间隔下拉
+                static const int secs[] = {1, 2, 5, 10, 30, 60};
+                WCHAR buf[32];
+                HMENU m = CreatePopupMenu();
+                for (int i = 0; i < 6; ++i) {
+                    swprintf_s(buf, L"%d 秒", secs[i]);
+                    AppendMenuW(m, MF_STRING | (g.winCacheSec == secs[i] ? MF_CHECKED : 0),
+                                4530 + i, buf);
+                }
+                StyleDarkMenu(m);
+                RECT r;
+                GetWindowRect(GetDlgItem(h, IDC_CMB_WINCACHE), &r);
+                SetForegroundWindow(h);
+                int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
+                                         r.left, r.bottom, 0, h, nullptr);
+                DestroyMenu(m);
+                if (cmd >= 4530 && cmd < 4536) g.winCacheSec = secs[cmd - 4530];
+                else return 0;
+                InvalidateRect(GetDlgItem(h, IDC_CMB_WINCACHE), nullptr, TRUE);
             } else if (id == IDC_LST_THEME && HIWORD(wp) == LBN_SELCHANGE) {
                 // 主题选择器：自绘列表框选中即切换（实时预览全部界面）
                 if (!g.beautify) break;  // 美化关闭时主题不可选（列表已置灰）
@@ -3857,7 +4559,6 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 int n = (int)(sizeof(kThemes) / sizeof(kThemes[0]));
                 for (int i = 0; i < n && i < (int)sTuneSaved.size(); ++i) {
                     kThemes[i].alpha = (BYTE)sTuneSaved[i].alpha;
-                    kThemes[i].blurStrength = sTuneSaved[i].blur;
                     kThemes[i].radiusWindow = sTuneSaved[i].radius;
                     kThemes[i].radiusCard = (int)(sTuneSaved[i].radius * 0.8);
                     kThemes[i].radiusButton = (int)(sTuneSaved[i].radius * 0.6);
@@ -3866,8 +4567,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 g.themeIdx = g.themeSaved;
                 g.theme = &kThemes[g.themeIdx];
                 if (g.beautify != g.beautifySaved) { g.beautify = g.beautifySaved; ApplyBeautify(); }
-                if (g.glass != g.glassSaved) g.glass = g.glassSaved;
-                ApplyTheme();  // 复原主题 + 微调（圆角/材质浓度）
+                ApplyTheme();  // 复原主题 + 微调（圆角）
                 g.startupWanted = g.startupSaved;
                 g.hotkeyMode = g.hotkeyModeSaved;
                 if (IsWindowVisible(g.hwnd)) RepaintNow();
@@ -3876,6 +4576,25 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 g.weightFlush = g.weightFlushSaved;
                 g.weightMaxEntries = g.weightMaxSaved;
                 g.fdjEnabled = g.fdjEnabledSaved;    // 文件对话框跳转：取消即回退
+                g.topEnabled = g.topEnabledSaved;    // top 命令开关：取消即回退
+                // 抗残影双缓冲（实验性）：取消即回退 WS_EX_COMPOSITED 状态
+                g.antiGhost = g.antiGhostSaved;
+                {   LONG_PTR ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+                    if (g.antiGhost) ex |= WS_EX_COMPOSITED; else ex &= ~WS_EX_COMPOSITED;
+                    SetWindowLongPtrW(h, GWL_EXSTYLE, ex);
+                    SetWindowPos(h, nullptr, 0, 0, 0, 0,
+                                 SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                                     SWP_NOACTIVATE); }
+                // Shell 与窗口：取消即回退未保存的配置
+                g.shellType = g.shellTypeSaved;
+                g.shellCustomPath = g.shellCustomPathSaved;
+                g.shellCustomArgs = g.shellCustomArgsSaved;
+                g.shellDefaultCwd = g.shellDefaultCwdSaved;
+                g.shellShowWindow = g.shellShowWindowSaved;
+                g.winGroupProc = g.winGroupProcSaved;
+                g.winShowUwp = g.winShowUwpSaved;
+                g.winShowProc = g.winShowProcSaved;
+                g.winCacheSec = g.winCacheSecSaved;
                 DestroyWindow(h);
             } else if (id == IDC_BTN_RESET) {
                 SetWindowTextW(GetDlgItem(h, IDC_EDT_RULES), DefaultRulesText().c_str());
@@ -3910,13 +4629,12 @@ static void OpenSettings() {
     }
     g.themeSaved = g.themeIdx;  // 保存当前主题，取消时用于回退
     g.beautifySaved = g.beautify;
-    g.glassSaved = g.glass;
+    g.antiGhostSaved = g.antiGhost;  // 抗残影开关：取消时回退
     {   // 快照每个主题的微调值：取消时用它回退滑块的实时预览改动
         int n = (int)(sizeof(kThemes) / sizeof(kThemes[0]));
         sTuneSaved.assign(n, ThemeTune());
         for (int i = 0; i < n; ++i) {
             sTuneSaved[i].alpha = kThemes[i].alpha;
-            sTuneSaved[i].blur = kThemes[i].blurStrength;
             sTuneSaved[i].radius = kThemes[i].radiusWindow;
         }
     }
@@ -3928,11 +4646,10 @@ static void OpenSettings() {
     GetMonitorInfoW(mon, &mi);
     int x = mi.rcWork.left + ((mi.rcWork.right - mi.rcWork.left) - W) / 2;
     int y = mi.rcWork.top + ((mi.rcWork.bottom - mi.rcWork.top) - H) / 2;
-    // 使用系统原生标题栏，并让其走 DWM 亚克力材质（ApplyGlassTo 已对设置窗设置
-    // DWMWA_SYSTEMBACKDROP_TYPE=Acrylic + WCA_ACCENT 亚克力模糊）：标题栏与正文共用同一
-    // 材质、同色，告别「系统纯色平板」，且天然带亚克力模糊。
-    // 关键：窗口不再用 WS_EX_LAYERED + LWA_ALPHA —— 分层+Alpha 会让 DWM 材质在标题栏失效。
-    g.hSettings = CreateWindowExW(0, L"FlowtarySettings", L"Flowtary 设置",
+    // 使用系统原生标题栏：标题栏与正文共用同一主题配色，圆角/暗色由 ApplyBeautify 控制。
+    // 抗残影双缓冲（实验性）：开启 WS_EX_COMPOSITED 让整窗子控件双缓冲合成，消除切换 Tab 的残影。
+    DWORD exStyleSettings = g.antiGhost ? WS_EX_COMPOSITED : 0;
+    g.hSettings = CreateWindowExW(exStyleSettings, L"FlowtarySettings", L"Flowtary 设置",
                                   WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN |
                                       WS_THICKFRAME,  // 原生标题栏（含关闭按钮）+ 可拖拽改尺寸
                                   x,
@@ -4163,6 +4880,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_SETTINGS, L"设置(&S)");
                     AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_REFRESH, L"刷新缓存(&R)");
                     AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, 0, (LPCWSTR)L"");  // 自绘分隔线
+                    // 唤起快捷键开关：文字随状态切换（开启→“关闭…”，关闭→“开启…”）
+                    AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_WAKE_HOTKEY,
+                                g.hotkeyWake ? L"关闭唤起快捷键(&H)" : L"开启唤起快捷键(&H)");
+                    AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, 0, (LPCWSTR)L"");  // 自绘分隔线
                     AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_EXIT, L"退出(&X)");
                 }
                 StyleDarkMenu(menu);
@@ -4176,6 +4897,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     BuildPrograms();
                     TrayBalloon(L"已刷新", std::to_wstring(g.programs.size()) + L" 个应用已重新索引");
                 }
+                else if (cmd == IDM_WAKE_HOTKEY) ToggleWakeHotkey();
                 else if (cmd == IDM_EXIT) DestroyWindow(hwnd);
             }
             return 0;
@@ -4187,7 +4909,7 @@ bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
             // Alt+数字 由 WM_SYSKEYDOWN（Alt 组合键消息）统一处理，详见下方 case。
             switch (wParam) {
                 case VK_RETURN:
-                    ExecuteSelected();
+                    ExecuteSelected(ResolveExecKind(ctrl, shift));
                     return 0;
                 case VK_ESCAPE:
                     Hide();
@@ -4667,6 +5389,148 @@ static void ShowNotice(const std::wstring& title, const std::wstring& body,
     }
 }
 
+// ---------------- top 命令轻量 toast ----------------
+// 在目标窗口（顶部居中）位置显示一个快速淡入淡出、自动消失的小弹窗。
+// 相比系统托盘通知：非阻塞（不开嵌套消息循环）、无按钮、不抢焦点、停留期间不跑定时器，更省资源。
+struct TopToastData {
+    std::wstring text;
+    int baseX = 0, baseY = 0;   // 初始位置（淡入上移用）
+    DWORD t0 = 0;               // 淡入起始时间
+    int phase = 0;              // 0=淡入, 1=停留, 2=淡出
+    DWORD phaseT0 = 0;          // 当前阶段起始时间
+};
+
+static LRESULT CALLBACK TopToastProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_CREATE: {
+            const TopToastData* nd = (const TopToastData*)((CREATESTRUCTW*)lp)->lpCreateParams;
+            TopToastData* self = nd ? new TopToastData(*nd) : new TopToastData();
+            if (self) { self->t0 = GetTickCount(); self->phase = 0; }
+            SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)self);
+            ApplyRoundCorners(h);
+            SetTimer(h, 2, 16, nullptr);   // 淡入动画
+            return 0;
+        }
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC hdc = BeginPaint(h, &ps);
+            RECT rc; GetClientRect(h, &rc);
+            const Theme& t = *g.theme;
+            HBRUSH bg = CreateSolidBrush(t.bg);
+            FillRect(hdc, &rc, bg);
+            DeleteObject(bg);
+            RECT accent{0, 0, rc.right, S(3)};   // 顶部强调色条，呼应主题
+            HBRUSH ab = CreateSolidBrush(t.menuHi);
+            FillRect(hdc, &accent, ab);
+            DeleteObject(ab);
+            TopToastData* nd = (TopToastData*)GetWindowLongPtrW(h, GWLP_USERDATA);
+            if (nd) {
+                SetBkMode(hdc, TRANSPARENT);
+                SelectObject(hdc, g.fontPool[FontSlot(t.fontInput + 1)]);
+                SetTextColor(hdc, t.text);
+                RECT tr{S(14), 0, rc.right - S(14), rc.bottom};
+                DrawTextW(hdc, nd->text.c_str(), -1, &tr,
+                          DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+            }
+            EndPaint(h, &ps);
+            return 0;
+        }
+        case WM_TIMER:
+            if (wp == 1) {  // 停留结束 → 进入淡出
+                KillTimer(h, 1);
+                TopToastData* nd = (TopToastData*)GetWindowLongPtrW(h, GWLP_USERDATA);
+                if (nd) { nd->phase = 2; nd->phaseT0 = GetTickCount(); }
+                SetTimer(h, 2, 16, nullptr);
+                return 0;
+            }
+            if (wp == 2) {  // 淡入 / 淡出动画驱动
+                TopToastData* nd = (TopToastData*)GetWindowLongPtrW(h, GWLP_USERDATA);
+                if (!nd) break;
+                DWORD now = GetTickCount();
+                BYTE target = (BYTE)((std::max)((int)(g.theme ? g.theme->alpha : 255), 240));
+                if (nd->phase == 0) {
+                    double p = (double)(now - nd->t0) / 120.0; if (p > 1) p = 1;
+                    double e = 1 - pow(1 - p, 3);              // ease-out cubic
+                    BYTE a = (BYTE)(target * e); if (a < 1) a = 1;
+                    SetLayeredWindowAttributes(h, 0, a, LWA_ALPHA);
+                    int off = (int)(S(6) * (1 - e));           // 从下方 6px 滑入
+                    SetWindowPos(h, nullptr, nd->baseX, nd->baseY + off, 0, 0,
+                                 SWP_NOZORDER | SWP_NOSIZE | SWP_NOACTIVATE);
+                    if (p >= 1) {
+                        KillTimer(h, 2);                       // 停留期间不跑动画定时器（省资源）
+                        nd->phase = 1; nd->phaseT0 = now;
+                        SetTimer(h, 1, 1300, nullptr);         // 停留 1.3s
+                    }
+                } else if (nd->phase == 2) {
+                    double p = (double)(now - nd->phaseT0) / 150.0; if (p > 1) p = 1;
+                    BYTE a = (BYTE)(target * (1 - p));
+                    SetLayeredWindowAttributes(h, 0, a, LWA_ALPHA);
+                    if (p >= 1) DestroyWindow(h);
+                }
+                return 0;
+            }
+            break;
+        case WM_DESTROY:
+            KillTimer(h, 1); KillTimer(h, 2);
+            delete (TopToastData*)GetWindowLongPtrW(h, GWLP_USERDATA);
+            SetWindowLongPtrW(h, GWLP_USERDATA, 0);
+            return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+// 在目标窗口顶部居中弹出轻量 toast（目标窗口为 null 时退回主屏居中），非阻塞、自动消失
+static void ShowTopToast(HWND target, const std::wstring& text) {
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW nc{};
+        nc.cbSize = sizeof(nc);
+        nc.lpfnWndProc = TopToastProc;
+        nc.hInstance = g.inst;
+        nc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        nc.lpszClassName = L"FlowtaryTopToast";
+        if (RegisterClassExW(&nc)) registered = true;
+    }
+    if (!g.theme) return;
+    // 按文本实测宽度决定弹窗尺寸（设上限防过宽）
+    HDC dc = GetDC(nullptr);
+    HFONT oldFont = (HFONT)SelectObject(dc, g.fontPool[FontSlot(g.theme->fontInput + 1)]);
+    SIZE sz{};
+    GetTextExtentPoint32W(dc, text.c_str(), (int)text.size(), &sz);
+    SelectObject(dc, oldFont);
+    ReleaseDC(nullptr, dc);
+    int W = sz.cx + S(28);
+    int maxW = S(420);
+    if (W > maxW) W = maxW;
+    if (W < S(80)) W = S(80);
+    int H = S(40);
+
+    // 定位：目标窗口顶部居中（贴近窗口位置）；无目标时退回主屏居中
+    int x = 0, y = 0;
+    RECT wr{};
+    if (target && IsWindow(target) && GetWindowRect(target, &wr)) {
+        x = wr.left + ((wr.right - wr.left) - W) / 2;
+        y = wr.top + S(8);
+    }
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    HMONITOR mon = target ? MonitorFromWindow(target, MONITOR_DEFAULTTONEAREST)
+                          : MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
+    if (GetMonitorInfoW(mon, &mi)) {
+        if (x < mi.rcWork.left) x = mi.rcWork.left;
+        if (x + W > mi.rcWork.right) x = mi.rcWork.right - W;
+        if (y < mi.rcWork.top) y = mi.rcWork.top;
+        if (y + H > mi.rcWork.bottom) y = mi.rcWork.bottom - H;
+    }
+    TopToastData nd{text, x, y};
+    HWND h = CreateWindowExW(WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TOOLWINDOW,
+                             L"FlowtaryTopToast", L"", WS_POPUP,
+                             x, y + S(6), W, H, nullptr, nullptr, g.inst, &nd);
+    if (!h) return;
+    SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);
+    ShowWindow(h, SW_SHOWNOACTIVATE);  // 不抢焦点、不进入任务栏/Alt-Tab
+}
+
 // ---------------- 单实例：区分「同版本重复启动」与「新版本替换启动」 ----------------
 // 版本戳 = 本 exe 路径 + 最后修改时间。运行中的实例把戳写进注册表；
 // 后启动的进程比对：一致 → 同一个构建，属重复启动；不一致 → 新版本，接管。
@@ -4783,23 +5647,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     ApplyTheme();  // 应用主题：透明度、字体、刷子、菜单深色、星点
     fdj_init(g.hwnd);  // 文件对话框“文件夹原地跳转”增强（类 Listary Quick-Switch）
 
-    // 热键依次尝试：Alt+Space -> Alt+Q -> Ctrl+Alt+Space（避免与其他启动器冲突导致完全不可用）
-    static const struct { UINT mod, vk; const WCHAR* name; } kHotkeys[] = {
-        {MOD_ALT | MOD_NOREPEAT, VK_SPACE, L"Alt+Space"},
-        {MOD_ALT | MOD_NOREPEAT, 'Q', L"Alt+Q"},
-        {MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_SPACE, L"Ctrl+Alt+Space"},
-    };
-    bool hotkeyOk = false;
-    for (int i = 0; i < 3; ++i) {
-        if (RegisterHotKey(g.hwnd, 1, kHotkeys[i].mod, kHotkeys[i].vk)) {
-            hotkeyOk = true;
-            g.hotkeyName = kHotkeys[i].name;
-            break;
+    // 唤起快捷键：仅当开关开启时注册，依次尝试 Alt+Space -> Alt+Q -> Ctrl+Alt+Space
+    // （避免与其他启动器冲突导致完全不可用）；关闭状态下只保留托盘左键唤出
+    if (g.hotkeyWake) {
+        if (!RegisterWakeHotkey()) {
+            MessageBoxW(nullptr, L"Alt+Space / Alt+Q / Ctrl+Alt+Space 热键均注册失败，可能被其他程序占用。",
+                        L"Flowtary", MB_ICONWARNING);
         }
-    }
-    if (!hotkeyOk) {
-        MessageBoxW(nullptr, L"Alt+Space / Alt+Q / Ctrl+Alt+Space 热键均注册失败，可能被其他程序占用。",
-                    L"Flowtary", MB_ICONWARNING);
     }
     // 辅助热键：Ctrl+Alt+G —— 文件对话框激活时，把前台资源管理器当前目录同步到对话框
     RegisterHotKey(g.hwnd, 2, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'G');
