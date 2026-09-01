@@ -9,8 +9,8 @@
 #     make clean      清理 CMake 生成的产物
 #     make distclean  删除整个 build\ 目录
 #
-#   前置：Visual Studio C++ 工作负载（vswhere 定位）、CMake、GNU make。
-#   底层：CMake 生成 "NMake Makefiles"（nmake 即微软的 make）。
+#   前置：Visual Studio C++ 工作负载（vswhere 定位）、CMake、GNU make、ninja（需在 PATH）。
+#   底层：CMake 生成 Ninja 构建文件；入口仍是 make build / make release。
 #   注意：本 Makefile 以 cmd.exe 作为 shell，请在 cmd / PowerShell 中运行
 #         make（GnuWin32）或 mingw32-make（Strawberry）。
 # =====================================================================
@@ -38,9 +38,9 @@ all: build
 # ---------------- 构建（x64 + x86，产物汇到 build\） ----------------
 build:
 	@if "$(VS)"=="" (echo [error] Visual Studio with C++ workload not found. & exit /b 1)
-	@call $(VCVARS64) >nul 2>&1 && $(CMAKE) -S "$(ROOT)" -B "$(BUILD)" -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=$(CONFIG)
+	@call $(VCVARS64) >nul 2>&1 && $(CMAKE) -S "$(ROOT)" -B "$(BUILD)" -G Ninja -DCMAKE_BUILD_TYPE=$(CONFIG)
 	@call $(VCVARS64) >nul 2>&1 && $(CMAKE) --build "$(BUILD)" --config $(CONFIG)
-	@call $(VCVARS32) >nul 2>&1 && $(CMAKE) -S "$(ROOT)" -B "$(BUILD32)" -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=$(CONFIG) -DFLOWTARY_ARCH=x86
+	@call $(VCVARS32) >nul 2>&1 && $(CMAKE) -S "$(ROOT)" -B "$(BUILD32)" -G Ninja -DCMAKE_BUILD_TYPE=$(CONFIG) -DFLOWTARY_ARCH=x86
 	@call $(VCVARS32) >nul 2>&1 && $(CMAKE) --build "$(BUILD32)" --config $(CONFIG)
 	@copy /y "$(BUILD32)\filedlg_hook32.dll" "$(BUILD)\" >nul
 	@copy /y "$(BUILD32)\filedlg_agent32.exe" "$(BUILD)\" >nul
