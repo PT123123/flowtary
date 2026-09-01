@@ -106,7 +106,9 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
   逻辑像素。
 - **图标零资源**：托盘图标与窗口图标都用**系统自带字体现场绘制**——优先
   `Segoe MDL2 Assets` / `Segoe Fluent Icons` 的放大镜字形（`U+E721`，用 `GetGlyphIndices`
-  探测码位是否存在），图标字体缺失时回退 `Segoe UI` 粗体字母「F」。**不引入任何 `.ico` 资源**。**不写死像素点**：全部尺寸按统一比例缩放，比例 = max(系统 DPI 缩放,
+  探测码位是否存在），图标字体缺失时回退 `Segoe UI` 粗体字母「F」。**不引入任何 `.ico` 资源**。
+  采用 **4× 超采样**：先在 4 倍尺寸上绘制整枚图标（黑圆底 + 白字形），再面积平均缩回目标尺寸，
+  避免小尺寸直画导致纤细字形笔画糊成一团（高 DPI 下更明显）。**不写死像素点**：全部尺寸按统一比例缩放，比例 = max(系统 DPI 缩放,
   屏幕物理高度/1080)，高分辨率小屏上按比例放大不会显得过小；换屏唤醒时自动重算，
   字体随比例重建。
 - **中文输入法**：组合串与候选窗锚定在光标处（`CFS_FORCE_POSITION` + `CFS_CANDIDATEPOS`，
@@ -132,8 +134,15 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
 
 ## 构建与运行
 
-```bat
-build.bat        :: 需要安装 VS 2022 / Build Tools 的 C++ 工作负载（x64）
+```makefile
+make build       # 完整构建：x64（主程序/hook）+ x86（hook/agent），产物汇到 build\
+make release     # 版本自增 + 完整构建 + 输出到 dist\（可用 OUT= 覆盖输出目录）
+make clean       # 清理 CMake 生成的产物
+```
+需要 VS 2022 / Build Tools 的 C++ 工作负载（x64 + x86）、CMake、GNU make；
+底层由 CMake 生成 NMake Makefiles（nmake 即微软的 make）。
+
+```text
 build\flowtary.exe   :: 主程序，启动后无主窗口、常驻托盘，可被全局热键唤出
 build\evtest.exe     :: Everything IPC 协议冒烟测试工具（控制台）
 ```
@@ -171,7 +180,8 @@ exe 同目录及 PATH 中查找）。
 ```
 src/main.cpp      全部实现（Everything IPC / 网页指令 / 程序枚举匹配 / 自绘 UI / 热键）
 tools/evtest.cpp  Everything IPC 协议测试工具
-build.bat         MSVC 一键构建（vswhere 定位 VS，cl /O2 /MT Release）
+CMakeLists.txt    CMake 构建定义（x64 主程序 + x86 hook/agent 双架构，MSVC /O2 /MT Release）
+Makefile          Make 驱动入口（make build / make release / make clean）
 ```
 
 ## 已知限制
