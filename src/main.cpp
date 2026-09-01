@@ -2084,26 +2084,32 @@ static void ApplyRoundCorners(HWND h) {
 // 图标一律用系统自带字体现场绘制：优先 Segoe MDL2 Assets / Segoe Fluent Icons 的
 // 放大镜字形（U+E721），图标字体缺失时回退 Segoe UI 粗体字母「F」。
 // 不引入任何 .ico 资源，零额外图标开销。
+// 超采样：整枚图标（黑圆底 + 字形）先在 4 倍尺寸上绘制，再面积平均缩回目标尺寸。
+// 小尺寸 GDI 直画会让纤细字形笔画糊成一团（高 DPI 下更明显），
+// 超采样保留 4 倍细节，缩回后笔画边缘是干净的亚像素抗锯齿。
 static HICON MakeFontIcon(int size) {
     if (size < 8) size = 16;
+    const int SS = 4;  // 超采样倍数
+    const int big = size * SS;
     HDC sdc = GetDC(nullptr);
     HBITMAP color = CreateCompatibleBitmap(sdc, size, size);
     HBITMAP mask = CreateBitmap(size, size, 1, 1, nullptr);
+    HBITMAP bigBmp = CreateCompatibleBitmap(sdc, big, big);  // 超采样源图
     HDC dc = CreateCompatibleDC(sdc);
+    HGDIOBJ oldBmp = SelectObject(dc, bigBmp);
 
-    // 颜色位图：黑色圆底
-    HGDIOBJ oldBmp = SelectObject(dc, color);
+    // 大图：黑色圆底
     HGDIOBJ oldPen = SelectObject(dc, GetStockObject(NULL_PEN));
     HBRUSH black = CreateSolidBrush(RGB(0, 0, 0));
     HGDIOBJ oldBr = SelectObject(dc, black);
-    Ellipse(dc, 0, 0, size, size);
+    Ellipse(dc, 0, 0, big, big);
     SelectObject(dc, oldBr);
     DeleteObject(black);
 
-    // 白色字形：用 GetGlyphIndices 探测码位是否真实存在，避免字体缺失画成方框
+    // 大图：白色字形（用 GetGlyphIndices 探测码位是否真实存在，避免字体缺失画成方框）
     const WCHAR* kGlyph = L"\xE721";  // 放大镜（Search）
     const WCHAR* kFams[] = {L"Segoe MDL2 Assets", L"Segoe Fluent Icons", L"Segoe UI Symbol"};
-    int fh = -(size * 58 / 100);
+    int fh = -(big * 58 / 100);
     HFONT f = nullptr;
     bool useGlyph = false;
     for (const WCHAR* fam : kFams) {
@@ -2131,14 +2137,57 @@ static HICON MakeFontIcon(int size) {
         HGDIOBJ oldF = SelectObject(dc, f);
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, RGB(255, 255, 255));
-        RECT r{0, 0, size, size};
+        RECT r{0, 0, big, big};
         DrawTextW(dc, useGlyph ? kGlyph : L"F", -1, &r,
                   DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         SelectObject(dc, oldF);
         DeleteObject(f);
     }
     SelectObject(dc, oldPen);
-    SelectObject(dc, oldBmp);
+    SelectObject(dc, oldBmp);  // 解除 bigBmp 选中，GetDIBits 要求位图不在 DC 内
+
+    // 面积平均缩回目标尺寸：读大图像素按 SS×SS 块求平均。
+    // 相比 StretchBlt(HALFTONE)，面积平均不产生抖动纹理，4 倍超采样下就是理想的低通滤波。
+    std::vector<DWORD> bigPx((size_t)big * big);
+    {
+        BITMAPINFO bi{};
+        bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+        bi.bmiHeader.biWidth = big;
+        bi.bmiHeader.biHeight = -big;  // 自上而下
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        GetDIBits(dc, bigBmp, 0, big, bigPx.data(), &bi, DIB_RGB_COLORS);
+    }
+    const int strideBig = big;
+    const int strideRgb = (size * 3 + 3) & ~3;  // 24bpp 行按 4 字节对齐
+    std::vector<BYTE> rgb((size_t)size * strideRgb);
+    for (int y = 0; y < size; ++y) {
+        BYTE* dst = &rgb[(size_t)y * strideRgb];
+        for (int x = 0; x < size; ++x) {
+            unsigned r = 0, g = 0, b = 0;
+            for (int sy = 0; sy < SS; ++sy)
+                for (int sx = 0; sx < SS; ++sx) {
+                    DWORD p = bigPx[(size_t)(y * SS + sy) * strideBig + (x * SS + sx)];
+                    b += p & 0xFF;
+                    g += (p >> 8) & 0xFF;
+                    r += (p >> 16) & 0xFF;
+                }
+            const int n = SS * SS;
+            *dst++ = (BYTE)(b / n);  // B
+            *dst++ = (BYTE)(g / n);  // G
+            *dst++ = (BYTE)(r / n);  // R
+        }
+    }
+    BITMAPINFO di{};
+    di.bmiHeader.biSize = sizeof(di.bmiHeader);
+    di.bmiHeader.biWidth = size;
+    di.bmiHeader.biHeight = -size;
+    di.bmiHeader.biPlanes = 1;
+    di.bmiHeader.biBitCount = 24;
+    di.bmiHeader.biCompression = BI_RGB;
+    SetDIBits(dc, color, 0, size, rgb.data(), &di, DIB_RGB_COLORS);
+    DeleteObject(bigBmp);
 
     // 掩码：单色位图，白=透明、黑=不透明 → 圆外透明
     oldBmp = SelectObject(dc, mask);
