@@ -1,5 +1,6 @@
 // Flowtary 版本号 —— 全项目唯一来源
-//   · release.bat 解析本文件的 FT_VER_DOT，把产物命名为 flowtary-<版本>.exe
+//   · Makefile 的 release 流程（tools\release_copy.ps1）解析本文件的 FT_VER_DOT，
+//     把产物命名为 flowtary-<版本>.exe
 //   · exe 的版本信息资源 src\flowtary.rc 引用 FT_VER_COMMA 与 FT_VER_DOT
 //
 // 升级版本号时：FT_VER_COMMA（数值四元组）与 FT_VER_DOT（点号分隔）要一起改。
@@ -14,10 +15,10 @@
 #define FT_VER_MAJOR 1
 #define FT_VER_MINOR 0
 #define FT_VER_PATCH 0
-#define FT_VER_BUILD 1
+#define FT_VER_BUILD 2
 
-#define FT_VER_COMMA 1,0,0,1    /* rc: FILEVERSION / PRODUCTVERSION */
-#define FT_VER_DOT   "1.0.0.1"  /* rc string fields + release.bat  */
+#define FT_VER_COMMA 1,0,0,2    /* rc: FILEVERSION / PRODUCTVERSION */
+#define FT_VER_DOT   "1.0.0.2"  /* rc string fields + release 流程 */
 
 #define FT_PRODUCT_NAME "Flowtary"
 #define FT_FILE_DESC    "Flowtary Launcher"

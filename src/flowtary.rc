@@ -1,5 +1,5 @@
 // Flowtary 版本信息资源
-// 由 release.bat / build.bat 用 rc.exe 编译成 .res，再链接进 exe。
+// 由 CMake 构建（CMakeLists.txt）调用 rc.exe 编译成 .res，再链接进 exe。
 // 版本号等字段统一取自 version.h，不在本文件里硬编码。
 #include <winver.h>
 #include "version.h"
