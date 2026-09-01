@@ -139,8 +139,8 @@ make build       # 完整构建：x64（主程序/hook）+ x86（hook/agent）�
 make release     # 版本自增 + 完整构建 + 输出到 dist\（可用 OUT= 覆盖输出目录）
 make clean       # 清理 CMake 生成的产物
 ```
-需要 VS 2022 / Build Tools 的 C++ 工作负载（x64 + x86）、CMake、GNU make；
-底层由 CMake 生成 NMake Makefiles（nmake 即微软的 make）。
+需要 VS 2022 / Build Tools 的 C++ 工作负载（x64 + x86）、CMake、GNU make、ninja（需在 PATH 中）；
+底层由 CMake 生成 Ninja 构建文件。
 
 ```text
 build\flowtary.exe   :: 主程序，启动后无主窗口、常驻托盘，可被全局热键唤出
