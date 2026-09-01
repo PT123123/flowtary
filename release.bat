@@ -1,19 +1,19 @@
 @echo off
 @chcp 65001 >nul
 rem ============================================================
-rem  Flowtary �����ű���MSVC Release���������ļ���ɫ�棩
+rem  Flowtary release script (MSVC Release, single-file green)
 rem
-rem  �÷���
-rem    release.bat                        ���벢����� ��ĿĿ¼\dist\
-rem    release.bat "D:\Tools\Flowtary"    �����ָ��Ŀ¼
+rem  Usage:
+rem    release.bat                        build and output to project\dist\
+rem    release.bat "D:\Tools\Flowtary"    output to specified directory
 rem
-rem  ���<Ŀ��Ŀ¼>\flowtary-<�汾��>.exe
-rem  �汾��ȡ�� src\version.h �� FT_VER_DOT����һ��Դ�������Ｔ�ɣ�
+rem  Output: <target_dir>\flowtary-<version>.exe
+rem  Version from src\version.h FT_VER_DOT
 rem
-rem  ˵����exe �� /MT ��̬���� C ����ʱ�������� VC++ ���п⣻
-rem        �������ô�ע��� HKCU\Software\Flowtary������ exe �Ա�д�κ��ļ���
-rem  ע�⣺�ļ��Ի�����תģ������ filedlg_hook64.dll / filedlg_hook32.dll /
-rem        filedlg_agent32.exe���������ļ������� flowtary-<�汾>.exe ͬĿ¼����
+rem  Note: exe uses /MT static C runtime, no VC++ runtime needed.
+rem        Config written to HKCU\Software\Flowtary, no files needed.
+rem  Note: file dialog jump module includes filedlg_hook64.dll /
+rem        filedlg_hook32.dll / filedlg_agent32.exe, must be in same dir.
 rem ============================================================
 setlocal
 
@@ -21,48 +21,55 @@ set "ROOT=%~dp0"
 set "OUTDIR=%~1"
 if "%OUTDIR%"=="" set "OUTDIR=%ROOT%dist"
 
-rem ---- ��ȡ�汾�ţ����� src\version.h �� FT_VER_DOT�� ----
-rem �����磺#define FT_VER_DOT   "1.0.0.0"   �� �� 3 �� token��%%~v ȥ������
+rem ---- Read version from src\version.h ----
+set "VER=0.0.0.0"
+for /f "usebackq tokens=3" %%v in (`findstr /c:"#define FT_VER_DOT" "%ROOT%src\version.h"`) do set "VER=%%~v"
+echo [info] version before bump = %VER%
+
+rem ---- Auto bump BUILD digit, write back to src\version.h ----
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tools\version_bump.ps1" "%ROOT%src\version.h"
+if errorlevel 1 (
+    echo [error] Version auto-bump failed.
+    exit /b 1
+)
+
+rem ---- Re-read version after bump ----
 set "VER=0.0.0.0"
 for /f "usebackq tokens=3" %%v in (`findstr /c:"#define FT_VER_DOT" "%ROOT%src\version.h"`) do set "VER=%%~v"
 echo [info] version = %VER%
 
-rem ---- ��λ Visual Studio����Ҫ C++ �������أ� ----
+rem ---- Locate Visual Studio (C++ desktop workload) ----
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 set "VS="
 for /f "usebackq delims=" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VS=%%i"
 if "%VS%"=="" (
-    echo [error] δ�ҵ��� C++ �������ص� Visual Studio��
+    echo [error] Visual Studio with C++ desktop workload not found.
     exit /b 1
 )
 call "%VS%\VC\Auxiliary\Build\vcvars64.bat" >nul
 
 if not exist "%ROOT%build" mkdir "%ROOT%build"
 
-rem ---- ���� 1��������ʷ�������������ǲ����ľɰ桢������־/��ͼ���м��ļ��� ----
-echo [1/4] ������ʷ����...
+rem ---- Step 1: Clean up old artifacts ----
+echo [1/4] Cleaning old artifacts...
 del /q "%ROOT%build\flowtary_old.exe"    2>nul
-del /q "%ROOT%build\flowtary_new.exe"    2>nul
 del /q "%ROOT%build\flowtary_fixed.exe"  2>nul
 del /q "%ROOT%build\flowtary_test.exe"   2>nul
-del /q "%ROOT%build\*_new.*"             2>nul
 del /q "%ROOT%build\*.manifest"          2>nul
 del /q "%ROOT%build\*.obj"               2>nul
 del /q "%ROOT%build\*.log"               2>nul
 del /q "%ROOT%build\*.png"               2>nul
 
-rem ---- ���� 2������汾��Ϣ��Դ ----
-echo [2/4] ����汾��Ϣ��Դ...
+rem ---- Step 2: Compile version info resource ----
+echo [2/4] Compiling version info resource...
 rc /nologo /fo "%ROOT%build\flowtary.res" "%ROOT%src\flowtary.rc"
 if errorlevel 1 (
-    echo [error] ��Դ����ʧ�ܡ�
+    echo [error] Resource compilation failed.
     exit /b 1
 )
 
-rem ---- ���� 3������������ + �ļ��Ի�����תģ�飨/MT ��̬���� �� ���ļ���ɫ�� ----
-rem ע������� build\flowtary_new.exe ��ʱ��������������ʵ����ռ�� build\flowtary.exe��
-rem     ��ֱ��д�����ᱻ�������� LNK1104 �ܳ⣻�������ʱ���ɳ��׹�ܴ�����ͻ��
-echo [3/4] ����������...
+rem ---- Step 3: Compile main program + file dialog jump module (/MT static) ----
+echo [3/4] Compiling main program...
 cl /nologo /std:c++17 /O2 /MT /W3 /EHsc /utf-8 /DNDEBUG /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS /c ^
    "%ROOT%src\main.cpp" /Fo:"%ROOT%build\main.obj"
 if errorlevel 1 exit /b 1
@@ -71,62 +78,55 @@ cl /nologo /std:c++17 /O2 /MT /W3 /EHsc /utf-8 /DNDEBUG /DUNICODE /D_UNICODE /D_
 if errorlevel 1 exit /b 1
 cl /nologo /std:c++17 /O2 /MT /W3 /EHsc /utf-8 /DNDEBUG /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS ^
    "%ROOT%build\main.obj" "%ROOT%build\filedlg_jump.obj" "%ROOT%build\flowtary.res" ^
-   /Fe:"%ROOT%build\flowtary_new.exe" ^
+   /Fe:"%ROOT%build\flowtary.exe" ^
    /link /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF /INCREMENTAL:NO
 if errorlevel 1 exit /b 1
 
-rem ---- ���� 3b������ע�� DLL��32/64 λ���� 32 λ���Ӱ�װ���� ----
-echo [3b] ���빳�� DLL �� 32 λ����...
+rem ---- Step 3b: Compile hook DLLs (32/64) and 32-bit agent ----
+echo [3b] Compiling hook DLLs and 32-bit agent...
 cl /nologo /std:c++17 /O2 /MT /W3 /EHsc /utf-8 /DNDEBUG /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS ^
-   "%ROOT%src\hookdlg.cpp" /Fe:"%ROOT%build\filedlg_hook64_new.dll" /Fo:"%ROOT%build\hookdlg64.obj" ^
+   "%ROOT%src\hookdlg.cpp" /Fe:"%ROOT%build\filedlg_hook64.dll" /Fo:"%ROOT%build\hookdlg64.obj" ^
    /link /DLL /OPT:REF /OPT:ICF /INCREMENTAL:NO
 if errorlevel 1 exit /b 1
 call "%VS%\VC\Auxiliary\Build\vcvars32.bat" >nul
 cl /nologo /std:c++17 /O2 /MT /W3 /EHsc /utf-8 /DNDEBUG /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS ^
-   "%ROOT%src\hookdlg.cpp" /Fe:"%ROOT%build\filedlg_hook32_new.dll" /Fo:"%ROOT%build\hookdlg32.obj" ^
+   "%ROOT%src\hookdlg.cpp" /Fe:"%ROOT%build\filedlg_hook32.dll" /Fo:"%ROOT%build\hookdlg32.obj" ^
    /link /DLL /OPT:REF /OPT:ICF /INCREMENTAL:NO
 if errorlevel 1 exit /b 1
 cl /nologo /std:c++17 /O2 /MT /W3 /EHsc /utf-8 /DNDEBUG /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS ^
-   "%ROOT%src\agent32.cpp" /Fe:"%ROOT%build\filedlg_agent32_new.exe" /Fo:"%ROOT%build\agent32.obj" ^
+   "%ROOT%src\agent32.cpp" /Fe:"%ROOT%build\filedlg_agent32.exe" /Fo:"%ROOT%build\agent32.obj" ^
    /link /SUBSYSTEM:WINDOWS user32.lib /OPT:REF /OPT:ICF /INCREMENTAL:NO
 if errorlevel 1 exit /b 1
 
-rem ---- ���� 4�������Ŀ��Ŀ¼�����汾�Ÿ����� ----
-echo [4/4] ����� %OUTDIR% ...
+rem ---- Step 4: Output to target directory ----
+echo [4/4] Output to %OUTDIR% ...
 if not exist "%OUTDIR%" mkdir "%OUTDIR%"
-copy /y "%ROOT%build\flowtary_new.exe" "%OUTDIR%\flowtary-%VER%.exe" >nul
+copy /y "%ROOT%build\flowtary.exe" "%OUTDIR%\flowtary-%VER%.exe" >nul
 if errorlevel 1 (
-    echo [error] ����ʧ�ܡ�
+    echo [error] Copy main program failed.
     exit /b 1
 )
-rem �ļ��Ի�����תģ�������� 32/64 λע�� DLL �� 32 λ���֣������� exe ͬĿ¼
-copy /y "%ROOT%build\filedlg_hook64_new.dll" "%OUTDIR%\filedlg_hook64.dll" >nul
+copy /y "%ROOT%build\filedlg_hook64.dll" "%OUTDIR%\filedlg_hook64.dll" >nul
 if errorlevel 1 (
-    echo [error] copy filedlg_hook64.dll failed: close ALL running Flowtary instances and retry.
+    echo [error] Copy filedlg_hook64.dll failed.
     exit /b 1
 )
-copy /y "%ROOT%build\filedlg_hook32_new.dll" "%OUTDIR%\filedlg_hook32.dll" >nul
+copy /y "%ROOT%build\filedlg_hook32.dll" "%OUTDIR%\filedlg_hook32.dll" >nul
 if errorlevel 1 (
-    echo [error] copy filedlg_hook32.dll failed: close ALL running Flowtary instances (incl. filedlg_agent32.exe) and retry.
+    echo [error] Copy filedlg_hook32.dll failed.
     exit /b 1
 )
-copy /y "%ROOT%build\filedlg_agent32_new.exe" "%OUTDIR%\filedlg_agent32.exe" >nul
+copy /y "%ROOT%build\filedlg_agent32.exe" "%OUTDIR%\filedlg_agent32.exe" >nul
 if errorlevel 1 (
-    echo [error] copy filedlg_agent32.exe failed: close ALL running Flowtary instances and retry.
+    echo [error] Copy filedlg_agent32.exe failed.
     exit /b 1
 )
-rem �� build\flowtary.exe δ��ռ����˳��ˢ�£�ռ��ʱ���ԣ���Ӱ�췢�����
-copy /y "%ROOT%build\flowtary_new.exe" "%ROOT%build\flowtary.exe" >nul 2>nul
-copy /y "%ROOT%build\filedlg_hook64_new.dll" "%ROOT%build\filedlg_hook64.dll" >nul 2>nul
-copy /y "%ROOT%build\filedlg_hook32_new.dll" "%ROOT%build\filedlg_hook32.dll" >nul 2>nul
-copy /y "%ROOT%build\filedlg_agent32_new.exe" "%ROOT%build\filedlg_agent32.exe" >nul 2>nul
 
 echo.
 echo [ok] %OUTDIR%\flowtary-%VER%.exe
 echo.
-echo ��ʾ��
-echo   1) �Ȱ���� exe �ŵ����չ̶���λ�ã�����������
-echo   2) Ȼ���ڡ������Ҽ� �� ���� �� ���桹��ѡ�������Զ�����������
-echo      ��ע������¼���ǹ�ѡ��һ�̵� exe ����·�����ȹ���Ų�ᵼ�¿�������ʧЧ��
-echo   3) ���ɰ汾���ں�̨���У�ֱ�������°���Զ�������ʾ���ӹܣ������ֶ��˳��ɰ棩��
+echo Notes:
+echo   1) Put the exe in a fixed location (overwrite old version).
+echo   2) Right-click tray icon > Settings > Behavior > "Auto-open launcher".
+echo   3) Old version runs in background until new version prompts takeover.
 exit /b 0
