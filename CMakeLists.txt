@@ -63,6 +63,16 @@ else()
   set_target_properties(flowtary PROPERTIES OUTPUT_NAME flowtary)
   target_link_libraries(flowtary PRIVATE ${FLOWTARY_LIBS})
 
+  # 将 ScreenCapture.exe 和 ImageReader.exe 复制到构建输出目录
+  add_custom_command(TARGET flowtary POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "${CMAKE_SOURCE_DIR}/tools/ScreenCapture.exe"
+      "$<TARGET_FILE_DIR:flowtary>/ScreenCapture.exe"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "${CMAKE_SOURCE_DIR}/tools/ImageReader.exe"
+      "$<TARGET_FILE_DIR:flowtary>/ImageReader.exe"
+    COMMENT "Copying ScreenCapture.exe and ImageReader.exe to output directory")
+
   add_executable(evtest tools/evtest.cpp)
   set_target_properties(evtest PROPERTIES OUTPUT_NAME evtest)
   target_link_libraries(evtest PRIVATE user32 shell32)
