@@ -26,6 +26,8 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <urlmon.h>
+#include <wininet.h>
 
 // comctl6：让公共控件（编辑框滚动条/组合框）走现代主题，配合 DarkMode_* 变体变暗
 #pragma comment(linker, "\"/manifestdependency:type='win32' \
@@ -41,6 +43,8 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "uxtheme.lib")
 #pragma comment(lib, "msimg32.lib")
+#pragma comment(lib, "wininet.lib")
+#pragma comment(lib, "urlmon.lib")
 
 // ---------------- Everything IPC（官方 SDK 协议，Everything 1.3+） ----------------
 namespace ev {
@@ -251,7 +255,7 @@ struct Program {
 };
 
 struct Row {
-    enum Kind { File, Folder, Web, Prog, EvFallback, Hint, Group, Shell, Window, Top };
+    enum Kind { File, Folder, Web, Prog, EvFallback, Hint, Group, Shell, Window, Top, Capture };
     Kind kind = Hint;
     std::wstring title;
     std::wstring sub;     // 路径 / URL 说明
@@ -276,7 +280,7 @@ struct CmdGroup {
     std::vector<std::wstring> targets;
 };
 
-enum class Mode { None, Everything, Web, Programs, Shell, Window, Top };
+enum class Mode { None, Everything, Web, Programs, Shell, Window, Top, Capture };
 
 // 窗口枚举缓存项
 struct WinInfo {
@@ -305,7 +309,7 @@ struct App {
     bool startupSaved = false; // 设置窗打开时的初始值（取消时回退）
     bool hotkeyWake = true;    // 唤起快捷键总开关（托盘菜单切换；关闭时不再注册 Alt+Space 等）
     int hotkeyModeSaved = 0;   // 同上，结果项快捷键方案（取消时回退）
-    int settingsTab = 0;        // 设置窗当前 Tab：0=常规, 1=网页规则, 2=主题, 3=一键, 4=搜索权重, 5=排除路径, 6=Shell 与窗口, 7=命令（关闭后仍记住上次选择）
+    int settingsTab = 0;        // 设置窗当前 Tab：0=常规, 1=网页规则, 2=主题, 3=一键, 4=搜索权重, 5=排除路径, 6=Shell 与窗口, 7=命令, 8=截图工具（关闭后仍记住上次选择）
     int themeIdx = 0;          // 当前主题索引（设置窗切换后、保存前为暂存值）
     int themeSaved = 0;        // 设置窗打开时的初始主题（取消时回退）
     bool beautify = true;      // 界面美化：暗色标题栏 + 圆角窗口 + 强制暗色菜单（默认开）
@@ -413,6 +417,12 @@ struct App {
     // 窗口枚举缓存（避免频繁 EnumWindows 卡顿）
     std::vector<WinInfo> windowCache;
     DWORD windowCacheTick = 0;
+
+    // —— 截图命令（ScreenCapture.exe）——
+    bool captureEnabled = true;        // ss 命令开关（默认开）
+    bool captureEnabledSaved = true;   // 取消时回退用
+    std::wstring captureExe;           // ScreenCapture.exe 完整路径
+    std::wstring captureArgs;          // 本次启动的命令行参数
 } g;
 
 constexpr int kBaseW = 600, kBaseInputH = 56, kBaseRowH = 30, kBasePad = 12;
@@ -914,6 +924,27 @@ static std::wstring Utf8ToWide(const std::string& s) {
     std::wstring w(n, 0);
     MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
     return w;
+}
+
+// 检测输入是否为网址：以 http:// https:// ftp:// ftps:// 开头，
+// 或 www. 开头，或包含 ://（自定义协议），或无斜杠点分域名格式
+static bool IsUrl(const std::wstring& s) {
+    if (s.empty()) return false;
+    if (_wcsnicmp(s.c_str(), L"http://", 7) == 0) return true;
+    if (_wcsnicmp(s.c_str(), L"https://", 8) == 0) return true;
+    if (_wcsnicmp(s.c_str(), L"ftp://", 6) == 0) return true;
+    if (_wcsnicmp(s.c_str(), L"ftps://", 7) == 0) return true;
+    if (_wcsnicmp(s.c_str(), L"www.", 4) == 0) return true;
+    size_t pos = s.find(L"://");
+    if (pos != std::wstring::npos && pos > 0) return true;
+    // 无斜杠点分域名：xxx.yyy.zzz（有至少一个点，点不在首尾，无斜杠/空格）
+    size_t dot = s.find(L'.');
+    if (dot == std::wstring::npos || dot == 0 || dot == s.size() - 1) return false;
+    for (wchar_t c : s) {
+        if (c == L' ' || c == L'\t' || c == L'\r' || c == L'\n' ||
+            c == L'\\' || c == L'/') return false;
+    }
+    return true;
 }
 
 static std::wstring BuildUrl(const WCHAR* tmpl, const std::wstring& keyword) {
@@ -1526,6 +1557,15 @@ static void Refresh() {
 
     const std::wstring& t = g.text;
     if (!t.empty()) {
+        // 网址直达：输入为网址时，结果最前面加一条「打开网址」项
+        if (IsUrl(t)) {
+            Row r;
+            r.kind = Row::Web;
+            r.title = L"打开网址：" + t;
+            r.action = t;
+            r.sub = t;
+            g.items.push_back(std::move(r));
+        }
         // 命令类前缀：必须以空格开头（去掉前导空格后才是真正的 token）。
         // top / cmd / w 三种命令各自可在「命令」设置页开关。
         bool spaceCmd = (t[0] == L' ');
@@ -1573,6 +1613,50 @@ static void Refresh() {
                     AddHint(L"输入窗口标题/进程名切换；回车切换，Ctrl+Enter 关闭，Ctrl+Shift+Enter 结束进程");
                 } else {
                     SearchWindows(rest);
+                }
+            } else if (g.captureEnabled && tok == L"ss") {
+                // ss 命令：截图（ScreenCapture.exe）
+                g.mode = Mode::Capture;
+                if (rest.empty()) {
+                    // 无参数：显示默认截图项，回车直接执行
+                    if (g.captureExe.empty()) {
+                        AddHint(L"未找到 ScreenCapture.exe，请在设置→截图工具中下载");
+                    } else {
+                        Row r;
+                        r.kind = Row::Capture;
+                        r.title = L"截图";
+                        r.action = L"cap";
+                        r.sub = L"ScreenCapture（回车截图，或输入 pin / long / ocr / qr）";
+                        g.items.push_back(std::move(r));
+                    }
+                } else {
+                    std::wstring enterMode;
+                    if (rest == L"pin") enterMode = L"pin";
+                    else if (rest == L"long") enterMode = L"long";
+                    else if (rest == L"cap") enterMode = L"cap";
+                    else if (rest == L"ocr") enterMode = L"ocr";
+                    else if (rest == L"qr") enterMode = L"qr";
+                    else {
+                        AddHint(L"不支持的模式，可用：pin（贴图）/ long（长截图）/ ocr（文字识别）/ qr（二维码）");
+                    }
+                    if (!enterMode.empty() && g.captureExe.empty()) {
+                        if (enterMode == L"ocr")
+                            AddHint(L"未找到 ScreenCapture.exe，请在设置→截图工具中下载");
+                        else if (enterMode == L"qr")
+                            AddHint(L"未找到 ScreenCapture.exe，请在设置→截图工具中下载");
+                        else
+                            AddHint(L"未找到 ScreenCapture.exe，请确认与 flowtary.exe 同目录");
+                    } else if (!enterMode.empty()) {
+                        Row r;
+                        r.kind = Row::Capture;
+                        r.title = (enterMode == L"cap") ? L"截图" :
+                                  (enterMode == L"pin") ? L"截图 + 贴图" :
+                                  (enterMode == L"ocr") ? L"截图 + 文字识别" :
+                                  (enterMode == L"qr") ? L"截图 + 二维码识别" : L"长截图";
+                        r.action = enterMode;  // 保存模式，执行时构造完整命令行
+                        r.sub = L"ScreenCapture " + enterMode;
+                        g.items.push_back(std::move(r));
+                    }
                 }
             } else {
                 // 空格开头但不是已知命令：按普通程序搜索处理
@@ -1741,6 +1825,15 @@ static bool ExecuteRow(Row& r, ExecKind ek = ExecKind::Normal) {
                 return true;
             }
             return false;
+        }
+        case Row::Capture: {
+            // ss 命令：启动 ScreenCapture.exe 截图
+            if (g.captureExe.empty()) return false;
+            // 构造命令行参数：enter=模式 tray=false auto-quit=true
+            std::wstring args = L"enter=" + r.action + L" tray=false auto-quit=true";
+            HINSTANCE h = ShellExecuteW(nullptr, L"open", g.captureExe.c_str(),
+                                        args.c_str(), nullptr, SW_SHOWNORMAL);
+            return (INT_PTR)h > 32;
         }
         case Row::Hint:
             break;
@@ -2504,6 +2597,13 @@ static void LoadSettings() {
         g.winEnabled = v != 0;
     else
         g.winEnabled = true;
+    // ss 截图命令开关（空格+ss 截图；默认开）
+    cb = sizeof(v);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"CaptureCmd", RRF_RT_REG_DWORD,
+                     nullptr, &v, &cb) == ERROR_SUCCESS)
+        g.captureEnabled = v != 0;
+    else
+        g.captureEnabled = true;
 
     // —— Shell 与窗口设置 ——
     DWORD vv = 0; DWORD cbv = sizeof(vv);
@@ -3207,6 +3307,14 @@ constexpr int IDC_CHK_FILEDLGJUMP = 3034;  // 常规页：文件对话框跳转�
 constexpr int IDC_CHK_TOP = 3035;          // 命令页：top 命令开关（空格+top 回车置顶/取消置顶当前窗口）
 constexpr int IDC_CHK_CMD = 3081;          // 命令页：cmd 命令开关（空格+cmd 执行 Shell 命令，原 "> 命令"）
 constexpr int IDC_CHK_WIN = 3082;          // 命令页：w 命令开关（空格+w 切换窗口，原 "< 关键词"）
+constexpr int IDC_CHK_CAPTURE = 3083;      // 命令页：ss 截图命令开关（空格+ss 截图）
+// 截图工具 Tab（索引 8）：下载 ScreenCapture.exe + ImageReader.exe
+constexpr int IDC_TAB_CAPTURE = 3090;      // 左侧 Tab：截图工具
+constexpr int IDC_BTN_DL_SCREENCAPTURE = 3091;  // 下载 ScreenCapture.exe
+constexpr int IDC_BTN_DL_IMAGEREADER = 3092;    // 下载 ImageReader.exe
+constexpr int IDC_LBL_CAPTURE_STATUS = 3093;    // 当前工具状态
+constexpr int IDC_LBL_CAPTURE_HINT = 3094;      // 说明文字
+constexpr int IDC_LBL_CAPTURE_NOTE = 3095;      // OCR 备注
 // 主题页：自绘主题选择器（色板列表）+ 3 个微调滑块（实时预览，保存后生效）
 constexpr int IDC_LST_THEME = 3040;  // 主题选择器：自绘列表框
 constexpr int IDC_LBL_TUNE = 3041;   // 「微调」说明标签
@@ -3254,6 +3362,94 @@ static const WCHAR* ShellCwdName(int t) {
     return t == 0 ? L"用户目录 (%USERPROFILE%)"
          : t == 1 ? L"系统默认目录 (System32)"
                   : L"桌面目录";
+}
+
+// 截图工具：获取 Flowtary.exe 同目录
+static std::wstring GetFlowtaryDir() {
+    WCHAR path[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    std::wstring dir(path);
+    size_t pos = dir.find_last_of(L"\\/");
+    if (pos != std::wstring::npos) dir.resize(pos + 1);
+    return dir;
+}
+
+// 截图工具：更新状态标签文本
+static void UpdateCaptureStatus(HWND hSettings) {
+    if (!hSettings) return;
+    HWND hw = GetDlgItem(hSettings, IDC_LBL_CAPTURE_STATUS);
+    if (!hw) return;
+    std::wstring dir = GetFlowtaryDir();
+    bool sc = GetFileAttributesW((dir + L"ScreenCapture.exe").c_str()) != INVALID_FILE_ATTRIBUTES;
+    bool ir = GetFileAttributesW((dir + L"ImageReader.exe").c_str()) != INVALID_FILE_ATTRIBUTES;
+    std::wstring text;
+    if (sc && ir)
+        text = L"ScreenCapture.exe 和 ImageReader.exe 均已就绪";
+    else if (sc)
+        text = L"ScreenCapture.exe 已就绪，ImageReader.exe 未下载（文字识别不可用）";
+    else if (ir)
+        text = L"ImageReader.exe 已就绪，ScreenCapture.exe 未下载";
+    else
+        text = L"ScreenCapture.exe 和 ImageReader.exe 均未下载";
+    SetWindowTextW(hw, text.c_str());
+}
+
+// 截图工具：从 URL 下载文件到目标路径（同步执行，用于下载按钮回调）
+static bool DownloadFile(HWND hParent, const WCHAR* url, const WCHAR* destPath) {
+    // 先尝试 URLDownloadToFile（urlmon.dll，同步阻塞但实现最简洁）
+    HRESULT hr = URLDownloadToFileW(nullptr, url, destPath, 0, nullptr);
+    if (hr == S_OK) return true;
+    if (hr == E_OUTOFMEMORY) {
+        MessageBoxW(hParent, L"下载失败：内存不足", L"下载错误", MB_ICONERROR);
+        return false;
+    }
+    // URLDownloadToFile 失败时尝试 WinINET
+    HINTERNET hSession = InternetOpenW(L"Flowtary/1.0",
+                                       INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
+    if (!hSession) {
+        MessageBoxW(hParent, L"下载失败：无法建立网络连接", L"下载错误", MB_ICONERROR);
+        return false;
+    }
+    HINTERNET hUrl = InternetOpenUrlW(hSession, url, nullptr, 0,
+                                       INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_PRAGMA_NOCACHE, 0);
+    if (!hUrl) {
+        InternetCloseHandle(hSession);
+        MessageBoxW(hParent, L"下载失败：无法访问下载链接", L"下载错误", MB_ICONERROR);
+        return false;
+    }
+    WCHAR tmpPath[MAX_PATH];
+    wcscpy_s(tmpPath, destPath);
+    wcscat_s(tmpPath, L".tmp");
+    FILE* fp = _wfopen(tmpPath, L"wb");
+    if (!fp) {
+        InternetCloseHandle(hUrl);
+        InternetCloseHandle(hSession);
+        MessageBoxW(hParent, L"下载失败：无法创建临时文件", L"下载错误", MB_ICONERROR);
+        return false;
+    }
+    BYTE buf[8192];
+    DWORD done = 0;
+    bool ok = true;
+    while (InternetReadFile(hUrl, buf, sizeof(buf), &done) && done > 0) {
+        if (fwrite(buf, 1, done, fp) != (size_t)done) {
+            ok = false;
+            break;
+        }
+    }
+    fclose(fp);
+    InternetCloseHandle(hUrl);
+    InternetCloseHandle(hSession);
+    if (!ok) {
+        _wremove(tmpPath);
+        MessageBoxW(hParent, L"下载失败：写入文件时出错", L"下载错误", MB_ICONERROR);
+        return false;
+    }
+    if (!MoveFileExW(tmpPath, destPath, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        _wremove(tmpPath);
+        MessageBoxW(hParent, L"下载失败：无法替换目标文件", L"下载错误", MB_ICONERROR);
+        return false;
+    }
+    return true;
 }
 
 // 设置窗口 Tab 切换：按 g.settingsTab 显示/隐藏对应分组控件，
@@ -3326,6 +3522,14 @@ static void ShowSettingsTab(HWND h, int tab) {
     vis(IDC_CHK_TOP, cmd);
     vis(IDC_CHK_CMD, cmd);
     vis(IDC_CHK_WIN, cmd);
+    vis(IDC_CHK_CAPTURE, cmd);
+    bool capture = (tab == 8);
+    vis(IDC_BTN_DL_SCREENCAPTURE, capture);
+    vis(IDC_BTN_DL_IMAGEREADER, capture);
+    vis(IDC_LBL_CAPTURE_STATUS, capture);
+    vis(IDC_LBL_CAPTURE_HINT, capture);
+    vis(IDC_LBL_CAPTURE_NOTE, capture);
+    if (capture) UpdateCaptureStatus(h);  // 切换到截图工具页时刷新状态
     // 保存/取消/恢复默认：始终显示，贴底并整行居中（由 LayoutSettings 统一处理）
     LayoutSettings(h);
     InvalidateRect(h, nullptr, TRUE);
@@ -3575,6 +3779,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             g.topEnabledSaved = g.topEnabled;     // top 命令开关（取消时回退）
             g.cmdEnabledSaved = g.cmdEnabled;     // cmd 命令开关（取消时回退）
             g.winEnabledSaved = g.winEnabled;     // w 命令开关（取消时回退）
+            g.captureEnabledSaved = g.captureEnabled;  // ss 截图命令开关（取消时回退）
             HWND c;
 
             // 左侧 Tab 栏（自绘按钮）：常规 / 网页规则 / 主题
@@ -3617,6 +3822,11 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                                 S(10), S(332), S(120), S(36), h,
                                 (HMENU)(INT_PTR)IDC_TAB_CMD, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+            c = CreateWindowExW(0, L"BUTTON", L"截图工具",
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                S(10), S(376), S(120), S(36), h,
+                                (HMENU)(INT_PTR)IDC_TAB_CAPTURE, g.inst, nullptr);
             SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
 
             c = CreateWindowExW(0, L"BUTTON", L"开机自动启动",
@@ -4059,7 +4269,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 ShowWindow(GetDlgItem(h, IDC_EDT_SHELLARGS), SW_HIDE);
             }
 
-            // 命令 Tab（索引 7）：top / cmd / w 三个开关，各自默认开、单独可控
+            // 命令 Tab（索引 7）：top / cmd / w / ss 四个开关，各自默认开、单独可控
             c = CreateWindowExW(0, L"BUTTON",
                                 L"top 命令（空格+top 回车，置顶/取消置顶当前窗口）",
                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
@@ -4078,9 +4288,54 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                                 margin, S(92), contentW, S(24), h,
                                 (HMENU)(INT_PTR)IDC_CHK_WIN, g.inst, nullptr);
             SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+            c = CreateWindowExW(0, L"BUTTON",
+                                L"ss 命令（空格+ss 截图，空格+ss pin 贴图）",
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                margin, S(128), contentW, S(24), h,
+                                (HMENU)(INT_PTR)IDC_CHK_CAPTURE, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+
+            // 截图工具 Tab（索引 8）：下载 ScreenCapture + ImageReader
+            // 状态标签（显示当前工具是否已就位）
+            c = CreateWindowExW(0, L"STATIC", L"",
+                                WS_CHILD | SS_CENTERIMAGE,
+                                margin, S(20), contentW, S(24), h,
+                                (HMENU)(INT_PTR)IDC_LBL_CAPTURE_STATUS, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+            // ScreenCapture.exe 下载按钮
+            c = CreateWindowExW(0, L"BUTTON",
+                                L"下载 ScreenCapture.exe（约 1MB）",
+                                WS_CHILD | WS_TABSTOP | BS_OWNERDRAW,
+                                margin, S(56), contentW, S(32), h,
+                                (HMENU)(INT_PTR)IDC_BTN_DL_SCREENCAPTURE, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+            // ImageReader.exe 下载按钮（OCR 依赖）
+            c = CreateWindowExW(0, L"BUTTON",
+                                L"下载 ImageReader.exe（约 25MB，文字识别必需）",
+                                WS_CHILD | WS_TABSTOP | BS_OWNERDRAW,
+                                margin, S(100), contentW, S(32), h,
+                                (HMENU)(INT_PTR)IDC_BTN_DL_IMAGEREADER, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+            // 说明文字
+            c = CreateWindowExW(0, L"STATIC",
+                                L"下载后将自动保存到 Flowtary.exe 同目录。"
+                                L"OCR 功能（空格+ss ocr）需要 ImageReader.exe 才可使用。",
+                                WS_CHILD | SS_LEFT,
+                                margin, S(148), contentW, S(48), h,
+                                (HMENU)(INT_PTR)IDC_LBL_CAPTURE_HINT, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+            // OCR 备注
+            c = CreateWindowExW(0, L"STATIC",
+                                L"提示：文字识别结果会自动复制到剪贴板。"
+                                L"支持的命令：空格+ss（截图）/ 空格+ss pin（贴图）/ 空格+ss long（长截图）/ 空格+ss ocr（文字识别）/ 空格+ss qr（二维码）",
+                                WS_CHILD | SS_LEFT,
+                                margin, S(204), contentW, S(72), h,
+                                (HMENU)(INT_PTR)IDC_LBL_CAPTURE_NOTE, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
 
             RecordSettingsLayout(h);            // 记录初始几何，之后可随窗口缩放重排
             ShowSettingsTab(h, g.settingsTab);  // 按当前 Tab 初始化分组可见性并重排
+            UpdateCaptureStatus(h);             // 初始化截图工具状态标签
             return 0;
         }
 
@@ -4315,7 +4570,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (dis->CtlType == ODT_BUTTON) {
                 int id = (int)dis->CtlID;
                 const Theme& t = *g.theme;
-                if (id == IDC_CHK_CMD || id == IDC_CHK_WIN ||
+                if (id == IDC_CHK_CMD || id == IDC_CHK_WIN || id == IDC_CHK_CAPTURE ||
                     id == IDC_CHK_START || id == IDC_CHK_BEAUTIFY ||
                     id == IDC_CHK_WEIGHTON || id == IDC_CHK_FILEDLGJUMP ||
                     id == IDC_CHK_TOP || id == IDC_CHK_GHOST ||
@@ -4339,6 +4594,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                                  : (id == IDC_CHK_TOP) ? g.topEnabled
                                  : (id == IDC_CHK_CMD) ? g.cmdEnabled
                                  : (id == IDC_CHK_WIN) ? g.winEnabled
+                                 : (id == IDC_CHK_CAPTURE) ? g.captureEnabled
                                  : (id == IDC_CHK_GHOST) ? g.antiGhost
                                  : (id == IDC_CHK_SHOWWIN) ? g.shellShowWindow
                                  : (id == IDC_CHK_WINGROUP) ? g.winGroupProc
@@ -4414,7 +4670,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 if (id == IDC_TAB_GENERAL || id == IDC_TAB_WEB || id == IDC_TAB_THEME ||
                     id == IDC_TAB_GROUP || id == IDC_TAB_WEIGHT || id == IDC_TAB_EXCLUDE ||
-                    id == IDC_TAB_SHELL || id == IDC_TAB_CMD) {
+                    id == IDC_TAB_SHELL || id == IDC_TAB_CMD || id == IDC_TAB_CAPTURE) {
                     // 左侧 Tab 按钮：激活项用强调色高亮，并加左侧竖条
                     int idx = (id == IDC_TAB_GENERAL) ? 0
                             : (id == IDC_TAB_WEB)     ? 1
@@ -4423,7 +4679,8 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                             : (id == IDC_TAB_WEIGHT)  ? 4
                             : (id == IDC_TAB_EXCLUDE) ? 5
                             : (id == IDC_TAB_SHELL)   ? 6
-                                                      : 7;
+                            : (id == IDC_TAB_CMD)     ? 7
+                                                      : 8;
                     bool active = (g.settingsTab == idx);
                     bool hover = (dis->itemState & ODS_HOTLIGHT) != 0;
                     HBRUSH bk = CreateSolidBrush(active ? t.menuHi : (hover ? t.editBg : t.menuBg));
@@ -4449,7 +4706,8 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                                      : (id == IDC_TAB_WEIGHT)  ? L"搜索权重"
                                      : (id == IDC_TAB_EXCLUDE) ? L"排除路径"
                                      : (id == IDC_TAB_SHELL)   ? L"Shell 与窗口"
-                                                               : L"命令";
+                                     : (id == IDC_TAB_CMD)     ? L"命令"
+                                                                : L"截图工具";
                     RECT tr = dis->rcItem;
                     tr.left += S(10);
                     DrawTextW(dis->hDC, lbl, -1, &tr,
@@ -4534,6 +4792,9 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 DWORD vwin = g.winEnabled ? 1 : 0;
                 RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"WinCmd",
                                 REG_DWORD, &vwin, sizeof(vwin));
+                DWORD vcap = g.captureEnabled ? 1 : 0;
+                RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"CaptureCmd",
+                                REG_DWORD, &vcap, sizeof(vcap));
                 int len = GetWindowTextLengthW(GetDlgItem(h, IDC_EDT_RULES));
                 std::wstring rulesText(len + 1, 0);
                 GetWindowTextW(GetDlgItem(h, IDC_EDT_RULES), &rulesText[0], len + 1);
@@ -4652,6 +4913,9 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             } else if (id == IDC_CHK_WIN && HIWORD(wp) == BN_CLICKED) {
                 g.winEnabled = !g.winEnabled;
                 InvalidateRect(GetDlgItem(h, IDC_CHK_WIN), nullptr, TRUE);
+            } else if (id == IDC_CHK_CAPTURE && HIWORD(wp) == BN_CLICKED) {
+                g.captureEnabled = !g.captureEnabled;
+                InvalidateRect(GetDlgItem(h, IDC_CHK_CAPTURE), nullptr, TRUE);
             } else if (id == IDC_CHK_SHOWWIN && HIWORD(wp) == BN_CLICKED) {
                 g.shellShowWindow = !g.shellShowWindow;
                 InvalidateRect(GetDlgItem(h, IDC_CHK_SHOWWIN), nullptr, TRUE);
@@ -4690,7 +4954,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 } else if ((id == IDC_TAB_GENERAL || id == IDC_TAB_WEB || id == IDC_TAB_THEME ||
                           id == IDC_TAB_GROUP || id == IDC_TAB_WEIGHT ||
                           id == IDC_TAB_EXCLUDE || id == IDC_TAB_SHELL ||
-                          id == IDC_TAB_CMD) &&
+                          id == IDC_TAB_CMD || id == IDC_TAB_CAPTURE) &&
                          HIWORD(wp) == BN_CLICKED) {
                 ShowSettingsTab(h, (id == IDC_TAB_GENERAL) ? 0
                                  : (id == IDC_TAB_WEB)    ? 1
@@ -4699,7 +4963,8 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                                  : (id == IDC_TAB_WEIGHT) ? 4
                                  : (id == IDC_TAB_EXCLUDE) ? 5
                                  : (id == IDC_TAB_SHELL)   ? 6
-                                                           : 7);
+                                 : (id == IDC_TAB_CMD)     ? 7
+                                                           : 8);
              } else if (id == IDC_CMB_WAKE && HIWORD(wp) == CBN_SELCHANGE) {
                 int s = (int)SendMessageW((HWND)lp, CB_GETCURSEL, 0, 0);
                 if (s >= 0 && s < 2) g.centerWake = (s == 0);
@@ -4791,6 +5056,41 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                                    std::to_wstring(DefaultExcludePaths().size()) +
                                    L" 条排除项";
                 SetWindowTextW(GetDlgItem(h, IDC_LBL_EXCLUDECOUNT), cnt.c_str());
+            } else if (id == IDC_BTN_DL_SCREENCAPTURE && HIWORD(wp) == BN_CLICKED) {
+                // 下载 ScreenCapture.exe：从 GitHub Release 获取最新版
+                HWND btn = GetDlgItem(h, IDC_BTN_DL_SCREENCAPTURE);
+                SetWindowTextW(btn, L"下载中…");
+                EnableWindow(btn, FALSE);
+                std::wstring dir = GetFlowtaryDir();
+                std::wstring dest = dir + L"ScreenCapture.exe";
+                bool ok = DownloadFile(h,
+                    L"https://github.com/xland/ScreenCapture/releases/latest/download/ScreenCapture.exe",
+                    dest.c_str());
+                if (ok) {
+                    g.captureExe = dest;
+                    MessageBoxW(h, L"ScreenCapture.exe 下载完成！\r\n现在可以使用 空格+ss 截图命令了。",
+                                L"下载成功", MB_ICONINFORMATION);
+                }
+                SetWindowTextW(btn, L"下载 ScreenCapture.exe（约 1MB）");
+                EnableWindow(btn, TRUE);
+                UpdateCaptureStatus(h);
+            } else if (id == IDC_BTN_DL_IMAGEREADER && HIWORD(wp) == BN_CLICKED) {
+                // 下载 ImageReader.exe：OCR 插件
+                HWND btn = GetDlgItem(h, IDC_BTN_DL_IMAGEREADER);
+                SetWindowTextW(btn, L"下载中…（约 25MB，请稍候）");
+                EnableWindow(btn, FALSE);
+                std::wstring dir = GetFlowtaryDir();
+                std::wstring dest = dir + L"ImageReader.exe";
+                bool ok = DownloadFile(h,
+                    L"https://github.com/xland/ImageReader/releases/latest/download/ImageReader.exe",
+                    dest.c_str());
+                if (ok) {
+                    MessageBoxW(h, L"ImageReader.exe 下载完成！\r\n现在可以使用 空格+ss ocr 文字识别功能了。",
+                                L"下载成功", MB_ICONINFORMATION);
+                }
+                SetWindowTextW(btn, L"下载 ImageReader.exe（约 25MB，文字识别必需）");
+                EnableWindow(btn, TRUE);
+                UpdateCaptureStatus(h);
             }
             return 0;
         }
@@ -5783,6 +6083,32 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
         InitCommonControlsEx(&icc);
     }
     LoadSettings();  // 先加载设置：确定主题/快捷键
+    // 查找 ScreenCapture.exe（优先同目录，其次注册表自定义路径）
+    {
+        WCHAR exePath[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+        std::wstring dir(exePath);
+        size_t pos = dir.find_last_of(L"\\/");
+        if (pos != std::wstring::npos) dir.resize(pos + 1);
+        std::wstring candidate = dir + L"ScreenCapture.exe";
+        if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            g.captureExe = candidate;
+        } else {
+            // 尝试注册表自定义路径
+            DWORD type = 0, cb = 0;
+            if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"CaptureExe",
+                             RRF_RT_REG_SZ, &type, nullptr, &cb) == ERROR_SUCCESS && cb > sizeof(WCHAR)) {
+                std::vector<WCHAR> buf(cb / sizeof(WCHAR));
+                if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"CaptureExe",
+                                 RRF_RT_REG_SZ, nullptr, buf.data(), &cb) == ERROR_SUCCESS) {
+                    std::wstring customPath(buf.data());
+                    if (GetFileAttributesW(customPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                        g.captureExe = customPath;
+                    }
+                }
+            }
+        }
+    }
     UpdateScale(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY));  // 建字体池（比例 = max(DPI, 物理高/1080)）
     ApplyTheme(false);  // 建立主题字体与画刷：此时还没有窗口，只为弹窗准备绘制资源
 
