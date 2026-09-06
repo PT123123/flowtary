@@ -161,3 +161,158 @@ if(EXISTS "${SC_DIR}/main.cpp")
     version windowsapp windowscodecs winmm
     userenv uuid ntdll)
 endif()
+
+# =====================================================================
+# vcpkg 静态三元组定位（opencv / onnxruntime）
+#
+# TinyOCR 链接的是 onnxruntime 的 **static-mt** 版本，与本项目 /MT 一致；
+# 官方 GitHub Release 只提供动态库版，故必须用 vcpkg 的 x64-windows-static。
+# =====================================================================
+function(_flowtary_find_triplet _triplet _out)
+  foreach(_root IN ITEMS "C:/vcpkg" "${CMAKE_SOURCE_DIR}/../vcpkg" "$ENV{VCPKG_ROOT}")
+    if(_root AND EXISTS "${_root}/installed/${_triplet}/include")
+      set(${_out} "${_root}/installed/${_triplet}" PARENT_SCOPE)
+      return()
+    endif()
+  endforeach()
+  set(${_out} "" PARENT_SCOPE)
+endfunction()
+
+_flowtary_find_triplet("x64-windows-static" FLOWTARY_VCPKG_STATIC)
+
+# ---- Yoga（Ling 内置的 flexbox 布局引擎，上游为独立 vcxproj）----
+set(LING_DIR "${CMAKE_CURRENT_SOURCE_DIR}/Ling")
+if(EXISTS "${LING_DIR}/src/Ling.cpp")
+  # Yoga 头文件在 vendor/Ling/yoga/ 下。上游 vcxproj 的 SolutionDir 是 Ling 根,
+  # #include <yoga/Yoga.h> 实际映射到 Ling/yoga/Yoga.h。CMake 中 include 目录用
+  # Ling 根（而非 yoga 子目录），以匹配 MSBuild $(SolutionDir) 语义。
+  file(GLOB_RECURSE YOGA_SOURCES "${LING_DIR}/yoga/*.cpp")
+  add_library(yoga STATIC ${YOGA_SOURCES})
+  target_include_directories(yoga PUBLIC "${LING_DIR}")
+  set_target_properties(yoga PROPERTIES
+    CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+
+  # ---- Ling（GUI 框架）----
+  file(GLOB_RECURSE LING_SOURCES "${LING_DIR}/src/*.cpp")
+  add_library(Ling STATIC ${LING_SOURCES})
+  # include 基准为 Ling 仓库根（上游 vcxproj 的 $(SolutionDir)），
+  # 供 ImageReader 以 <Ling/...> 之外的写法包含时也能命中。
+  #
+  # 注意：App.cpp 使用相对路径 "../include/Util.h" 包含 Util.h，这会绕过
+  # _include_路径搜索。为了替换有问题的 COMPILE_TIME_RAND_STR 宏，我们
+  # 使用 /FI 编译器选项强制在编译单元开头 include wrapper/Util.h，
+  # 它会先 include 原始的 Util.h，然后 #undef 并重新定义宏。
+  target_include_directories(Ling PUBLIC
+    "${LING_DIR}"
+    "${LING_DIR}/include"
+    "${FLOWTARY_CPPWINRT_DIR}")
+  target_link_libraries(Ling PUBLIC yoga d2d1 dwrite windowscodecs)
+  target_compile_options(Ling PRIVATE
+    /std:c++latest /Zc:preprocessor
+    /FI${CMAKE_SOURCE_DIR}/cmake/wrapper/Util.h
+  )
+  target_compile_definitions(Ling PRIVATE NOMINMAX)
+  set_target_properties(Ling PROPERTIES
+    CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+endif()
+
+# ---- Clipper2（TinyOCR 内置）----
+set(TYOCR_DIR "${CMAKE_CURRENT_SOURCE_DIR}/TinyOCR")
+if(EXISTS "${TYOCR_DIR}/Clipper2/src")
+  file(GLOB_RECURSE CLIPPER_SOURCES "${TYOCR_DIR}/Clipper2/src/*.cpp")
+  add_library(Clipper2 STATIC ${CLIPPER_SOURCES})
+  target_include_directories(Clipper2 PUBLIC "${TYOCR_DIR}/Clipper2/include")
+  set_target_properties(Clipper2 PROPERTIES
+    CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+endif()
+
+# =====================================================================
+# OCR 链：TinyOCR → ImageReader
+#   依赖 vcpkg 的 opencv(core+imgproc) 与 onnxruntime 静态库。
+#   依赖未就绪时整体跳过，主构建不受影响（此时 OCR 沿用预编译 exe）。
+# =====================================================================
+set(FLOWTARY_OCR_READY FALSE)
+if(FLOWTARY_VCPKG_STATIC AND TARGET Ling AND TARGET Clipper2)
+  # x64-windows-static triplet 生成的 onnxruntime 静态库名为 onnxruntime_common.lib
+  file(GLOB _ORT_LIB "${FLOWTARY_VCPKG_STATIC}/lib/onnxruntime_common.lib")
+  file(GLOB _OCV_CORE "${FLOWTARY_VCPKG_STATIC}/lib/opencv_core*.lib")
+  file(GLOB _OCV_IMGPROC "${FLOWTARY_VCPKG_STATIC}/lib/opencv_imgproc*.lib")
+  if(_ORT_LIB AND _OCV_CORE AND _OCV_IMGPROC)
+    set(FLOWTARY_OCR_READY TRUE)
+  endif()
+endif()
+
+if(FLOWTARY_OCR_READY)
+  message(STATUS "[vendor] OCR 依赖就绪: ${FLOWTARY_VCPKG_STATIC}")
+
+  # ---- TinyOCR ----
+  set(TYOCR_SOURCES
+    "${TYOCR_DIR}/TinyOCR/src/cal_rec_boxes.cpp"
+    "${TYOCR_DIR}/TinyOCR/src/ctc_decoder.cpp"
+    "${TYOCR_DIR}/TinyOCR/src/db_post_process.cpp"
+    "${TYOCR_DIR}/TinyOCR/src/image_utils.cpp"
+    "${TYOCR_DIR}/TinyOCR/src/ort_session.cpp"
+    "${TYOCR_DIR}/TinyOCR/src/text_detector.cpp"
+    "${TYOCR_DIR}/TinyOCR/src/text_recognizer.cpp"
+    "${TYOCR_DIR}/TinyOCR/src/tiny_ocr.cpp"
+  )
+  add_library(TinyOCR STATIC ${TYOCR_SOURCES})
+  target_include_directories(TinyOCR PUBLIC
+    "${TYOCR_DIR}"
+    "${TYOCR_DIR}/TinyOCR/include"
+    "${FLOWTARY_VCPKG_STATIC}/include/opencv4"
+    "${FLOWTARY_VCPKG_STATIC}/include/onnxruntime"
+    "${FLOWTARY_VCPKG_STATIC}/include")
+  target_link_libraries(TinyOCR PUBLIC Clipper2)
+  set_target_properties(TinyOCR PROPERTIES
+    CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+
+  # ---- ImageReader（OCR 独立进程）----
+  set(IR_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ImageReader")
+  file(GLOB IR_SOURCES "${IR_DIR}/ImageReader/*.cpp")
+  add_executable(ImageReader WIN32
+    ${IR_SOURCES}
+    "${IR_DIR}/ImageReader/Res/Resource.rc")
+  set_target_properties(ImageReader PROPERTIES
+    OUTPUT_NAME ImageReader
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+  # include 基准为 Ling 与 TinyOCR 两个仓库根（对齐上游 vcxproj）
+  # 注意：wrapper 目录必须在 Ling include 目录之前，替换有问题的宏
+  target_include_directories(ImageReader PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/wrapper"
+    "${LING_DIR}"
+    "${TYOCR_DIR}")
+
+  file(GLOB _OCV_3RD
+    "${FLOWTARY_VCPKG_STATIC}/lib/zlib*.lib"
+    "${FLOWTARY_VCPKG_STATIC}/lib/libpng*.lib"
+    "${FLOWTARY_VCPKG_STATIC}/lib/jpeg*.lib"
+    "${FLOWTARY_VCPKG_STATIC}/lib/turbojpeg*.lib"
+    "${FLOWTARY_VCPKG_STATIC}/lib/ippiw*.lib"
+    "${FLOWTARY_VCPKG_STATIC}/lib/ippicv*.lib"
+    "${FLOWTARY_VCPKG_STATIC}/lib/ittnotify*.lib")
+
+  # 链接所有 vcpkg 静态库（包括 abseil、re2、flatbuffers、protobuf、zlib 等）
+  file(GLOB _ALL_VCPKG_LIBS "${FLOWTARY_VCPKG_STATIC}/lib/*.lib")
+
+  target_link_libraries(ImageReader PRIVATE
+    Ling yoga TinyOCR Clipper2
+    ${_ALL_VCPKG_LIBS}
+    WindowsApp runtimeobject d3d11 d2d1 dwrite
+    user32 shcore dwmapi windowscodecs shell32 ole32
+    version.lib)
+else()
+  message(STATUS "[vendor] OCR 依赖未就绪（缺少 opencv/onnxruntime 静态库），"
+                 "跳过 TinyOCR/ImageReader 源码构建，沿用预编译 ImageReader.exe")
+endif()
+
+foreach(_t yoga Ling Clipper2 TinyOCR)
+  if(TARGET ${_t})
+    set_target_properties(${_t} PROPERTIES
+      MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+  endif()
+endforeach()
