@@ -1,5 +1,70 @@
 cmake_minimum_required(VERSION 3.20)
-project(Flowtary LANGUAGES CXX RC)
+project(Flowtary LANGUAGES C CXX RC)
+
+# =====================================================================
+# vcpkg 集成（cpp-pinyin 拼音库）
+# =====================================================================
+# vcpkg 根目录候选列表。
+# 注意：不能只信 $ENV{VCPKG_ROOT} —— VS 的 vcvars64.bat 会把它劫持为 VS 内置 vcpkg
+# （如 .../VC/vcpkg），而 cpp-pinyin 实际装在 C:/vcpkg，导致后续头文件/库全部找不到。
+# 因此改为「候选列表逐个校验」，命中真正含 cpp-pinyin 的那个根。
+set(_VCPKG_CANDIDATES "")
+if(DEFINED ENV{VCPKG_ROOT} AND NOT "$ENV{VCPKG_ROOT}" STREQUAL "")
+  list(APPEND _VCPKG_CANDIDATES "$ENV{VCPKG_ROOT}")
+endif()
+list(APPEND _VCPKG_CANDIDATES
+  "C:/vcpkg"
+  "${CMAKE_SOURCE_DIR}/../vcpkg"
+  "$ENV{USERPROFILE}/vcpkg")
+list(REMOVE_DUPLICATES _VCPKG_CANDIDATES)
+
+# 布局优先级：installed/x64-windows（标准安装布局）> packages/cpp-pinyin_x64-windows（构建中间产物）
+set(_CPP_PINYIN_LAYOUTS "installed/x64-windows" "packages/cpp-pinyin_x64-windows")
+
+set(VCPKG_ROOT "")
+set(CPP_PINYIN_INCLUDE_DIR "")
+set(CPP_PINYIN_LIBRARY "")
+set(CPP_PINYIN_DLL "")
+set(CPP_PINYIN_DICT "")
+foreach(_root IN LISTS _VCPKG_CANDIDATES)
+  foreach(_layout IN LISTS _CPP_PINYIN_LAYOUTS)
+    set(_base "${_root}/${_layout}")
+    if(EXISTS "${_base}/include/cpp-pinyin/Pinyin.h" AND
+       EXISTS "${_base}/lib/cpp-pinyin.lib")
+      set(VCPKG_ROOT "${_root}")
+      set(CPP_PINYIN_INCLUDE_DIR "${_base}/include")
+      set(CPP_PINYIN_LIBRARY "${_base}/lib/cpp-pinyin.lib")
+      if(EXISTS "${_base}/bin/cpp-pinyin.dll")
+        set(CPP_PINYIN_DLL "${_base}/bin/cpp-pinyin.dll")
+      endif()
+      if(EXISTS "${_base}/share/cpp-pinyin/dict")
+        set(CPP_PINYIN_DICT "${_base}/share/cpp-pinyin/dict")
+      endif()
+      break()
+    endif()
+  endforeach()
+  if(CPP_PINYIN_LIBRARY)
+    break()
+  endif()
+endforeach()
+unset(_VCPKG_CANDIDATES)
+unset(_CPP_PINYIN_LAYOUTS)
+
+# vcpkg toolchain is disabled to avoid Windows SDK include path conflicts
+# if(VCPKG_ROOT AND EXISTS "${VCPKG_ROOT}/vcpkg")
+#   set(CMAKE_TOOLCHAIN_FILE "${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" CACHE FILEPATH "vcpkg toolchain")
+#   set(VCPKG_MANIFEST_MODE ON)
+#   message(STATUS "Using vcpkg from: ${VCPKG_ROOT}")
+# endif()
+
+# =====================================================================
+# cpp-pinyin 拼音库
+# =====================================================================
+if(CPP_PINYIN_LIBRARY)
+  message(STATUS "cpp-pinyin: ${CPP_PINYIN_LIBRARY} (vcpkg root: ${VCPKG_ROOT})")
+else()
+  message(STATUS "cpp-pinyin not found; searched vcpkg roots: C:/vcpkg, ../vcpkg, %USERPROFILE%/vcpkg")
+endif()
 
 # =====================================================================
 # Flowtary — CMake 构建定义
@@ -40,6 +105,14 @@ set(FLOWTARY_LIBS
   user32 gdi32 shell32 ole32 imm32 dwmapi advapi32 uxtheme msimg32
   oleaut32 uuid shlwapi)
 
+# cpp-pinyin 拼音库
+if(CPP_PINYIN_LIBRARY)
+  list(APPEND FLOWTARY_LIBS ${CPP_PINYIN_LIBRARY})
+endif()
+if(CPP_PINYIN_INCLUDE_DIR)
+  include_directories(${CPP_PINYIN_INCLUDE_DIR})
+endif()
+
 if(FLOWTARY_ARCH STREQUAL "x86")
   # ================= 32 位子构建 =================
   add_library(filedlg_hook32 SHARED src/hookdlg.cpp)
@@ -63,15 +136,33 @@ else()
   set_target_properties(flowtary PROPERTIES OUTPUT_NAME flowtary)
   target_link_libraries(flowtary PRIVATE ${FLOWTARY_LIBS})
 
-  # 将 ScreenCapture.exe 和 ImageReader.exe 复制到构建输出目录
+  # 第三方源码子项目（vendor/CMakeLists.txt）：
+  #   ScreenCapture.exe 已改为源码构建、直接输出到 build\；
+  #   ImageReader.exe 暂用预编译二进制，待 Ling/TinyOCR 源码链接入后一并移除。
+  add_subdirectory(vendor)
+
+  # 将 ImageReader.exe 复制到构建输出目录（与 flowtary.exe 同目录）
   add_custom_command(TARGET flowtary POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-      "${CMAKE_SOURCE_DIR}/tools/ScreenCapture.exe"
-      "$<TARGET_FILE_DIR:flowtary>/ScreenCapture.exe"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
       "${CMAKE_SOURCE_DIR}/tools/ImageReader.exe"
       "$<TARGET_FILE_DIR:flowtary>/ImageReader.exe"
-    COMMENT "Copying ScreenCapture.exe and ImageReader.exe to output directory")
+    COMMENT "Copying ImageReader.exe to output directory")
+
+  # 复制 cpp-pinyin DLL 和字典文件到输出目录
+  if(CPP_PINYIN_DLL)
+    add_custom_command(TARGET flowtary POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CPP_PINYIN_DLL}"
+        "$<TARGET_FILE_DIR:flowtary>/cpp-pinyin.dll"
+      COMMENT "Copying cpp-pinyin.dll to output directory")
+  endif()
+  if(CPP_PINYIN_DICT)
+    add_custom_command(TARGET flowtary POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
+        "${CPP_PINYIN_DICT}"
+        "$<TARGET_FILE_DIR:flowtary>/dict"
+      COMMENT "Copying cpp-pinyin dictionary files to output directory")
+  endif()
 
   add_executable(evtest tools/evtest.cpp)
   set_target_properties(evtest PROPERTIES OUTPUT_NAME evtest)

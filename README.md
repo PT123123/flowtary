@@ -24,11 +24,9 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
 | `空格 top` | 置顶/取消置顶当前窗口（切换「唤醒前的前台窗口」置顶，在目标窗口位置弹出轻量提示；需在设置「命令」中开启，默认开） |
 | `空格 cmd 命令` | 执行 Shell 命令（等价于原 `> 命令`）；需在设置「命令」中开启，默认开 |
 | `空格 w 关键词` | 切换/关闭/结束窗口（等价于原 `< 关键词`）；需在设置「命令」中开启，默认开 |
-| `空格 ss` | 截图（调用 ScreenCapture.exe，与 flowtary.exe 同目录）；需在设置「命令」中开启，默认开 |
+| `空格 ss` | 截图（调用同目录 ScreenCapture.exe）；需在设置「命令」中开启，默认开 |
 | `空格 ss pin` | 截图 + 贴图/标注（截图后直接进入钉图编辑窗口） |
-| `空格 ss long` | 长截图/滚动截图（截取可滚动区域并自动拼接） |
 | `空格 ss ocr` | 文字识别（框选区域后 OCR 提取文字，需 ImageReader.exe） |
-| `空格 ss qr` | 二维码识别（框选区域识别二维码内容） |
 | 其他任意输入 | 程序搜索（见下），回车启动 |
 | **一键组关键字** | 整串精确命中「启动组 / 关闭组」关键字时，结果最前面出现 `一键启动：xxx` / `一键关闭：xxx`，回车即执行（详见「一键」Tab） |
 
@@ -188,14 +186,28 @@ exe 同目录及 PATH 中查找）。
 ## 目录结构
 
 ```
-src/main.cpp         全部实现（Everything IPC / 网页指令 / 程序枚举匹配 / 自绘 UI / 热键）
+src/main.cpp         全部实现（Everything IPC / 网页指令 / 程序枚举匹配 / 拼音搜索 / 自绘 UI / 热键）
 tools/evtest.cpp     Everything IPC 协议测试工具
-tools/ScreenCapture.exe  截图工具（xland/ScreenCapture 2.4.25，黑盒调用）
-tools/ImageReader.exe    OCR 文字识别插件（xland/ImageReader 1.0.2，ScreenCapture 的 ocr 模式依赖此文件）
-tools/ScreenCapture.exe  截图工具（xland/ScreenCapture 2.4.25，独立进程调用）
+tools/ImageReader.exe  OCR 文字识别插件（xland/ImageReader 1.0.2，ScreenCapture 的 ocr 模式依赖此文件）
+vendor/ScreenCapture/  截图工具源码（git submodule，xland/ScreenCapture 2.4.25），构建产物 ScreenCapture.exe
+vendor/CMakeLists.txt  第三方源码构建定义（不改动 submodule 内部，所有 target 在此声明）
 CMakeLists.txt    CMake 构建定义（x64 主程序 + x86 hook/agent 双架构，MSVC /O2 /MT Release）
 Makefile          Make 驱动入口（make build / make release / make clean）
 ```
+
+### 截图工具（ScreenCapture）
+
+`ScreenCapture.exe` 由 `vendor/ScreenCapture` 源码编译而来（C++20 + Direct2D/D3D11/DComposition），
+与主程序同目录输出，Flowtary 通过 `ShellExecute` 以独立进程调用。
+
+按 Flowtary 的实际需要，构建时**只保留截图 / 贴图 / OCR 三个模式**，
+上游的录屏（MP4 + GIF）与长截图模块不参与编译：
+`WinVideo.cpp` / `WinLong.cpp` / `ToolVideo.cpp` / `ToolLong.cpp` / `Win/cgif` 被排除，
+`App.cpp` 与 `Tray.cpp` 会先生成剔除了这些模块引用的副本再编译——submodule 本身零改动，
+裁剪规则集中在 `vendor/CMakeLists.txt`。
+
+连带好处：录屏模块依赖的 ATL（`atlbase.h`）与 MediaFoundation 都不再需要，
+本机未安装 ATL 组件也能正常构建。
 
 ## 已知限制
 
