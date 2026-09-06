@@ -188,9 +188,13 @@ exe 同目录及 PATH 中查找）。
 ```
 src/main.cpp         全部实现（Everything IPC / 网页指令 / 程序枚举匹配 / 拼音搜索 / 自绘 UI / 热键）
 tools/evtest.cpp     Everything IPC 协议测试工具
-tools/ImageReader.exe  OCR 文字识别插件（xland/ImageReader 1.0.2，ScreenCapture 的 ocr 模式依赖此文件）
 vendor/ScreenCapture/  截图工具源码（git submodule，xland/ScreenCapture 2.4.25），构建产物 ScreenCapture.exe
+vendor/Ling/           GUI 框架源码（git submodule，xland/Ling），OCR 链依赖
+vendor/TinyOCR/        OCR 推理引擎源码（git submodule，xland/TinyOCR），基于 onnxruntime
+vendor/ImageReader/    OCR 独立进程源码（git submodule，xland/ImageReader 1.0.2），构建产物 ImageReader.exe
 vendor/CMakeLists.txt  第三方源码构建定义（不改动 submodule 内部，所有 target 在此声明）
+cmake/msvc-include.cmake  MSVC include 路径自动检测（解决 ninja 生成器不传递 SDK 头文件路径的问题）
+cmake/wrapper/Util.h   Ling::Util 头文件包装（替换 MSVC 不完全支持的 C++20 template lambda 宏）
 CMakeLists.txt    CMake 构建定义（x64 主程序 + x86 hook/agent 双架构，MSVC /O2 /MT Release）
 Makefile          Make 驱动入口（make build / make release / make clean）
 ```
@@ -208,6 +212,14 @@ Makefile          Make 驱动入口（make build / make release / make clean）
 
 连带好处：录屏模块依赖的 ATL（`atlbase.h`）与 MediaFoundation 都不再需要，
 本机未安装 ATL 组件也能正常构建。
+
+### OCR 链（ImageReader）
+
+`ImageReader.exe` 由 `vendor/ImageReader` 源码编译而来（C++20 + Ling + TinyOCR + onnxruntime），
+与主程序同目录输出，Flowtary 通过 `ShellExecute` 以独立进程调用（`ss ocr` 命令）。
+
+OCR 链的依赖关系：`ImageReader` → `TinyOCR` + `Ling` → `yoga` + `Clipper2`，
+第三方依赖通过 vcpkg 的 `x64-windows-static` 三元组提供（opencv、onnxruntime）。
 
 ## 已知限制
 
