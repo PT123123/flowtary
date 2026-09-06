@@ -1,5 +1,11 @@
 cmake_minimum_required(VERSION 3.20)
+
 project(Flowtary LANGUAGES C CXX RC)
+
+# =====================================================================
+# MSVC include 路径自动检测（必须在 add_subdirectory(vendor) 之前）
+# =====================================================================
+include(cmake/msvc-include.cmake)
 
 # =====================================================================
 # vcpkg 集成（cpp-pinyin 拼音库）
@@ -92,7 +98,6 @@ endif()
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# ---- 与旧 build.bat 对齐的 MSVC 编译选项 ----
 # /MT(静态运行库) /W3 /EHsc /utf-8 /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS
 # /O2 与 /DNDEBUG 由 Release 配置默认提供。
 if(MSVC)
