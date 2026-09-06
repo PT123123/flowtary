@@ -1,0 +1,12 @@
+[submodule "vendor/ScreenCapture"]
+	path = vendor/ScreenCapture
+	url = git@github.com:xland/ScreenCapture.git
+[submodule "vendor/Ling"]
+	path = vendor/Ling
+	url = git@github.com:xland/Ling.git
+[submodule "vendor/TinyOCR"]
+	path = vendor/TinyOCR
+	url = git@github.com:xland/TinyOCR.git
+[submodule "vendor/ImageReader"]
+	path = vendor/ImageReader
+	url = git@github.com:xland/ImageReader.git
