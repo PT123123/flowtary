@@ -13,14 +13,18 @@
 #pragma once
 
 #define FT_VER_MAJOR 1
-#define FT_VER_MINOR 0
-#define FT_VER_PATCH 0
+#define FT_VER_MINOR 1
+#define FT_VER_PATCH 3
 #define FT_VER_BUILD 10
 
-#define FT_VER_COMMA 1,0,0,10    /* rc: FILEVERSION / PRODUCTVERSION */
-#define FT_VER_DOT   "1.0.0.10"  /* rc string fields + release 流程 */
+#define FT_VER_COMMA 1,1,3,10    /* rc: FILEVERSION / PRODUCTVERSION */
+#define FT_VER_DOT   "1.1.3.10"  /* rc string fields + release 流程 */
 
 #define FT_PRODUCT_NAME "Flowtary"
 #define FT_FILE_DESC    "Flowtary Launcher"
 #define FT_COMPANY      "Flowtary"
 #define FT_COPYRIGHT    "Copyright (C) 2026"
+
+// 应用图标资源 ID（见 flowtary.ico 与 src\flowtary.rc）。.rc 通过本宏引用，
+// 主程序用同一宏在 winmain 里 LoadImageW 加载为窗口 + 托盘图标。
+#define FT_APPICON_ID 101

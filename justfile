@@ -7,6 +7,7 @@
 #     just run            构建（增量）并启动 flowtary.exe
 #     just release        版本自增 + 完整构建 + 输出到 dist\
 #     just release-to DIR 发版到指定目录（如 just release-to "D:\Tools\Flowtary"）
+#     just deploy-workshop 构建并部署到 C:\workshop\Flowtary-<版本>（每次 PATCH 版本号 +1）
 #     just clean          清理 CMake 生成的产物（保留 build 目录）
 #     just distclean      删除整个 build\ 缓存（换工具链/配置异常时重来）
 #
@@ -37,6 +38,10 @@ release:
 # 发版到指定目录，如：just release-to "D:\Tools\Flowtary"
 release-to out:
     @make release OUT={{out}}
+
+# 构建并部署到 C:\workshop\Flowtary-<版本>（每次部署 minor 版本号 +1）
+deploy-workshop:
+    @powershell -NoProfile -ExecutionPolicy Bypass -File "{{justfile_directory()}}\tools\deploy_workshop.ps1" -Root "{{justfile_directory()}}"
 
 # 清理 CMake 生成的产物（保留 build 目录）
 clean:
