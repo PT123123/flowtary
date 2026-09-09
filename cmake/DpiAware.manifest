@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Flowtary 为 vendor 子项目补嵌的 DPI 感知清单。
+
+  背景：ScreenCapture / ImageReader 的上游 vcxproj 通过
+  <EnableDpiAwareness>PerMonitorHighDPIAware</EnableDpiAwareness>
+  在 MSVC 构建时自动生成 DPI 清单；CMake 构建不会做这件事，
+  缺失该声明时进程为 DPI 不感知，显示缩放 >100% 会被 DWM
+  整体放大（表现为截图覆盖窗“放大、看不全”）。
+
+  此文件作为源文件加入 vendor/CMakeLists.txt 的两个 target，
+  由链接器嵌入 exe。不修改任何 submodule 内部文件。
+-->
+<assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">True/PM</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+    </windowsSettings>
+  </application>
+</assembly>
