@@ -10,6 +10,7 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include "filedlg_jump.h"
+#include "version.h"  // FT_APPICON_ID（应用图标资源）、版本号等
 #include <imm.h>
 #include <dwmapi.h>
 #include <uxtheme.h>
@@ -424,6 +425,9 @@ struct App {
     std::vector<Program> programs;
     std::wstring everythingExe;
     std::wstring hotkeyName = L"Alt+Space";
+    HHOOK hWakeHook = nullptr;     // 低级键盘钩子：让首选唤起组合优先于其他程序的 RegisterHotKey
+    bool hotkeyRegistered = false; // 唤起热键是否已成功 RegisterHotKey（失败由重试定时器回收）
+    int wakeIndex = -1;            // 当前注册的唤起组合下标（-1=未注册；0=首选 Alt+Space）
 
     NOTIFYICONDATAW nid{};     // 托盘图标
     HICON hTrayIcon = nullptr;
@@ -471,6 +475,7 @@ constexpr UINT_PTR kTimerBlink = 2;
 constexpr UINT_PTR kTimerBalloon = 3;
 constexpr UINT_PTR kTimerWeightSave = 4;   // 点击权重延迟合并写盘
 constexpr UINT_PTR kTimerTween = 5;        // 补间动画（与光标闪烁 kTimerBlink 区分，互不干扰）
+constexpr UINT_PTR kTimerHotkeyRetry = 6;  // 唤起快捷键被占用时定时重试回收
 constexpr int kDebounceMs = 120;
 constexpr int kWeightSaveDelayMs = 3000;   // 延迟合并写盘的等待时间
 constexpr int WM_APP_TRAY = WM_APP + 1;
@@ -1310,7 +1315,6 @@ static void Hide() {
     }
     g.compText.clear();
     ShowWindow(g.hwnd, SW_HIDE);
-    SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);  // 归还物理内存
 }
 
 // ---------------- Everything 查询 ----------------
@@ -2298,139 +2302,20 @@ static void ApplyRoundCorners(HWND h) {
         g.dwmBorderOk = true;
 }
 
-// 图标一律用系统自带字体现场绘制：优先 Segoe MDL2 Assets / Segoe Fluent Icons 的
-// 放大镜字形（U+E721），图标字体缺失时回退 Segoe UI 粗体字母「F」。
-// 不引入任何 .ico 资源，零额外图标开销。
-// 超采样：整枚图标（黑圆底 + 字形）先在 4 倍尺寸上绘制，再面积平均缩回目标尺寸。
-// 小尺寸 GDI 直画会让纤细字形笔画糊成一团（高 DPI 下更明显），
-// 超采样保留 4 倍细节，缩回后笔画边缘是干净的亚像素抗锯齿。
-static HICON MakeFontIcon(int size) {
-    if (size < 8) size = 16;
-    const int SS = 4;  // 超采样倍数
-    const int big = size * SS;
-    HDC sdc = GetDC(nullptr);
-    HBITMAP color = CreateCompatibleBitmap(sdc, size, size);
-    HBITMAP mask = CreateBitmap(size, size, 1, 1, nullptr);
-    HBITMAP bigBmp = CreateCompatibleBitmap(sdc, big, big);  // 超采样源图
-    HDC dc = CreateCompatibleDC(sdc);
-    HGDIOBJ oldBmp = SelectObject(dc, bigBmp);
-
-    // 大图：黑色圆底
-    HGDIOBJ oldPen = SelectObject(dc, GetStockObject(NULL_PEN));
-    HBRUSH black = CreateSolidBrush(RGB(0, 0, 0));
-    HGDIOBJ oldBr = SelectObject(dc, black);
-    Ellipse(dc, 0, 0, big, big);
-    SelectObject(dc, oldBr);
-    DeleteObject(black);
-
-    // 大图：白色字形（用 GetGlyphIndices 探测码位是否真实存在，避免字体缺失画成方框）
-    const WCHAR* kGlyph = L"\xE721";  // 放大镜（Search）
-    const WCHAR* kFams[] = {L"Segoe MDL2 Assets", L"Segoe Fluent Icons", L"Segoe UI Symbol"};
-    int fh = -(big * 58 / 100);
-    HFONT f = nullptr;
-    bool useGlyph = false;
-    for (const WCHAR* fam : kFams) {
-        HFONT cand = CreateFontW(fh, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                                 OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
-                                 DEFAULT_PITCH | FF_DONTCARE, fam);
-        if (!cand) continue;
-        HGDIOBJ oldF = SelectObject(dc, cand);
-        WORD gi = 0;
-        DWORD gr = GetGlyphIndicesW(dc, kGlyph, 1, &gi, GGI_MARK_NONEXISTING_GLYPHS);
-        SelectObject(dc, oldF);
-        if (gr != GDI_ERROR && gi != 0xFFFF) {
-            f = cand;
-            useGlyph = true;
-            break;
-        }
-        DeleteObject(cand);
-    }
-    if (!f) {  // 图标字体不可用：回退字母 F
-        f = CreateFontW(fh, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
-                        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-    }
-    if (f) {
-        HGDIOBJ oldF = SelectObject(dc, f);
-        SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, RGB(255, 255, 255));
-        RECT r{0, 0, big, big};
-        DrawTextW(dc, useGlyph ? kGlyph : L"F", -1, &r,
-                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-        SelectObject(dc, oldF);
-        DeleteObject(f);
-    }
-    SelectObject(dc, oldPen);
-    SelectObject(dc, oldBmp);  // 解除 bigBmp 选中，GetDIBits 要求位图不在 DC 内
-
-    // 面积平均缩回目标尺寸：读大图像素按 SS×SS 块求平均。
-    // 相比 StretchBlt(HALFTONE)，面积平均不产生抖动纹理，4 倍超采样下就是理想的低通滤波。
-    std::vector<DWORD> bigPx((size_t)big * big);
-    {
-        BITMAPINFO bi{};
-        bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
-        bi.bmiHeader.biWidth = big;
-        bi.bmiHeader.biHeight = -big;  // 自上而下
-        bi.bmiHeader.biPlanes = 1;
-        bi.bmiHeader.biBitCount = 32;
-        bi.bmiHeader.biCompression = BI_RGB;
-        GetDIBits(dc, bigBmp, 0, big, bigPx.data(), &bi, DIB_RGB_COLORS);
-    }
-    const int strideBig = big;
-    const int strideRgb = (size * 3 + 3) & ~3;  // 24bpp 行按 4 字节对齐
-    std::vector<BYTE> rgb((size_t)size * strideRgb);
-    for (int y = 0; y < size; ++y) {
-        BYTE* dst = &rgb[(size_t)y * strideRgb];
-        for (int x = 0; x < size; ++x) {
-            unsigned r = 0, g = 0, b = 0;
-            for (int sy = 0; sy < SS; ++sy)
-                for (int sx = 0; sx < SS; ++sx) {
-                    DWORD p = bigPx[(size_t)(y * SS + sy) * strideBig + (x * SS + sx)];
-                    b += p & 0xFF;
-                    g += (p >> 8) & 0xFF;
-                    r += (p >> 16) & 0xFF;
-                }
-            const int n = SS * SS;
-            *dst++ = (BYTE)(b / n);  // B
-            *dst++ = (BYTE)(g / n);  // G
-            *dst++ = (BYTE)(r / n);  // R
-        }
-    }
-    BITMAPINFO di{};
-    di.bmiHeader.biSize = sizeof(di.bmiHeader);
-    di.bmiHeader.biWidth = size;
-    di.bmiHeader.biHeight = -size;
-    di.bmiHeader.biPlanes = 1;
-    di.bmiHeader.biBitCount = 24;
-    di.bmiHeader.biCompression = BI_RGB;
-    SetDIBits(dc, color, 0, size, rgb.data(), &di, DIB_RGB_COLORS);
-    DeleteObject(bigBmp);
-
-    // 掩码：单色位图，白=透明、黑=不透明 → 圆外透明
-    oldBmp = SelectObject(dc, mask);
-    oldPen = SelectObject(dc, GetStockObject(NULL_PEN));
-    oldBr = SelectObject(dc, GetStockObject(BLACK_BRUSH));
-    PatBlt(dc, 0, 0, size, size, WHITENESS);
-    Ellipse(dc, 0, 0, size, size);
-    SelectObject(dc, oldBr);
-    SelectObject(dc, oldPen);
-    SelectObject(dc, oldBmp);
-
-    ICONINFO ii{};
-    ii.fIcon = TRUE;
-    ii.hbmColor = color;
-    ii.hbmMask = mask;
-    HICON ic = CreateIconIndirect(&ii);
-    DeleteObject(color);
-    DeleteObject(mask);
-    DeleteDC(dc);
-    ReleaseDC(nullptr, sdc);
-    return ic;
+// 应用图标从内置 .ico 资源（flowtary.ico，多尺寸：16/24/32/48/64/128/256）加载。
+// 取代原先的字体自绘方案：exe 文件、窗口、任务栏/alt-tab、托盘都用同一套图标。
+// 传给目标尺寸（px）让 LoadImageW 从多帧 ico 里取最合适的那一帧。
+static HICON LoadAppIcon(int px) {
+    HINSTANCE hi = GetModuleHandleW(nullptr);
+    HICON h = (HICON)LoadImageW(hi, MAKEINTRESOURCE(FT_APPICON_ID), IMAGE_ICON,
+                                px, px, LR_DEFAULTCOLOR);
+    if (!h) h = LoadIconW(hi, MAKEINTRESOURCE(FT_APPICON_ID));  // 兜底：任选尺寸
+    return h;
 }
 
 static void TrayAdd() {
     if (!g.hwnd) return;
-    if (!g.hTrayIcon) g.hTrayIcon = MakeFontIcon(GetSystemMetrics(SM_CXSMICON));
+    if (!g.hTrayIcon) g.hTrayIcon = LoadAppIcon(GetSystemMetrics(SM_CXSMICON));
     if (!g.hTrayIcon) return; // Guard against icon creation failure
     ZeroMemory(&g.nid, sizeof(g.nid));
     g.nid.cbSize = sizeof(g.nid);
@@ -2471,10 +2356,63 @@ static bool RegisterWakeHotkey() {
     for (int i = 0; i < 3; ++i) {
         if (RegisterHotKey(g.hwnd, 1, kWakeHotkeys[i].mod, kWakeHotkeys[i].vk)) {
             g.hotkeyName = kWakeHotkeys[i].name;
+            g.wakeIndex = i;
+            g.hotkeyRegistered = true;
             return true;
         }
     }
+    g.hotkeyRegistered = false;
+    g.wakeIndex = -1;
     return false;
+}
+
+// —— 低级键盘钩子（WH_KEYBOARD_LL）：启动器快捷键权限高于其他应用 ——
+// RegisterHotKey 是先到先得，组合一旦被其他程序先注册，本程序永远抢不到。
+// 低级键盘钩子在系统分发键盘消息（含 RegisterHotKey 处理）的最前端，
+// 命中首选唤起组合（Alt+Space）时直接吞掉按键并触发唤出，无论该组合当前被谁持有。
+static LRESULT CALLBACK WakeHookProc(int code, WPARAM wParam, LPARAM lParam) {
+    static bool sTriggered = false;  // 已触发且未松键：忽略按住不放的键盘重复
+    if (code == HC_ACTION && g.hotkeyWake && g.hwnd) {
+        const KBDLLHOOKSTRUCT* k = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
+        const auto& hk = kWakeHotkeys[0];  // 首选组合：Alt+Space
+        if (k->vkCode == hk.vk) {
+            if (k->flags & LLKHF_UP) {
+                sTriggered = false;  // 松键复位，允许下一次触发
+            } else if (!sTriggered && !(k->flags & LLKHF_INJECTED) &&
+                       (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
+                bool altDown = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+                bool ctrlDown = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+                if (altDown == ((hk.mod & MOD_ALT) != 0) &&
+                    ctrlDown == ((hk.mod & MOD_CONTROL) != 0)) {
+                    sTriggered = true;
+                    PostMessageW(g.hwnd, WM_HOTKEY, 1, 0);  // 与 RegisterHotKey 共用处理路径
+                    return 1;  // 吞掉按键：系统与其他程序（含已注册者）都收不到
+                }
+            }
+        }
+    }
+    return CallNextHookEx(nullptr, code, wParam, lParam);
+}
+
+static void InstallWakeHook() {
+    if (!g.hWakeHook)
+        g.hWakeHook =
+            SetWindowsHookExW(WH_KEYBOARD_LL, WakeHookProc, GetModuleHandleW(nullptr), 0);
+}
+
+static void RemoveWakeHook() {
+    if (g.hWakeHook) {
+        UnhookWindowsHookEx(g.hWakeHook);
+        g.hWakeHook = nullptr;
+    }
+}
+
+// 未持有首选组合（或完全没注册上）时保持重试定时器；拿到首选后自动停止
+static void UpdateHotkeyRetryTimer() {
+    if (g.hotkeyWake && g.hwnd && g.wakeIndex != 0)
+        SetTimer(g.hwnd, kTimerHotkeyRetry, 5000, nullptr);
+    else
+        KillTimer(g.hwnd, kTimerHotkeyRetry);
 }
 
 // 托盘菜单：切换唤起快捷键开关（关闭=注销热键，开启=重新依次尝试注册）
@@ -2483,13 +2421,17 @@ static void ToggleWakeHotkey() {
     if (g.hotkeyWake) {
         UnregisterHotKey(g.hwnd, 1);  // 关闭：注销唤起热键
         g.hotkeyWake = false;
+        g.hotkeyRegistered = false;
+        g.wakeIndex = -1;
+        RemoveWakeHook();
     } else {
+        InstallWakeHook();  // 先装钩子：即使注册失败，首选组合依然可用
         if (!RegisterWakeHotkey()) {
-            TrayBalloon(L"Flowtary", L"唤起快捷键注册失败，可能被其他程序占用");
-            return;  // 注册失败：保持关闭状态
+            TrayBalloon(L"Flowtary", L"唤起快捷键注册暂被其他程序占用，已通过钩子接管，将自动重试");
         }
         g.hotkeyWake = true;
     }
+    UpdateHotkeyRetryTimer();
     DWORD v = g.hotkeyWake ? 1 : 0;
     RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"HotkeyWake", REG_DWORD, &v,
                     sizeof(v));
@@ -5371,6 +5313,24 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 Shell_NotifyIconW(NIM_MODIFY, &g.nid);
             } else if (wParam == kTimerTween) {
                 TickTweens();
+            } else if (wParam == kTimerHotkeyRetry) {
+                // 唤起快捷键被占用后的自动恢复：优先抢注首选组合 Alt+Space
+                if (!g.hotkeyWake || g.wakeIndex == 0) {
+                    KillTimer(hwnd, kTimerHotkeyRetry);
+                } else {
+                    UnregisterHotKey(g.hwnd, 1);  // 先让出当前备用组合
+                    if (RegisterHotKey(g.hwnd, 1, kWakeHotkeys[0].mod, kWakeHotkeys[0].vk)) {
+                        g.hotkeyName = kWakeHotkeys[0].name;
+                        g.wakeIndex = 0;
+                        g.hotkeyRegistered = true;
+                        TrayUpdateTip();
+                        TrayBalloon(L"Flowtary", std::wstring(L"唤起快捷键已恢复：") +
+                                                     kWakeHotkeys[0].name);
+                    } else {
+                        RegisterWakeHotkey();  // 首选仍被占：重挂备用组合（可能仍失败，下轮再试）
+                    }
+                    UpdateHotkeyRetryTimer();  // 依结果决定是否继续定时
+                }
             }
             return 0;
 
@@ -6207,8 +6167,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInst;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    // 图标用系统字体现场绘制（无 .ico 资源），托盘与两个窗口共用同一枚
-    if (!g.hAppIcon) g.hAppIcon = MakeFontIcon(GetSystemMetrics(SM_CXICON));
+    // 窗口图标从内置 .ico 资源加载（托盘/窗口/alt-tab 共用）
+    if (!g.hAppIcon) g.hAppIcon = LoadAppIcon(GetSystemMetrics(SM_CXICON));
     wc.hIcon = g.hAppIcon;
     wc.lpszClassName = L"FlowtaryLauncher";
     RegisterClassExW(&wc);
@@ -6248,7 +6208,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     g.startingUp = true;
     _beginthreadex(nullptr, 0, ScanProgramsThread, nullptr, 0, nullptr);
     g.everythingExe = FindEverythingExe();
-    SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
@@ -6264,6 +6223,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     }
 
     fdj_uninit();  // 卸载文件对话框增强的钩子与 32 位助手
+    RemoveWakeHook();
     UnregisterHotKey(g.hwnd, 1);
     UnregisterHotKey(g.hwnd, 2);
     CoUninitialize();
