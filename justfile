@@ -4,6 +4,7 @@
 #   用法：
 #     just                列出所有可用命令
 #     just build          完整构建 x64 + x86，产物汇到 build\
+#     just run            构建（增量）并启动 flowtary.exe
 #     just release        版本自增 + 完整构建 + 输出到 dist\
 #     just release-to DIR 发版到指定目录（如 just release-to "D:\Tools\Flowtary"）
 #     just clean          清理 CMake 生成的产物（保留 build 目录）
@@ -24,6 +25,10 @@ default:
 # 完整构建：x64（主程序/hook）+ x86（hook/agent），产物汇到 build\
 build:
     @make build
+
+# 构建（增量）并启动主程序，工作目录为 build\
+run:
+    @make run
 
 # 版本自增 + 完整构建 + 输出到 dist\
 release:

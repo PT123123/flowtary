@@ -15,4 +15,10 @@ phaseA_build.log
 phaseB_build.log
 phaseE_build.log
 phaseE_build2.log
-phaseX_build.log
+phaseX_build.log# Build outputs (VS generator)
+build_vs/
+
+# Editor tooling
+.zcode/
+# Runtime logs
+logs/
