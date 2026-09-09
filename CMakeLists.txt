@@ -142,16 +142,9 @@ else()
   target_link_libraries(flowtary PRIVATE ${FLOWTARY_LIBS})
 
   # 第三方源码子项目（vendor/CMakeLists.txt）：
-  #   ScreenCapture.exe 已改为源码构建、直接输出到 build\；
-  #   ImageReader.exe 暂用预编译二进制，待 Ling/TinyOCR 源码链接入后一并移除。
+  #   ScreenCapture.exe / ImageReader.exe 均为源码构建，输出目录即 build\
+  #   （ImageReader 由 vendor 的 ImageReader 目标直接产出，无需复制）。
   add_subdirectory(vendor)
-
-  # 将 ImageReader.exe 复制到构建输出目录（与 flowtary.exe 同目录）
-  add_custom_command(TARGET flowtary POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-      "${CMAKE_SOURCE_DIR}/tools/ImageReader.exe"
-      "$<TARGET_FILE_DIR:flowtary>/ImageReader.exe"
-    COMMENT "Copying ImageReader.exe to output directory")
 
   # 复制 cpp-pinyin DLL 和字典文件到输出目录
   if(CPP_PINYIN_DLL)

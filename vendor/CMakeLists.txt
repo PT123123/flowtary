@@ -133,7 +133,10 @@ if(EXISTS "${SC_DIR}/main.cpp")
   add_executable(ScreenCapture WIN32
     ${SC_CXX_SOURCES}
     ${SC_C_SOURCES}
-    ${SC_RESOURCE})
+    ${SC_RESOURCE}
+    # DPI 感知清单：上游 vcxproj 的 EnableDpiAwareness=CMake 不会自动做，
+    # 缺失时缩放>100% 会被 DWM 放大截图覆盖窗（见 cmake/DpiAware.manifest 注释）
+    "${CMAKE_SOURCE_DIR}/cmake/DpiAware.manifest")
 
   set_target_properties(ScreenCapture PROPERTIES
     OUTPUT_NAME ScreenCapture
@@ -272,7 +275,8 @@ if(FLOWTARY_OCR_READY)
   file(GLOB IR_SOURCES "${IR_DIR}/ImageReader/*.cpp")
   add_executable(ImageReader WIN32
     ${IR_SOURCES}
-    "${IR_DIR}/ImageReader/Res/Resource.rc")
+    "${IR_DIR}/ImageReader/Res/Resource.rc"
+    "${CMAKE_SOURCE_DIR}/cmake/DpiAware.manifest")
   set_target_properties(ImageReader PROPERTIES
     OUTPUT_NAME ImageReader
     CXX_STANDARD 20

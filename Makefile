@@ -4,6 +4,7 @@
 #   用法：
 #     make build      完整构建：x64（flowtary.exe / evtest.exe / filedlg_hook64.dll）
 #                     + x86（filedlg_hook32.dll / filedlg_agent32.exe），全部汇到 build\
+#     make run        构建后启动 build\flowtary.exe（工作目录 build\，返回终端）
 #     make release    版本自增（tools\version_bump.ps1）+ 完整构建 + 输出到 dist\
 #                     （默认 dist\；可覆盖：make release OUT=D:\Tools\Flowtary）
 #     make clean      清理 CMake 生成的产物
@@ -31,7 +32,7 @@ VS := $(shell powershell -NoProfile -Command "$$w=\"$${env:ProgramFiles(x86)}\Mi
 VCVARS64 := "$(VS)\VC\Auxiliary\Build\vcvars64.bat"
 VCVARS32 := "$(VS)\VC\Auxiliary\Build\vcvars32.bat"
 
-.PHONY: all build release clean distclean help
+.PHONY: all build run release clean distclean help
 
 all: build
 
@@ -46,6 +47,10 @@ build:
 	@copy /y "$(BUILD32)\filedlg_agent32.exe" "$(BUILD)\" >nul
 	@echo [ok] build\flowtary.exe / build\evtest.exe
 	@echo [ok] build\filedlg_hook64.dll / build\filedlg_hook32.dll / build\filedlg_agent32.exe
+
+# ---------------- 运行（增量构建后启动主程序） ----------------
+run: build
+	@start "" /d "$(BUILD)" "$(BUILD)\flowtary.exe"
 
 # ---------------- 发布（版本自增 + 构建 + 输出到 dist\） ----------------
 release:
@@ -66,6 +71,7 @@ distclean:
 	@if exist "$(BUILD)" rmdir /s /q "$(BUILD)"
 
 help:
-	@echo Flowtary build targets: build, release, clean, distclean
+	@echo Flowtary build targets: build, run, release, clean, distclean
 	@echo   make build     - x64 + x86 full build into build/
+	@echo   make run       - build then launch build\flowtary.exe
 	@echo   make release   - bump version + build + copy into dist/
