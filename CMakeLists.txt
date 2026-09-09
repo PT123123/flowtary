@@ -137,7 +137,9 @@ else()
   add_executable(flowtary WIN32
     src/main.cpp
     src/filedlg_jump.cpp
-    src/flowtary.rc)
+    src/flowtary.rc
+    src/flowtary.ico)
+  set_source_files_properties(src/flowtary.ico PROPERTIES HEADER_FILE_ONLY TRUE)
   set_target_properties(flowtary PROPERTIES OUTPUT_NAME flowtary)
   target_link_libraries(flowtary PRIVATE ${FLOWTARY_LIBS})
 

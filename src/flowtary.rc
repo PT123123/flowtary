@@ -4,6 +4,12 @@
 #include <winver.h>
 #include "version.h"
 
+// 应用图标（多尺寸 .ico，由 tools 流程从源图生成）。
+// 注意：资源名必须写数字 101。rc.exe 在“资源名位置”不会把宏展开成数字
+// （会当成普通标识符字符串命名，如 FT_APPICON_ID），所以这里不引用宏，
+// 直接硬编码，与 version.h 里的 FT_APPICON_ID(=101) 保持一致。
+101 ICON "flowtary.ico"
+
 VS_VERSION_INFO VERSIONINFO
  FILEVERSION    FT_VER_COMMA
  PRODUCTVERSION FT_VER_COMMA
