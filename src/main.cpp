@@ -1088,6 +1088,8 @@ static void EnumProgramFiles(const std::wstring& pf, std::vector<Program>& out) 
 
 // 扫描已装软件到 out（按显示名称去重，保留优先级更高的来源）。
 // 只写传入容器、不碰 g.programs，因此可以安全地在工作线程调用。
+static HICON GetProgramIcon(Program* p);  // 前置声明：扫描线程预抽图标用
+
 static void BuildProgramsInto(std::vector<Program>& out) {
     std::vector<Program> raw;
     WCHAR buf[MAX_PATH]{};
@@ -1113,6 +1115,11 @@ static void BuildProgramsInto(std::vector<Program>& out) {
         }
         if (!dup) out.push_back(std::move(p));
     }
+
+    // 预抽图标：SHGetFileInfoW(SHGFI_ICON) 首次抽取较慢（.lnk 还要经 shell 解析），
+    // 若留到 WM_PAINT 懒抽取，第一次搜索结果的绘帧会同步卡一下。
+    // 这里在扫描线程一次性抽完，之后绘制永远命中缓存，输入不再掉帧。
+    for (auto& p : out) GetProgramIcon(&p);
 }
 
 static void BuildPrograms() {  // 主线程：原地重建 g.programs
