@@ -128,6 +128,7 @@ static const WCHAR* kDefaultRulesText =
     L"xhs https://www.xiaohongshu.com/search_result?keyword={q}\r\n"
     L"zhihu https://www.zhihu.com/search?q={q}\r\n"
     L"douban https://www.douban.com/search?q={q}\r\n"
+    L"gh https://github.com/search?q={q}\r\n"
     L"google https://www.google.com/search?q={q}";
 
 static std::wstring DefaultRulesText() { return kDefaultRulesText; }
