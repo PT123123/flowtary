@@ -20,6 +20,7 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
 | `xhs {q}` | 小红书 `https://www.xiaohongshu.com/search_result?keyword={q}` |
 | `zhihu {q}` | 知乎 `https://www.zhihu.com/search?q={q}` |
 | `douban {q}` | 豆瓣 `https://www.douban.com/search?q={q}` |
+| `gh {q}` | GitHub `https://github.com/search?q={q}` |
 | `google {q}` | Google `https://www.google.com/search?q={q}` |
 | `空格 top` | 置顶/取消置顶当前窗口（切换「唤醒前的前台窗口」置顶，在目标窗口位置弹出轻量提示；需在设置「命令」中开启，默认开） |
 | `空格 cmd 命令` | 执行 Shell 命令（等价于原 `> 命令`）；需在设置「命令」中开启，默认开 |
