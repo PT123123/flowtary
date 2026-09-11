@@ -295,7 +295,9 @@ struct Program {
 };
 
 struct Row {
-    enum Kind { File, Folder, Web, Prog, EvFallback, Hint, Group, Shell, Window, Top, Capture };
+    // Reveal：搜索框里直接粘贴了「文件」路径时的直达项 —— 回车不启动该文件，
+    // 而是在资源管理器中打开其所在文件夹并选中它（action 为文件完整路径）。
+    enum Kind { File, Folder, Web, Prog, EvFallback, Hint, Group, Shell, Window, Top, Capture, Reveal };
     Kind kind = Hint;
     std::wstring title;
     std::wstring sub;     // 路径 / URL 说明
@@ -400,10 +402,13 @@ struct App {
     std::vector<CmdGroup> groupsLaunch;  // 一键启动组：关键字 → 文件列表
     std::vector<CmdGroup> groupsKill;    // 一键关闭组：关键字 → 进程名列表
 
-    // 排除路径（设置可编辑）：小写+路径分隔符归一化后的通配符模式列表。
+    // 排除路径（设置可编辑）：用户原文，每行一条（保留给设置页编辑框原样回显）。
     // 命中 Everything 结果路径或程序 .lnk/.exe 完整路径时丢弃该项。
     // 仅在 Everything 模式（d/f）与程序模式生效；网页/一键组不参与过滤。
     std::vector<std::wstring> excludePaths;
+    // excludePaths 的归一化镜像（反斜杠统一 + 去尾部分隔符 + 全小写），与前者下标一一对应。
+    // 匹配时只看这一份，避免用户填的大小写/尾部反斜杠写法导致静默失效。
+    std::vector<std::wstring> excludePathsNorm;
 
     std::wstring text;
     size_t caret = 0;
@@ -495,6 +500,8 @@ constexpr int IDM_WIN_KILL = 2023;    // 窗口项：结束进程
 constexpr int IDM_SHELL_ADMIN = 2024; // Shell 项：以管理员运行
 constexpr int IDM_COPYTITLE = 2025;   // 复制窗口标题
 constexpr int IDM_COPYPROC = 2026;    // 复制进程名
+constexpr int IDM_OPENCMD = 2027;     // 结果右键菜单：用此路径（所在目录）打开命令行
+constexpr int IDM_OPENFILE = 2028;    // 路径直达行：打开文件本身
 
 // 结果项快捷键方案：
 //   方案0 Alt+数字：按结果优先级自上而下分配 1..9,0（列表最多 10 行，1=最高优先级）
@@ -911,17 +918,32 @@ static std::wstring NormalizePatternForExclude(const std::wstring& s) {
     return NormalizePathForExclude(s);
 }
 
+// 重建排除模式的归一化镜像。凡是改写 g.excludePaths 的地方（加载 / 恢复默认 / 设置页保存）
+// 都必须调一次，否则匹配会退化成拿用户原文和小写路径比较。
+static void RebuildExcludeNorm() {
+    g.excludePathsNorm.clear();
+    g.excludePathsNorm.reserve(g.excludePaths.size());
+    for (const auto& p : g.excludePaths) g.excludePathsNorm.push_back(NormalizePatternForExclude(p));
+}
+
 // 路径是否被排除：与 g.excludePaths 任一模式匹配（模式不含通配符时按前缀匹配）
+// 匹配一律大小写不敏感：np 已小写，模式取 g.excludePathsNorm 里对应的归一化副本
+// （曾经直接拿用户原文比较，导致 `C:\$RECYCLE.BIN` 这类含大写的默认项永远不命中）。
 static bool IsPathExcluded(const std::wstring& path) {
     if (g.excludePaths.empty() || path.empty()) return false;
     std::wstring np = NormalizePathForExclude(path);
-    for (const auto& pat : g.excludePaths) {
+    for (size_t i = 0; i < g.excludePaths.size(); ++i) {
+        const std::wstring& raw = g.excludePaths[i];
+        const std::wstring& pat =
+            (i < g.excludePathsNorm.size()) ? g.excludePathsNorm[i] : raw;
+        // 通配符判定看原文（归一化不改动 * / ?，两者等价，这里用原文更直观）
+        bool wild = raw.find(L'*') != std::wstring::npos || raw.find(L'?') != std::wstring::npos;
         // 含 * / ? 走通配符，否则按「路径以前缀开头」匹配（直觉：填一个目录就排除整棵）
-        if (pat.find(L'*') != std::wstring::npos || pat.find(L'?') != std::wstring::npos) {
+        if (wild) {
             if (MatchWildcardI(pat.c_str(), np.c_str())) return true;
         } else {
             size_t pn = pat.size();
-            if (np.size() >= pn && np.compare(0, pn, pat) == 0) {
+            if (pn && np.size() >= pn && np.compare(0, pn, pat) == 0) {
                 // 命中后还要确认是「目录边界」：完全相等，或紧随其后的字符是 '\\'
                 if (np.size() == pn || np[pn] == L'\\') return true;
             }
@@ -988,6 +1010,44 @@ static bool IsUrl(const std::wstring& s) {
         if (c == L' ' || c == L'\t' || c == L'\r' || c == L'\n' ||
             c == L'\\' || c == L'/') return false;
     }
+    return true;
+}
+
+// 检测输入是否为「已存在的本地路径」：绝对路径（X:\ 或 \\server\share）或含 %环境变量% 的写法。
+// 命中时 out 返回归一化后的真实路径（/ 统一为 \、去掉尾部分隔符），isDir 指示目录还是文件。
+// 只做存在性判断，不解析相对路径（.、..），也不接受 `C:foo` 这种盘符相对形式。
+static bool DetectExistingPath(const std::wstring& input, std::wstring& out, bool& isDir) {
+    out.clear();
+    isDir = false;
+    std::wstring s = TrimW(input);
+    // 容忍整串带引号（复制「复制为路径」拿到的 "C:\xxx" 形式）
+    if (s.size() >= 2 && s.front() == L'"' && s.back() == L'"') s = TrimW(s.substr(1, s.size() - 2));
+    if (s.empty()) return false;
+
+    const bool looksAbs = (s.size() >= 3 && s[1] == L':' && iswalpha(s[0]) && s[2] == L'\\') ||
+                          (s.size() >= 2 && s[0] == L'\\' && s[1] == L'\\');
+    const bool looksEnv = (s[0] == L'%');
+    if (!looksAbs && !looksEnv) return false;  // 普通关键词不参与，避免把搜索词误判成路径
+
+    std::wstring path = s;
+    if (s.find(L'%') != std::wstring::npos) {
+        std::vector<WCHAR> buf(32768, 0);
+        DWORD n = ExpandEnvironmentStringsW(s.c_str(), buf.data(), (DWORD)buf.size());
+        if (n > 0 && n <= (DWORD)buf.size()) {
+            std::wstring ex(buf.data(), (size_t)n - 1);  // n 含结尾 NUL
+            if (ex != s) path = ex;                      // 确有替换才采纳（未定义的变量会原样返回）
+            else if (looksEnv) return false;             // 纯 %VAR% 形式却没展开 → 不是有效路径
+        } else if (looksEnv) {
+            return false;
+        }
+    }
+    for (auto& c : path) if (c == L'/') c = L'\\';
+    while (path.size() > 3 && path.back() == L'\\') path.pop_back();  // 保留盘符根 C:\
+
+    DWORD attr = GetFileAttributesW(path.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES) return false;
+    isDir = (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    out = path;
     return true;
 }
 
@@ -1490,28 +1550,49 @@ static void KillProcessByPid(DWORD pid) {
 }
 
 // 依据当前 shell 配置构造要执行的 exe / 参数 / cwd
+// cwdOverride：非空时用它替代设置里的默认工作目录（「用此路径打开命令行」用）
+// interactive：交互式终端 —— 强制显示窗口，且 cmd 为空时各 shell 都进入可输入的提示符
 static void BuildShellCommand(const std::wstring& cmd, bool admin,
-                              std::wstring& exe, std::wstring& args, std::wstring& cwd) {
-    exe.clear(); args.clear(); cwd = GetShellCwd();
-    bool visible = g.shellShowWindow || admin;  // 提权时必然可见（UAC 弹窗）
+                              std::wstring& exe, std::wstring& args, std::wstring& cwd,
+                              const std::wstring* cwdOverride = nullptr,
+                              bool interactive = false) {
+    exe.clear(); args.clear();
+    cwd = (cwdOverride && !cwdOverride->empty()) ? *cwdOverride : GetShellCwd();
+    bool visible = g.shellShowWindow || admin || interactive;  // 提权时必然可见（UAC 弹窗）
+    const bool bare = cmd.empty();  // 无命令：只开一个交互式终端
     if (g.shellType == 0) {            // 命令提示符
         exe = L"cmd.exe";
-        args = (visible ? L"/k " : L"/c ") + cmd;
+        if (bare) args = visible ? L"/k" : L"/c";
+        else      args = (visible ? L"/k " : L"/c ") + cmd;
     } else if (g.shellType == 1) {     // PowerShell
         exe = L"powershell.exe";
-        args = (visible ? L"-NoExit -NoProfile -Command " : L"-NoProfile -Command ") + cmd;
+        if (bare) args = visible ? L"-NoExit -NoProfile" : L"-NoProfile";
+        else      args = (visible ? L"-NoExit -NoProfile -Command " : L"-NoProfile -Command ") + cmd;
     } else if (g.shellType == 2) {     // Git Bash
         exe = FindGitBash();
-        if (visible) args = L"-c \"" + cmd + L"; exec bash\"";
-        else        args = L"-c \"" + cmd + L"\"";
+        if (bare) args.clear();        // 无参数启动 bash，工作目录由 lpDirectory 决定
+        else if (visible) args = L"-c \"" + cmd + L"; exec bash\"";
+        else              args = L"-c \"" + cmd + L"\"";
     } else {                           // 自定义
         exe = g.shellCustomPath.empty() ? L"cmd.exe" : g.shellCustomPath;
         std::wstring t = g.shellCustomArgs;
         size_t p = t.find(L"{c}");
         if (p != std::wstring::npos) t.replace(p, 3, cmd);
-        else t = t + (t.empty() ? L"" : L" ") + cmd;
+        else if (!cmd.empty() || !t.empty()) t = t + (t.empty() ? L"" : L" ") + cmd;
         args = t;
     }
+}
+
+// 在指定目录打开一个交互式命令行窗口（走设置页配置的 Shell 程序）
+static bool OpenShellAt(const std::wstring& dir) {
+    if (dir.empty()) return false;
+    std::wstring exe, args, cwd;
+    BuildShellCommand(std::wstring(), false, exe, args, cwd, &dir, /*interactive=*/true);
+    if (exe.empty()) return false;
+    HINSTANCE h = ShellExecuteW(nullptr, L"open", exe.c_str(),
+                                args.empty() ? nullptr : args.c_str(),
+                                cwd.empty() ? nullptr : cwd.c_str(), SW_SHOWNORMAL);
+    return (INT_PTR)h > 32;
 }
 
 static BOOL CALLBACK EnumWinProc(HWND hwnd, LPARAM lp) {
@@ -1627,6 +1708,21 @@ static void Refresh() {
             r.action = t;
             r.sub = t;
             g.items.push_back(std::move(r));
+        }
+        // 路径直达：输入为已存在的路径时置顶一条（目录→打开文件夹；文件→打开所在文件夹并选中）。
+        // 与网址直达一样只做「前置插入」，后面的普通搜索照常跑，回车默认命中首条即本项。
+        {
+            std::wstring hitPath;
+            bool hitIsDir = false;
+            if (DetectExistingPath(t, hitPath, hitIsDir)) {
+                Row r;
+                r.kind = hitIsDir ? Row::Folder : Row::Reveal;
+                r.action = hitPath;
+                r.sub = hitPath;
+                r.title = hitIsDir ? (L"打开文件夹：" + hitPath)
+                                   : (L"打开所在文件夹：" + hitPath);
+                g.items.push_back(std::move(r));
+            }
         }
         // 命令类前缀：必须以空格开头（去掉前导空格后才是真正的 token）。
         // top / cmd / w 三种命令各自可在「命令」设置页开关。
@@ -1798,6 +1894,12 @@ static bool ExecuteRow(Row& r, ExecKind ek = ExecKind::Normal) {
         case Row::Web:
             ShellExecuteW(nullptr, L"open", r.action.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
             return true;
+        case Row::Reveal: {
+            // 路径直达（文件路径）：在资源管理器中定位并选中，不直接启动该文件
+            std::wstring args = L"/select,\"" + r.action + L"\"";
+            ShellExecuteW(nullptr, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
+            return true;
+        }
         case Row::Prog: {
             std::wstring dir = DirOf(!r.prog->target.empty() ? r.prog->target : r.action);
             ShellExecuteW(nullptr, L"open", r.action.c_str(), nullptr,
@@ -2053,13 +2155,23 @@ static void ShowRowMenu(HWND hwnd) {
         AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_COPYPROC, (LPCWSTR)L"复制进程名");
         SetMenuDefaultItem(menu, IDM_WIN_SWITCH, FALSE);
     } else {
-        AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_OPEN, (LPCWSTR)L"打开");
+        // 路径直达行（Reveal）：默认动作本身就是「打开所在文件夹并选中」，标题照此写
+        AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_OPEN,
+                    (LPCWSTR)(r.kind == Row::Reveal ? L"打开所在文件夹" : L"打开"));
         if (r.kind == Row::File || r.kind == Row::Folder || r.kind == Row::Prog)
             AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_OPENLOC, (LPCWSTR)L"打开所在文件夹");
+        if (r.kind == Row::Reveal)
+            AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_OPENFILE, (LPCWSTR)L"打开文件");
         if (r.kind == Row::File || r.kind == Row::Prog)
             AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_RUNAS, (LPCWSTR)L"以管理员模式打开");
         if (r.kind == Row::Shell)
             AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_SHELL_ADMIN, (LPCWSTR)L"以管理员运行");
+        // 用该路径（文件取所在目录）打开命令行，沿用设置页配置的 Shell 程序
+        if (r.kind == Row::Folder || r.kind == Row::File || r.kind == Row::Reveal ||
+            r.kind == Row::Prog)
+            AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_OPENCMD,
+                        (LPCWSTR)(r.kind == Row::Folder ? L"用此路径打开命令行"
+                                                        : L"在所在目录打开命令行"));
         AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_COPYPATH,
                     (LPCWSTR)(r.kind == Row::Web ? L"复制链接"
                               : r.kind == Row::Shell ? L"复制命令" : L"复制路径"));
@@ -2092,6 +2204,16 @@ static void ShowRowMenu(HWND hwnd) {
                               SW_SHOWNORMAL);
             }
             break;
+        case IDM_OPENFILE:
+            // 路径直达行：真的把该文件交系统打开（与默认的「定位并选中」区分开）
+            ShellExecuteW(nullptr, L"open", r.action.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            break;
+        case IDM_OPENCMD: {
+            // 文件夹项用自身路径；文件/程序项用其所在目录
+            std::wstring dir = (r.kind == Row::Folder) ? r.action : DirOf(r.action);
+            if (!dir.empty()) OpenShellAt(dir);
+            break;
+        }
         case IDM_RUNAS:
             ExecuteRowAdmin(r);
             break;
@@ -2838,10 +2960,12 @@ static void LoadExcludePaths() {
         std::wstring def = DefaultExcludePathsText();
         SaveRegText(L"ExcludePaths", def);
         g.excludePaths = DefaultExcludePaths();
+        RebuildExcludeNorm();
         return;
     }
     auto parsed = ParseExcludePaths(text);
     g.excludePaths = parsed.empty() ? DefaultExcludePaths() : parsed;
+    RebuildExcludeNorm();
 }
 
 static const CmdGroup* FindGroup(const std::vector<CmdGroup>& gs, const std::wstring& key) {
@@ -2923,6 +3047,8 @@ static bool WeightTermFromInput(std::wstring& termOut) {
         return !termOut.empty();
     }
     if (FindWebCmd(tok)) return false;  // gg 等网页前缀：本次点击不记录权重
+    // 输入本身就是一条路径（路径直达条，含 %VAR% 写法）：整条路径当搜索词存进权重表没有意义
+    if (t.find(L'\\') != std::wstring::npos || t.find(L'%') != std::wstring::npos) return false;
     termOut = NormalizeSearchTerm(t);
     return !termOut.empty();
 }
@@ -4102,7 +4228,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 
             // 排除路径 Tab（索引 5）：多行编辑器 + 「恢复默认」按钮 + 提示 + 当前条数
             c = CreateWindowExW(0, L"STATIC",
-                                L"每行一条路径，支持通配符 * ?。以排除项开头的文件/文件夹/程序会被过滤。"
+                                L"每行一条路径，大小写不敏感，支持通配符 * ?。以排除项开头的文件/文件夹/程序会被过滤。"
                                 L"网页与一键组不受影响。保存后生效。",
                                 WS_CHILD | WS_VISIBLE, margin, S(20), contentW, S(36), h,
                                 (HMENU)(INT_PTR)IDC_LBL_EXCLUDEHINT, g.inst, nullptr);
@@ -4816,6 +4942,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 exclText.resize(lenE);
                 auto parsedExcl = ParseExcludePaths(exclText);
                 if (!parsedExcl.empty()) g.excludePaths = parsedExcl;
+                RebuildExcludeNorm();
                 SaveRegText(L"ExcludePaths", ExcludePathsToText(g.excludePaths));
                 // —— Shell 与窗口设置持久化 ——
                 if (g.shellType == 3) {  // 仅自定义时读取并保存路径/参数
