@@ -22,6 +22,7 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
 | `douban {q}` | 豆瓣 `https://www.douban.com/search?q={q}` |
 | `gh {q}` | GitHub `https://github.com/search?q={q}` |
 | `google {q}` | Google `https://www.google.com/search?q={q}` |
+| `x {q}` | X（原 Twitter）`https://x.com/search?q={q}` |
 | `空格 top` | 置顶/取消置顶当前窗口（切换「唤醒前的前台窗口」置顶，在目标窗口位置弹出轻量提示；需在设置「命令」中开启，默认开） |
 | `空格 cmd 命令` | 执行 Shell 命令（等价于原 `> 命令`）；需在设置「命令」中开启，默认开 |
 | `空格 w 关键词` | 切换/关闭/结束窗口（等价于原 `< 关键词`）；需在设置「命令」中开启，默认开 |
