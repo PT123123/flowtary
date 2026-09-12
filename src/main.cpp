@@ -129,9 +129,43 @@ static const WCHAR* kDefaultRulesText =
     L"zhihu https://www.zhihu.com/search?q={q}\r\n"
     L"douban https://www.douban.com/search?q={q}\r\n"
     L"gh https://github.com/search?q={q}\r\n"
+    L"google https://www.google.com/search?q={q}\r\n"
+    L"x https://x.com/search?q={q}";
+
+// 默认规则集版本号：升级递增。存量用户注册表里的 WebRules 若仍等于某个旧版本快照，
+// 说明他从未手动改过规则，直接整体刷新为当前默认集（补上新增的 xhs / x / … 等）；
+// 一旦用户自己编辑过（与任何快照都不相等），则原样保留，绝不覆盖用户数据。
+static constexpr int kWebRulesVer = 2;
+static const WCHAR* const kLegacyRulesV1 =
+    L"bd https://www.baidu.com/#ie=UTF-8&wd={q}\r\n"
+    L"bili https://search.bilibili.com/all?keyword={q}\r\n"
+    L"xhs https://www.xiaohongshu.com/search_result?keyword={q}\r\n"
+    L"zhihu https://www.zhihu.com/search?q={q}\r\n"
+    L"douban https://www.douban.com/search?q={q}\r\n"
+    L"gh https://github.com/search?q={q}\r\n"
     L"google https://www.google.com/search?q={q}";
 
 static std::wstring DefaultRulesText() { return kDefaultRulesText; }
+
+// 去掉行尾 CR 后逐行比较，忽略用户编辑造成的换行风格差异（\n / \r\n 混用）
+static bool RulesTextEqual(const std::wstring& a, const std::wstring& b) {
+    auto lines = [](const std::wstring& s) {
+        std::vector<std::wstring> v;
+        size_t i = 0;
+        while (i <= s.size()) {
+            size_t j = s.find(L'\n', i);
+            if (j == std::wstring::npos) j = s.size();
+            std::wstring line = s.substr(i, j - i);
+            while (!line.empty() && (line.back() == L'\r' || line.back() == L' ' || line.back() == L'\t'))
+                line.pop_back();
+            v.push_back(line);
+            if (j == s.size()) break;
+            i = j + 1;
+        }
+        return v;
+    };
+    return lines(a) == lines(b);
+}
 
 // ---------------- 主题系统 ----------------
 // 每个预设统一定义：透明度、输入框/列表字号、主窗配色（含可选渐变+星点）、
@@ -2797,6 +2831,8 @@ static std::wstring RulesToText(const std::vector<WebCmd>& rules) {
     return t;
 }
 
+static void SaveRegText(const WCHAR* name, const std::wstring& s);  // 定义见下
+
 static void LoadWebRules() {
     std::wstring text;
     DWORD type = 0, cb = 0;
@@ -2807,12 +2843,23 @@ static void LoadWebRules() {
                          nullptr, buf.data(), &cb) == ERROR_SUCCESS)
             text = buf.data();
     }
+    // 默认规则集升级：仅当注册表内容仍是某个旧版默认快照（用户从未改过）时整体刷新
+    if (!text.empty() && RulesTextEqual(text, kLegacyRulesV1)) {
+        text = DefaultRulesText();
+        SaveRegText(L"WebRules", text);
+        int ver = kWebRulesVer;
+        RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"WebRulesVer", REG_DWORD,
+                        &ver, sizeof(int));
+    }
     g.webCmds = ParseRules(text.empty() ? DefaultRulesText() : text);
 }
 
 static void SaveWebRules(const std::wstring& editorText) {
     RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"WebRules", REG_SZ,
                     editorText.c_str(), (DWORD)((editorText.size() + 1) * sizeof(WCHAR)));
+    int ver = kWebRulesVer;  // 标记为「已编辑过」，避免升级时被旧快照判定覆盖
+    RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"WebRulesVer", REG_DWORD,
+                    &ver, sizeof(int));
     g.webCmds = ParseRules(editorText);
 }
 
