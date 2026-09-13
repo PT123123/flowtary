@@ -5,5 +5,9 @@ use cli::Cli;
 
 fn main() {
     let cli = Cli::parse();
-    cli::run(&cli);
+    if cli.serve {
+        altsearch::daemon::serve(&cli.dir, cli.reindex);
+    } else {
+        cli::run(&cli);
+    }
 }

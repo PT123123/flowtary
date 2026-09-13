@@ -96,10 +96,27 @@ Tested on a full C drive (~1.6 million entries):
 
 ```
 src/
-├── main.rs       — CLI entry point
+├── main.rs       — CLI entry point (routes to CLI or daemon mode)
 ├── lib.rs        — Library entry point
 ├── cache.rs      — File indexing and cache management
 ├── search.rs     — Query and search logic
+├── daemon.rs     — Persistent daemon mode (--serve) for Flowtary
 ├── watcher.rs    — File system watcher
 └── cli.rs        — Argument parsing and command handling
 ```
+
+## Flowtary fork
+
+Vendored into Flowtary (base: upstream `c3dd357`, MIT). Local changes:
+
+- **Daemon mode** (`--serve`): persistent index + watcher; line protocol over
+  stdin/stdout — `Q<tab><mode f|d|a><tab><max><tab><terms>` → `N<tab><count>`
+  followed by `<d|f><tab><full path>` lines; prints `READY` once queryable
+  (progress on `STATUS` lines); saves cache and exits on stdin EOF.
+- **Packed name arena + SIMD search**: lowercase names concatenated into one
+  contiguous buffer scanned with `memchr::memmem` (~25× faster than the
+  original per-name `contains` on 1.6M entries), prefix/boundary-aware top-N
+  ranking, full paths returned. Lazily compacted on deletions.
+- `Cache.roots` records the indexed roots; a mismatch on load triggers a full
+  reindex. Pre-fork `cache.bin` files are treated as corrupt and reindexed.
+- `--dir` is now repeatable (multi-root indexing).
