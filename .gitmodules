@@ -10,3 +10,6 @@
 [submodule "vendor/ImageReader"]
 	path = vendor/ImageReader
 	url = git@github.com:xland/ImageReader.git
+[submodule "vendor/alt-search"]
+	path = vendor/alt-search
+	url = https://github.com/AlternativeLua/alt-search.git
