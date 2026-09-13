@@ -109,14 +109,20 @@ src/
 
 Vendored into Flowtary (base: upstream `c3dd357`, MIT). Local changes:
 
-- **Daemon mode** (`--serve`): persistent index + watcher; line protocol over
-  stdin/stdout — `Q<tab><mode f|d|a><tab><max><tab><terms>` → `N<tab><count>`
-  followed by `<d|f><tab><full path>` lines; prints `READY` once queryable
-  (progress on `STATUS` lines); saves cache and exits on stdin EOF.
+- **Daemon mode** (`--serve`): resident singleton bound to `127.0.0.1:47771`
+  (a second instance exits when the port is taken). Independent of the host app:
+  the first full index finishes even across app restarts; idle with no client for
+  `--idle-exit-secs` (default 1800) → saves cache and exits. Line protocol per
+  TCP connection: `ALTSEARCH` greeting → `STATUS`/`READY` → queries
+  (`Q<tab><mode f|d|a><tab><max><tab><terms>` → `N<tab><count>` followed by
+  `<d|f><tab><full path>` lines). Indexing is throttled via `--threads`
+  (default 2-4) and `--dir` selects the indexed roots.
 - **Packed name arena + SIMD search**: lowercase names concatenated into one
   contiguous buffer scanned with `memchr::memmem` (~25× faster than the
   original per-name `contains` on 1.6M entries), prefix/boundary-aware top-N
   ranking, full paths returned. Lazily compacted on deletions.
 - `Cache.roots` records the indexed roots; a mismatch on load triggers a full
-  reindex. Pre-fork `cache.bin` files are treated as corrupt and reindexed.
+  reindex. `Cache.version` must equal `CACHE_VERSION` — bump it **only** when the
+  serialized layout changes, so pure code changes keep existing caches reusable.
+  Pre-versioned `cache.bin` files are treated as corrupt and reindexed.
 - `--dir` is now repeatable (multi-root indexing).

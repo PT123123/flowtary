@@ -7,6 +7,11 @@ use serde::{Deserialize, Serialize};
 use ahash::AHashMap;
 use memchr::memmem;
 
+/// 缓存格式版本:只有 Cache 序列化结构真正变化时才 +1(旧缓存解码失败或
+/// 版本不符都会整体重建)。搜索逻辑/守护进程等纯代码改动不得动它,
+/// 保证改代码后既有索引照常复用。
+pub const CACHE_VERSION: u32 = 2;
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FileEntry {
     pub name: String,
@@ -26,6 +31,9 @@ pub struct FileEntry {
 /// entries 校验活性,死条目超阈值后整体重建。
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Cache {
+    /// 缓存格式版本;加载时与 CACHE_VERSION 不符则整体重建
+    pub version: u32,
+
     /// 索引根目录;守护进程加载缓存后与本次启动参数不一致则整体重建
     #[serde(default)]
     pub roots: Vec<String>,
@@ -69,6 +77,7 @@ fn upsert_best(best: &mut Vec<(u8, u32)>, keep: usize, score: u8, idx: u32) {
 impl Cache {
     pub fn new() -> Cache {
         Cache {
+            version: CACHE_VERSION,
             roots: Vec::new(),
             entries: AHashMap::new(),
             name_buf: Vec::new(),
@@ -80,35 +89,40 @@ impl Cache {
     }
 
     pub fn build(&mut self, root: &Path) -> std::io::Result<usize> {
-        let file_entries: Vec<(String, FileEntry)> = WalkDir::new(root)
+        self.build_par(root, jwalk::Parallelism::RayonDefaultPool { busy_timeout: std::time::Duration::from_secs(10) })
+    }
+
+    /// 流式入库(边遍历边插表,不再先 collect 整棵树,峰值内存减半以上);
+    /// threads 限制遍历并行度,给宿主机留 CPU(默认全池会吃满所有核)。
+    pub fn build_par(&mut self, root: &Path, par: jwalk::Parallelism) -> std::io::Result<usize> {
+        for entry in WalkDir::new(root)
             .min_depth(1)
             .max_depth(usize::MAX)
+            .parallelism(par)
             .into_iter()
             .filter_map(|e| e.ok())
-            .filter_map(|entry| {
-                let metadata = entry.metadata().ok()?;
-                let file_entry = FileEntry {
-                    name: entry.file_name().to_string_lossy().to_string(),
-                    extension: entry.path().extension().map(|e| e.to_string_lossy().to_string()),
-                    size: metadata.len(),
-                    modified: metadata.modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0),
-                    created: metadata.created()
-                        .ok()
-                        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0),
-                    is_dir: entry.file_type().is_dir(),
-                };
-                Some((entry.path().to_string_lossy().to_string(), file_entry))
-            })
-            .collect();
-
-        for (key, value) in file_entries {
-            self.entries.insert(key, value);
+        {
+            let metadata = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let file_entry = FileEntry {
+                name: entry.file_name().to_string_lossy().to_string(),
+                extension: entry.path().extension().map(|e| e.to_string_lossy().to_string()),
+                size: metadata.len(),
+                modified: metadata.modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                created: metadata.created()
+                    .ok()
+                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                is_dir: entry.file_type().is_dir(),
+            };
+            self.entries.insert(entry.path().to_string_lossy().to_string(), file_entry);
         }
         self.rebuild_arena();
 
