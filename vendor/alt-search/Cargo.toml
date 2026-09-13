@@ -1,0 +1,28 @@
+[package]
+name = "altsearch"
+version = "0.1.0"
+edition = "2021"
+description = "A fast file search tool for Windows"
+license = "MIT"
+repository = "https://github.com/AlternativeLua/alt-search"
+readme = "README.md"
+keywords = ["search", "files", "windows", "cli"]
+categories = ["command-line-utilities"]
+
+[lib]
+name = "altsearch"
+path = "src/lib.rs"
+
+[[bin]]
+name = "altsearch"
+path = "src/main.rs"
+
+[dependencies]
+jwalk = "0.8.1"
+clap = { version = "4.6.0", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["alloc"] }
+rayon = "1.11.0"
+zstd = "0.13.3"
+ahash = { version = "0.8.12", features = ["serde"] }
+notify = "6.1.1"
