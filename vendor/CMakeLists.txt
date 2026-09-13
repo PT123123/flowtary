@@ -320,3 +320,31 @@ foreach(_t yoga Ling Clipper2 TinyOCR)
       MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
   endif()
 endforeach()
+
+# =====================================================================
+# alt-search（Fork 自 AlternativeLua/alt-search c3dd357，MIT）→ altsearch.exe
+#   Rust 实现的文件名索引/搜索守护进程，Flowtary 的 d/f 搜索后端
+#   （替代 Everything IPC；找不到本 exe 时自动回退 Everything）。
+#   与其余 vendor 不同：本目录源码为仓库内置 fork（需本地修改，非 submodule），
+#   通过 cargo 构建，产物复制到 build\ 与 flowtary.exe 同目录。
+#   未安装 Rust 工具链时跳过，不影响主构建。
+# =====================================================================
+set(ALTSEARCH_DIR "${CMAKE_CURRENT_SOURCE_DIR}/alt-search")
+if(EXISTS "${ALTSEARCH_DIR}/Cargo.toml")
+  find_program(CARGO_EXECUTABLE cargo)
+  if(CARGO_EXECUTABLE)
+    set(ALTSEARCH_EXE "${ALTSEARCH_DIR}/target/release/altsearch.exe")
+    add_custom_target(altsearch ALL
+      COMMAND "${CARGO_EXECUTABLE}" build --release
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${ALTSEARCH_EXE}" "${CMAKE_BINARY_DIR}/altsearch.exe"
+      BYPRODUCTS "${ALTSEARCH_EXE}"
+      WORKING_DIRECTORY "${ALTSEARCH_DIR}"
+      COMMENT "[vendor] cargo build alt-search -> altsearch.exe"
+      VERBATIM)
+  else()
+    message(STATUS "[vendor] 未找到 cargo，跳过 altsearch.exe 构建"
+                   "（d/f 搜索将回退 Everything IPC）")
+  endif()
+endif()
+

@@ -82,6 +82,13 @@ fn load_or_build(roots: &[String], reindex: bool) -> Cache {
         let _ = cache.build(Path::new(r));
     }
     cache.roots = roots.to_vec();
+    // 防御：根目录存在却索引出 0 条，多半是启动参数的路径被命令行转义弄坏了。
+    // 不落盘（避免空缓存被后续启动复用）、不发 READY，直接失败退出，
+    // 让调用方走回退后端（Flowtary 侧收到 EOF 会自动回退 Everything IPC）。
+    if cache.len() == 0 {
+        eprintln!("altsearch: indexed 0 entries from {:?}", roots);
+        std::process::exit(2);
+    }
     let _ = cache.save(&cpath);
     println!("STATUS\tindexed {}\t{}ms", cache.len(), start.elapsed().as_millis());
     cache
@@ -119,7 +126,9 @@ fn handle_line(cache: &Arc<Mutex<Cache>>, line: &str, out: &mut impl Write) -> b
 }
 
 pub fn serve(dirs: &[String], reindex: bool) {
-    let roots: Vec<String> = dirs.to_vec();
+    // 根路径归一化:统一反斜杠,调用方给 C:/ 或 C:\ 都收敛到同一 roots,
+    // 保证缓存复用判定一致
+    let roots: Vec<String> = dirs.iter().map(|d| d.replace('/', "\\")).collect();
     let cache = load_or_build(&roots, reindex);
     let cache = Arc::new(Mutex::new(cache));
 
