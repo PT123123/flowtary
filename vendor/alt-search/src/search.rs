@@ -24,7 +24,7 @@ impl Query {
 
 pub fn search<'a>(cache: &'a Cache, query: &Query) -> Vec<&'a FileEntry> {
     let candidates: Vec<&FileEntry> = match &query.name_contains {
-        Some(name) => cache.search_by_name(name).collect(),
+        Some(name) => cache.search_by_name(name),
         None => cache.iter().collect(),
     };
 

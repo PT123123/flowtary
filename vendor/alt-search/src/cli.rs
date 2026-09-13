@@ -2,15 +2,16 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use clap::Parser;
 use std::sync::{Arc, Mutex};
-use altsearch::cache::{FileEntry, Cache};
+use altsearch::cache::{Cache, FileEntry};
 use altsearch::search::{search, Query};
 use altsearch::watcher::start_watcher;
 
 #[derive(Parser)]
 #[command(name = "altsearch")]
 pub struct Cli {
+    /// 索引根目录,可重复传入(--dir C:\ --dir D:\);缺省为当前目录
     #[arg(short, long)]
-    pub dir: Option<String>,
+    pub dir: Vec<String>,
 
     #[arg(short, long)]
     pub name: Option<String>,
@@ -32,6 +33,10 @@ pub struct Cli {
 
     #[arg(long)]
     pub reindex: bool,
+
+    /// 守护进程模式:常驻索引,stdin 收查询行、stdout 回结果(Flowtary 调用)
+    #[arg(long)]
+    pub serve: bool,
 }
 
 pub fn build_query(cli: &Cli) -> Query {
@@ -54,9 +59,9 @@ pub fn print_results(results: &[&FileEntry]) {
         println!("No results found.");
         return;
     }
-    
+
     println!("Found {} results.", results.len());
-    
+
     for entry in results {
         println!("{}", entry.name);
     }
@@ -71,23 +76,33 @@ pub fn run(cli: &Cli) {
         std::fs::create_dir_all(parent).unwrap();
     }
 
+    let dirs: Vec<String> = if cli.dir.is_empty() {
+        vec![".".to_string()]
+    } else {
+        cli.dir.clone()
+    };
+
     let mut cache = Cache::new();
+    let mut loaded = false;
     if cache_path.exists() && !cli.reindex {
         let start = Instant::now();
-        cache = Cache::load(&cache_path).unwrap();
-        println!("Cache loaded in {}ms", start.elapsed().as_millis());
-    } else {
+        if let Ok(c) = Cache::load(&cache_path) {
+            cache = c;
+            loaded = true;
+            println!("Cache loaded in {}ms", start.elapsed().as_millis());
+        }
+    }
+    if !loaded {
         let start = Instant::now();
-        let dir = cli.dir.as_deref().unwrap_or(".");
-        cache.build(Path::new(dir)).unwrap();
+        for d in &dirs {
+            let _ = cache.build(Path::new(d));
+        }
         println!("Indexed {} entries in {}ms", cache.len(), start.elapsed().as_millis());
         cache.save(&cache_path).unwrap();
     }
 
     let cache = Arc::new(Mutex::new(cache));
-    if let Some(dir) = &cli.dir {
-        let _ = start_watcher(Arc::clone(&cache), vec![dir.clone()], cache_path.clone());
-    }
+    let _ = start_watcher(Arc::clone(&cache), dirs.clone(), cache_path);
 
     let cache = cache.lock().unwrap();
     let query = build_query(cli);
