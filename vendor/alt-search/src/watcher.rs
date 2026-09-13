@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use notify::event::{RenameMode, ModifyKind};
 use crate::cache::Cache;
@@ -18,12 +19,20 @@ pub fn start_watcher(
 
     std::thread::spawn(move || {
         let _watcher = watcher;
-        let mut changes = 0;
+        let mut changes: i32 = 0;
+        let mut last_save = Instant::now();
 
         for result in rx {
             match result {
-                Ok(event) => handle_event(event, &cache, &cache_path, &mut changes),
+                Ok(event) => handle_event(event, &cache, &mut changes),
                 Err(e) => eprintln!("watch error: {:?}", e),
+            }
+            // 大索引落盘一次要数十秒且期间查询被锁:攒够条数且距上次落盘
+            // 超过 5 分钟才写,避免频繁全量保存卡住查询
+            if changes >= 500 && last_save.elapsed() >= Duration::from_secs(300) {
+                let _ = cache.lock().unwrap().save(&cache_path);
+                changes = 0;
+                last_save = Instant::now();
             }
         }
     });
@@ -31,7 +40,7 @@ pub fn start_watcher(
     Ok(())
 }
 
-fn handle_event(event: Event, cache: &Arc<Mutex<Cache>>, cache_path: &PathBuf, changes: &mut i32) {
+fn handle_event(event: Event, cache: &Arc<Mutex<Cache>>, changes: &mut i32) {
     let mut cache = cache.lock().unwrap();
 
     match event.kind {
@@ -55,10 +64,5 @@ fn handle_event(event: Event, cache: &Arc<Mutex<Cache>>, cache_path: &PathBuf, c
             }
         }
         _ => {}
-    }
-
-    if *changes >= 50 {
-        let _ = cache.save(cache_path);
-        *changes = 0;
     }
 }

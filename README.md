@@ -173,10 +173,12 @@ build\evtest.exe     :: Everything IPC 协议冒烟测试工具（控制台）
 
 `d`/`f` 搜索后端按可用性自动选择：
 
-1. **alt-search 守护进程（默认）**：flowtary 启动时拉起同目录 `altsearch.exe --serve`
-   （Rust 守护进程，索引所有固定磁盘到 `%APPDATA%\AltSearch\cache.bin`，文件系统事件增量更新，
-   SIMD 名字查询毫秒级返回完整路径）。索引未就绪/守护进程缺失或崩溃时自动降级到下一级；
-   主程序退出（含崩溃）由 kill-on-close Job 连带结束守护进程，不留孤儿。
+1. **alt-search 守护进程（默认）**：常驻单例（监听 `127.0.0.1:47771`），由 flowtary
+   按需 detached 拉起同目录 `altsearch.exe --serve`，**独立于 flowtary 存活**——首次
+   全盘索引耗时较长（索引遍历限流在 2~4 线程，约 15~25% CPU），跨多次 flowtary 重启
+   也只需完成一次，之后每次启动从版本化缓存秒级恢复；文件系统事件增量更新，SIMD
+   名字查询毫秒级返回完整路径。索引未就绪时 d/f 显示「索引建立中」并暂用 Everything；
+   守护进程空闲半小时（无客户端）自动落盘退出。
 2. **Everything IPC（回退）**：守护进程不可用且 Everything 1.4+ 正在后台运行时走原有
    `WM_COPYDATA` 协议。
 3. **兜底项**：连 Everything 也未运行时，列表给出降级项「在 Everything 中搜索：…」，
@@ -188,15 +190,21 @@ build\evtest.exe     :: Everything IPC 协议冒烟测试工具（控制台）
 `d/f` 搜索由内置的开源 [AlternativeLua/alt-search](https://github.com/AlternativeLua/alt-search)
 fork（MIT，`vendor/alt-search/`，Rust 实现）承担，flowtary 本体保持零依赖：
 
-- **守护进程**（`altsearch.exe --serve`）：常驻内存索引 + `notify` 文件系统监视增量更新；
-  首次启动全盘建索引（数分钟），之后每次启动从 zstd 缓存秒级恢复。stdin/stdout 行协议：
-  `Q<TAB>模式(f/d)<TAB>条数<TAB>关键词` → `N<TAB>条数` + 每行 `d|f<TAB>完整路径`；
-  stdin EOF（主程序退出）时落盘索引并退出。
+- **常驻单例守护进程**（`altsearch.exe --serve`，端口 47771）：独立于 flowtary 生命周期
+  （detached 启动，主程序退出不影响首次索引的建立）；加载/建完索引才发 READY；无客户端
+  空闲 30 分钟自动落盘退出，下次使用时再被拉起并从缓存恢复。首次索引用 `--threads`
+  限流（默认按核数压到 2~4 线程），范围与力度可用 `--dir`/`--reindex`/`--threads` 调整。
+  行协议（localhost TCP）：连接后 `ALTSEARCH` 握手 → `STATUS`/`READY` → 查询
+  `Q<TAB>模式(f/d)<TAB>条数<TAB>关键词` → `N<TAB>条数` + 每行 `d|f<TAB>完整路径`。
 - **查询层**：所有小写文件名拼进连续缓冲区，`memchr` SIMD 子串扫描（160 万条目命中
   ~7ms、未命中全扫 ~4ms，替代原实现 ~100-230ms 的逐名 contains）；前缀命中 > 词边界
   命中 > 普通包含的排序，多词 AND，按文件/文件夹过滤，top-N 截断。
-- **接入方式**：flowtary 侧仅用 Win32 匿名管道 + 一个工作线程（带代数计数丢弃过期回复），
-  回复进入与 Everything 回复同一条处理链（排除路径过滤 → 点击加权重排 → 取前 10 展示）。
+- **缓存版本化**：`cache.bin`（`%APPDATA%\AltSearch\`）带格式版本号，alt-search 代码
+  迭代（搜索逻辑/守护进程改动）不影响既有索引复用；只有序列化结构真正变化时才升
+  版本触发一次重建。根目录列表也存入缓存，范围变化自动重建。
+- **接入方式**：flowtary 侧仅用 localhost TCP + 一个工作线程（断线自动重连、代数计数
+  丢弃过期回复），回复进入与 Everything 回复同一条处理链（排除路径过滤 → 点击权重
+  重排 → 取前 10 展示）。
 
 ## Everything IPC 协议说明（回退后端）
 

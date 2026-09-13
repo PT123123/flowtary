@@ -6,6 +6,8 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windowsx.h>
 #include <shellapi.h>
 #include <shlobj.h>
@@ -46,6 +48,7 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #pragma comment(lib, "msimg32.lib")
 #pragma comment(lib, "wininet.lib")
 #pragma comment(lib, "urlmon.lib")
+#pragma comment(lib, "ws2_32.lib")
 
 // ---------------- Everything IPC（官方 SDK 协议，Everything 1.3+） ----------------
 namespace ev {
@@ -463,22 +466,22 @@ struct App {
     DWORD serial = 0;
 
     // —— alt-search 守护进程（d/f 搜索后端，Everything IPC 为回退）——
+    // 守护进程常驻单例（127.0.0.1:ALT_PORT），detached 启动、独立于本程序存活：
+    // 首次全盘索引耗时很久，独立生命周期保证跨多次 Flowtary 重启只需建一次索引，
+    // 之后从版本化缓存秒级恢复。本程序只维护一条到守护进程的 TCP 连接。
     std::wstring altExe;       // altsearch.exe 完整路径（与 flowtary.exe 同目录；缺失则整套机制关闭）
-    HANDLE altJob = nullptr;   // kill-on-close Job：主程序退出（含崩溃）连带结束守护进程
-    HANDLE altProc = nullptr;
-    HANDLE altStdinWrite = nullptr;  // 守护进程 stdin（发查询；关闭后守护进程读到 EOF 自行落盘退出）
-    HANDLE altStdoutRead = nullptr;  // 守护进程 stdout（收 READY/结果）
     HANDLE altThread = nullptr;
     HANDLE altWake = nullptr;        // 有新查询时唤醒工作线程
     CRITICAL_SECTION altLock;
     bool altLockOk = false;
-    bool altReady = false;     // 守护进程已输出 READY（索引可查）
-    bool altDown = false;      // 守护进程不可用（未启动/崩溃/管道断开），之后走 Everything IPC
+    bool altReady = false;     // 守护进程已握手且索引就绪（可查询）
+    bool altIndexing = false;  // 守护进程在首次建索引中（d/f 结果区显示进行中提示）
     unsigned altGen = 0;       // 查询代数：单调递增，回复带 gen，过期回复直接丢弃
     std::wstring altPending;   // 待发协议行（工作线程只取最新一条）
     std::wstring altPendingKey; // 待发查询对应的权重 key（随 altPending 一起取走，供回复重排）
     std::wstring altTerms;     // 当前 d/f 查询原始关键词（守护进程侧自行分词）
-    bool altIsFile = true;     // 当前 d/f 模式：true=f（仅文件）false=d（仅文件夹）;
+    bool altIsFile = true;     // 当前 d/f 模式：true=f（仅文件）false=d（仅文件夹）
+    DWORD altLastSpawn = 0;    // 上次拉起守护进程的时刻（限频）;
 
     std::vector<Program> programs;
     std::wstring everythingExe;
@@ -1559,10 +1562,18 @@ static void HandleEverythingReply(const COPYDATASTRUCT* cds) {
 }
 
 // ---------------- alt-search 守护进程（d/f 搜索后端，Everything IPC 为回退） ----------------
-// 以子进程拉起同目录 altsearch.exe --serve（Rust，索引全部分固定磁盘），行协议走
-// stdin/stdout；专用工作线程串行收发，新查询只认最新一条（代数计数丢弃过期回复）。
-// 生命周期：主程序退出时关闭 stdin（守护进程读到 EOF 落盘退出），另有 Job
-// kill-on-close 兜底防孤儿。守护进程未就绪/不可用时自动回退 Everything IPC。
+// 守护进程为常驻单例（127.0.0.1:ALT_PORT，Rust 实现同目录 altsearch.exe），
+// 由本程序 detached 拉起、独立于本程序存活：首次全盘索引耗时很久，独立生命周期
+// 保证跨多次 Flowtary 重启也只需建一次索引，之后从版本化缓存秒级恢复；空闲无
+// 客户端超过半小时守护进程自行落盘退出。行协议走 localhost TCP（握手 ALTSEARCH
+// → STATUS/READY → Q/N 应答）；专用工作线程持有连接、断线自动重连，新查询只认
+// 最新一条（代数计数丢弃过期回复）。守护进程未就绪时自动回退 Everything IPC。
+
+// 守护进程监听端口（与 vendor/alt-search --serve 默认值一致）
+constexpr u_short ALT_PORT = 47771;
+
+// 请求给守护进程的条数：重排/过滤发生在本地，多取一些保证展示满 10 行
+constexpr int ALT_MAX_RESULTS = 50;
 
 // 查询回复（堆分配，经 WM_APP_ALT 交主线程处理，处理后 delete）
 struct AltReply {
@@ -1571,90 +1582,187 @@ struct AltReply {
     std::vector<std::pair<bool, std::wstring>> hits;  // (是否文件夹, 完整路径)
 };
 
-// 请求给守护进程的条数：重排/过滤发生在本地，多取一些保证展示满 10 行
-constexpr int ALT_MAX_RESULTS = 50;
+static bool AltRecvLine(SOCKET s, std::string& line) {
+    line.clear();
+    char ch = 0;
+    int n = 0;
+    for (;;) {
+        n = recv(s, &ch, 1, 0);
+        if (n <= 0) return false;
+        if (ch == '\n') return true;
+        if (ch != '\r') line.push_back(ch);
+    }
+}
 
-static void AltMarkDown() {  // 守护进程不可用：后续 d/f 走 Everything IPC
-    if (g.altLockOk) {
-        EnterCriticalSection(&g.altLock);
-        g.altDown = true;
-        LeaveCriticalSection(&g.altLock);
-    } else {
-        g.altDown = true;
+static bool AltSendAll(SOCKET s, const std::string& data) {
+    int off = 0;
+    while (off < (int)data.size()) {
+        int n = send(s, data.data() + off, (int)data.size() - off, 0);
+        if (n <= 0) return false;
+        off += n;
+    }
+    return true;
+}
+
+// 单次连接尝试；失败（守护进程未启动）返回 INVALID_SOCKET
+static SOCKET AltTryConnect() {
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return INVALID_SOCKET;
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(ALT_PORT);
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    if (connect(s, (sockaddr*)&addr, sizeof(addr)) != 0) {
+        closesocket(s);
+        return INVALID_SOCKET;
+    }
+    return s;
+}
+
+// detached 拉起守护进程：不挂 Job、不等它——它要独立于本程序存活，把首次
+// 索引建完。若已有实例在跑，新实例绑定端口失败会自消（单例互斥由端口承担）
+static void AltSpawnDaemon() {
+    if (g.altExe.empty()) return;
+    DWORD now = GetTickCount();
+    if (g.altLastSpawn && now - g.altLastSpawn < 15000) return;  // 限频
+    g.altLastSpawn = now;
+
+    // 索引根：所有本地固定磁盘（与 Everything 默认范围对齐）
+    std::wstring args = L"\"" + g.altExe + L"\" --serve";
+    DWORD drives = GetLogicalDrives();
+    wchar_t root[4] = {L'A', L':', L'\\', 0};
+    for (int i = 0; i < 26; ++i) {
+        if (!(drives & (1u << i))) continue;
+        root[0] = wchar_t(L'A' + i);
+        if (GetDriveTypeW(root) == DRIVE_FIXED) {
+            args += L" --dir \"";
+            args += root;
+            // 命令行转义：引号前的尾随反斜杠必须翻倍，否则 \" 被解析成字面引号
+            // （C:\ 会变成 C:"，索引静默为空）
+            args += L'\\';
+            args += L'"';
+        }
+    }
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (CreateProcessW(nullptr, args.data(), nullptr, nullptr, FALSE,
+                       CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+}
+
+// 连接后握手并等 READY；首次建索引期间守护进程反复发 STATUS indexing（可能数小时），
+// 本线程原地等待是安全的——等待期间新查询只是排队，就绪后先处理最新一条
+static bool AltHandshake(SOCKET s) {
+    std::string line;
+    for (;;) {
+        if (!AltRecvLine(s, line)) return false;
+        if (line.rfind("ALTSEARCH", 0) == 0) continue;   // 握手行
+        if (line.rfind("STATUS", 0) == 0) {              // 索引建立中
+            if (g.altLockOk) {
+                EnterCriticalSection(&g.altLock);
+                g.altIndexing = true;
+                LeaveCriticalSection(&g.altLock);
+            }
+            continue;
+        }
+        if (line.rfind("READY", 0) == 0) return true;
+        return false;  // 未知应答：端口被其他程序占用，视为不可用
     }
 }
 
 static unsigned WINAPI AltSearchThread(LPVOID) {
-    HANDLE rd = g.altStdoutRead;
-    auto readLine = [&](std::string& line) -> bool {
-        line.clear();
-        char ch = 0;
-        DWORD n = 0;
+    for (;;) {
+        // 1) 拿到一条已就绪的连接：反复试连；连不上就限频拉起守护进程再试
+        SOCKET s = INVALID_SOCKET;
+        for (int i = 0; i < 30 && s == INVALID_SOCKET; ++i) {
+            s = AltTryConnect();
+            if (s == INVALID_SOCKET) {
+                if (i == 0 || i == 15) AltSpawnDaemon();
+                Sleep(200);
+            }
+        }
+        if (s == INVALID_SOCKET) { Sleep(30000); continue; }  // 环境异常：慢速重试
+        if (!AltHandshake(s)) { closesocket(s); Sleep(3000); continue; }
+
+        EnterCriticalSection(&g.altLock);
+        g.altIndexing = false;
+        g.altReady = true;
+        LeaveCriticalSection(&g.altLock);
+        PostMessageW(g.hwnd, WM_APP_ALT, 1, 0);
+
+        // 2) 查询循环：当前连接上收发；断开则把请求塞回队列，重连后补发
+        std::string u8, line;
         for (;;) {
-            if (!ReadFile(rd, &ch, 1, &n, nullptr) || n == 0) return false;
-            if (ch == '\n') return true;
-            if (ch != '\r') line.push_back(ch);
+            WaitForSingleObject(g.altWake, INFINITE);
+            std::wstring req, key;
+            unsigned myGen = 0;
+            EnterCriticalSection(&g.altLock);
+            req = g.altPending;
+            key = g.altPendingKey;
+            myGen = g.altGen;
+            LeaveCriticalSection(&g.altLock);
+            if (req.empty()) continue;
+
+            u8 = WStringToUtf8(req);
+            u8 += '\n';  // 行协议按行读，必须以换行结尾
+            if (!AltSendAll(s, u8)) {
+                EnterCriticalSection(&g.altLock);
+                g.altPending = std::move(req);
+                g.altPendingKey = std::move(key);
+                LeaveCriticalSection(&g.altLock);
+                break;
+            }
+
+            if (!AltRecvLine(s, line) || line.rfind("N\t", 0) != 0) {
+                EnterCriticalSection(&g.altLock);
+                g.altPending = std::move(req);
+                g.altPendingKey = std::move(key);
+                LeaveCriticalSection(&g.altLock);
+                break;
+            }
+            AltReply* rep = new AltReply();
+            rep->gen = myGen;
+            rep->termKey = key;
+            int count = (std::min)(atoi(line.c_str() + 2), 200);
+            for (int i = 0; i < count; ++i) {
+                if (!AltRecvLine(s, line)) { delete rep; rep = nullptr; break; }
+                size_t tab = line.find('\t');
+                if (tab == std::string::npos) continue;
+                rep->hits.emplace_back(line[0] == 'd', Utf8ToWString(line.substr(tab + 1)));
+            }
+            if (!rep) {
+                EnterCriticalSection(&g.altLock);
+                g.altPending = std::move(req);
+                g.altPendingKey = std::move(key);
+                LeaveCriticalSection(&g.altLock);
+                break;
+            }
+            // 过期回复丢弃：读取期间来了新查询（下一轮循环会立刻处理它）
+            bool stale = false;
+            EnterCriticalSection(&g.altLock);
+            stale = (g.altGen != myGen);
+            LeaveCriticalSection(&g.altLock);
+            if (stale) { delete rep; continue; }
+            PostMessageW(g.hwnd, WM_APP_ALT, 0, (LPARAM)rep);
         }
-    };
 
-    std::string line;
-    // 等索引就绪：先收 STATUS…，直到 READY（首次建索引可能数十秒不响应，
-    // 期间新查询只是排队，就绪后先处理最新一条）
-    for (;;) {
-        if (!readLine(line)) { AltMarkDown(); return 0; }
-        if (line.rfind("READY", 0) == 0) break;
-    }
-    EnterCriticalSection(&g.altLock);
-    g.altReady = true;
-    LeaveCriticalSection(&g.altLock);
-    PostMessageW(g.hwnd, WM_APP_ALT, 1, 0);
-
-    std::string u8;
-    DWORD written = 0;
-    for (;;) {
-        WaitForSingleObject(g.altWake, INFINITE);
-        std::wstring req, key;
-        unsigned myGen = 0;
+        // 3) 连接断开：撤下就绪标记（d/f 自动回退 Everything），重连后恢复
         EnterCriticalSection(&g.altLock);
-        req = g.altPending;
-        key = g.altPendingKey;
-        myGen = g.altGen;
+        g.altReady = false;
         LeaveCriticalSection(&g.altLock);
-        if (req.empty()) continue;
-
-        u8 = WStringToUtf8(req);
-        u8 += '\n';  // 行协议按行读，必须以换行结尾，否则守护进程阻塞等待
-        if (!WriteFile(g.altStdinWrite, u8.c_str(), (DWORD)u8.size(), &written, nullptr) ||
-            written != u8.size()) {
-            AltMarkDown();
-            return 0;
-        }
-
-        if (!readLine(line) || line.rfind("N\t", 0) != 0) { AltMarkDown(); return 0; }
-        AltReply* rep = new AltReply();
-        rep->gen = myGen;
-        rep->termKey = key;
-        int count = atoi(line.c_str() + 2);
-        count = (std::min)(count, 200);
-        for (int i = 0; i < count; ++i) {
-            if (!readLine(line)) { delete rep; AltMarkDown(); return 0; }
-            size_t tab = line.find('\t');
-            if (tab == std::string::npos) continue;
-            rep->hits.emplace_back(line[0] == 'd', Utf8ToWString(line.substr(tab + 1)));
-        }
-        // 过期回复丢弃：读取期间来了新查询（下一轮循环会立刻处理它）
-        bool stale = false;
-        EnterCriticalSection(&g.altLock);
-        stale = (g.altGen != myGen);
-        LeaveCriticalSection(&g.altLock);
-        if (stale) { delete rep; continue; }
-        PostMessageW(g.hwnd, WM_APP_ALT, 0, (LPARAM)rep);
+        closesocket(s);
+        Sleep(3000);
     }
+    return 0;
 }
 
 // 把当前 d/f 查询发给守护进程；返回 false 表示不可用（调用方回退 Everything IPC）
 static bool AltDispatchQuery() {
-    if (g.altDown || !g.altReady || !g.altStdinWrite || g.altTerms.empty()) return false;
+    if (!g.altReady || g.altTerms.empty()) return false;
     std::wstring terms = g.altTerms;
     // 协议按 TAB 分行内字段：关键词里的制表/换行清洗成空格
     std::replace(terms.begin(), terms.end(), L'\t', L' ');
@@ -1694,79 +1802,10 @@ static void HandleAltReply(const AltReply& rep) {
     LayoutAndRepaint();
 }
 
-static void AltShutdown() {
-    // 关 stdin：守护进程读到 EOF 后保存缓存退出（Job kill-on-close 仅兜底）
-    if (g.altStdinWrite) {
-        CloseHandle(g.altStdinWrite);
-        g.altStdinWrite = nullptr;
-    }
-}
-
 static void StartAltSearchDaemon() {
     if (g.altExe.empty()) return;
-
-    // 索引根：所有本地固定磁盘（与 Everything 默认范围对齐）
-    std::wstring args = L"\"" + g.altExe + L"\" --serve";
-    DWORD drives = GetLogicalDrives();
-    wchar_t root[4] = {L'A', L':', L'\\', 0};
-    for (int i = 0; i < 26; ++i) {
-        if (!(drives & (1u << i))) continue;
-        root[0] = wchar_t(L'A' + i);
-        if (GetDriveTypeW(root) == DRIVE_FIXED) {
-            args += L" --dir \"";
-            args += root;
-            // 命令行转义：引号前的尾随反斜杠必须翻倍，否则 \" 被解析成字面引号
-            // （C:\ 会变成 C:"，索引静默为空）
-            args += L'\\';
-            args += L'"';
-        }
-    }
-
-    SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
-    HANDLE inR = nullptr, outW = nullptr;
-    if (!CreatePipe(&inR, &g.altStdinWrite, &sa, 0)) return;
-    if (!CreatePipe(&g.altStdoutRead, &outW, &sa, 0)) {
-        CloseHandle(inR);
-        CloseHandle(g.altStdinWrite);
-        g.altStdinWrite = nullptr;
-        return;
-    }
-    // 本进程自用的两端不许被子进程继承
-    SetHandleInformation(g.altStdinWrite, HANDLE_FLAG_INHERIT, 0);
-    SetHandleInformation(g.altStdoutRead, HANDLE_FLAG_INHERIT, 0);
-    HANDLE nul = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_WRITE,
-                             &sa, OPEN_EXISTING, 0, nullptr);  // stderr → NUL
-
-    STARTUPINFOW si{};
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdInput = inR;
-    si.hStdOutput = outW;
-    si.hStdError = (nul && nul != INVALID_HANDLE_VALUE) ? nul : outW;
-    PROCESS_INFORMATION pi{};
-    BOOL ok = CreateProcessW(nullptr, args.data(), nullptr, nullptr, TRUE,
-                             CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
-    CloseHandle(inR);
-    CloseHandle(outW);
-    if (nul && nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
-    if (!ok) {
-        CloseHandle(g.altStdinWrite);
-        g.altStdinWrite = nullptr;
-        CloseHandle(g.altStdoutRead);
-        g.altStdoutRead = nullptr;
-        return;
-    }
-    CloseHandle(pi.hThread);
-    g.altProc = pi.hProcess;
-
-    g.altJob = CreateJobObjectW(nullptr, nullptr);
-    if (g.altJob) {
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION ji{};
-        ji.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        SetInformationJobObject(g.altJob, JobObjectExtendedLimitInformation, &ji, sizeof(ji));
-        AssignProcessToJobObject(g.altJob, pi.hProcess);
-    }
-
+    WSADATA wsa{};
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return;
     InitializeCriticalSection(&g.altLock);
     g.altLockOk = true;
     g.altWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -5744,7 +5783,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 if (g.mode == Mode::Everything) {
                     // d/f 搜索后端：优先 alt-search 守护进程（SIMD 查询层），
                     // 未就绪/不可用时自动回退 Everything IPC，再不行走兜底行
-                    if (!AltDispatchQuery()) ExecuteEverythingQuery();
+                    if (!AltDispatchQuery()) {
+                        bool indexing = false;
+                        if (g.altLockOk) {
+                            EnterCriticalSection(&g.altLock);
+                            indexing = g.altIndexing;
+                            LeaveCriticalSection(&g.altLock);
+                        }
+                        if (indexing) AddHint(L"alt-search 首次索引建立中…完成后 d/f 自动切换");
+                        ExecuteEverythingQuery();
+                    }
                 }
             } else if (wParam == kTimerWeightSave) {
                 KillTimer(hwnd, kTimerWeightSave);
@@ -6675,8 +6723,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     _beginthreadex(nullptr, 0, ScanProgramsThread, nullptr, 0, nullptr);
     g.everythingExe = FindEverythingExe();
 
-    // alt-search 守护进程（d/f 搜索后端）：找同目录 altsearch.exe 并拉起；
-    // 找不到或启动失败时整套机制静默关闭，行为与旧版（Everything IPC）完全一致
+    // alt-search 守护进程（d/f 搜索后端）：找同目录 altsearch.exe 并启动后台
+    // 工作线程（线程负责按需 detached 拉起守护进程并维持连接）；
+    // 找不到 exe 时整套机制静默关闭，行为与旧版（Everything IPC）完全一致
     {
         WCHAR altbuf[MAX_PATH]{};
         if (GetModuleFileNameW(nullptr, altbuf, MAX_PATH)) {
@@ -6699,7 +6748,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
         DispatchMessageW(&msg);
     }
 
-    AltShutdown();  // 关闭守护进程 stdin：它读到 EOF 后落盘索引并退出
     fdj_uninit();  // 卸载文件对话框增强的钩子与 32 位助手
     RemoveWakeHook();
     UnregisterHotKey(g.hwnd, 1);

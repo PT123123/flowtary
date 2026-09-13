@@ -34,9 +34,21 @@ pub struct Cli {
     #[arg(long)]
     pub reindex: bool,
 
-    /// 守护进程模式:常驻索引,stdin 收查询行、stdout 回结果(Flowtary 调用)
+    /// 守护进程模式:常驻单例,监听 127.0.0.1 收查询(Flowtary 调用)
     #[arg(long)]
     pub serve: bool,
+
+    /// 守护进程监听端口(单例判据:端口被占即已有实例)
+    #[arg(long, default_value_t = 47771)]
+    pub port: u16,
+
+    /// 索引遍历线程数上限(默认 2~4,压低首次建索引的 CPU 占用)
+    #[arg(long)]
+    pub threads: Option<usize>,
+
+    /// 无客户端空闲多少秒后落盘退出(0=永不退出)
+    #[arg(long, default_value_t = 1800)]
+    pub idle_exit_secs: u64,
 }
 
 pub fn build_query(cli: &Cli) -> Query {
@@ -87,9 +99,11 @@ pub fn run(cli: &Cli) {
     if cache_path.exists() && !cli.reindex {
         let start = Instant::now();
         if let Ok(c) = Cache::load(&cache_path) {
-            cache = c;
-            loaded = true;
-            println!("Cache loaded in {}ms", start.elapsed().as_millis());
+            if c.version == altsearch::cache::CACHE_VERSION {
+                cache = c;
+                loaded = true;
+                println!("Cache loaded in {}ms", start.elapsed().as_millis());
+            }
         }
     }
     if !loaded {
