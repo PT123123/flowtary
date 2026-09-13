@@ -1623,6 +1623,7 @@ static unsigned WINAPI AltSearchThread(LPVOID) {
         if (req.empty()) continue;
 
         u8 = WStringToUtf8(req);
+        u8 += '\n';  // 行协议按行读，必须以换行结尾，否则守护进程阻塞等待
         if (!WriteFile(g.altStdinWrite, u8.c_str(), (DWORD)u8.size(), &written, nullptr) ||
             written != u8.size()) {
             AltMarkDown();
@@ -1654,8 +1655,13 @@ static unsigned WINAPI AltSearchThread(LPVOID) {
 // 把当前 d/f 查询发给守护进程；返回 false 表示不可用（调用方回退 Everything IPC）
 static bool AltDispatchQuery() {
     if (g.altDown || !g.altReady || !g.altStdinWrite || g.altTerms.empty()) return false;
+    std::wstring terms = g.altTerms;
+    // 协议按 TAB 分行内字段：关键词里的制表/换行清洗成空格
+    std::replace(terms.begin(), terms.end(), L'\t', L' ');
+    std::replace(terms.begin(), terms.end(), L'\n', L' ');
+    std::replace(terms.begin(), terms.end(), L'\r', L' ');
     std::wstring line = std::wstring(L"Q\t") + (g.altIsFile ? L'f' : L'd') +
-                        L"\t" + std::to_wstring(ALT_MAX_RESULTS) + L"\t" + g.altTerms;
+                        L"\t" + std::to_wstring(ALT_MAX_RESULTS) + L"\t" + terms;
     EnterCriticalSection(&g.altLock);
     g.altPending = std::move(line);
     g.altPendingKey = g.evTermKey;
