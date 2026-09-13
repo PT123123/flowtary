@@ -462,6 +462,24 @@ struct App {
     DWORD expectReply = 0;     // 期待的结果消息 dwData
     DWORD serial = 0;
 
+    // —— alt-search 守护进程（d/f 搜索后端，Everything IPC 为回退）——
+    std::wstring altExe;       // altsearch.exe 完整路径（与 flowtary.exe 同目录；缺失则整套机制关闭）
+    HANDLE altJob = nullptr;   // kill-on-close Job：主程序退出（含崩溃）连带结束守护进程
+    HANDLE altProc = nullptr;
+    HANDLE altStdinWrite = nullptr;  // 守护进程 stdin（发查询；关闭后守护进程读到 EOF 自行落盘退出）
+    HANDLE altStdoutRead = nullptr;  // 守护进程 stdout（收 READY/结果）
+    HANDLE altThread = nullptr;
+    HANDLE altWake = nullptr;        // 有新查询时唤醒工作线程
+    CRITICAL_SECTION altLock;
+    bool altLockOk = false;
+    bool altReady = false;     // 守护进程已输出 READY（索引可查）
+    bool altDown = false;      // 守护进程不可用（未启动/崩溃/管道断开），之后走 Everything IPC
+    unsigned altGen = 0;       // 查询代数：单调递增，回复带 gen，过期回复直接丢弃
+    std::wstring altPending;   // 待发协议行（工作线程只取最新一条）
+    std::wstring altPendingKey; // 待发查询对应的权重 key（随 altPending 一起取走，供回复重排）
+    std::wstring altTerms;     // 当前 d/f 查询原始关键词（守护进程侧自行分词）
+    bool altIsFile = true;     // 当前 d/f 模式：true=f（仅文件）false=d（仅文件夹）;
+
     std::vector<Program> programs;
     std::wstring everythingExe;
     std::wstring hotkeyName = L"Alt+Space";
@@ -521,6 +539,7 @@ constexpr int kWeightSaveDelayMs = 3000;   // 延迟合并写盘的等待时间
 constexpr int WM_APP_TRAY = WM_APP + 1;
 constexpr int WM_APP_PROGRAMS_READY = WM_APP + 2;  // 工作线程扫描完成，回主线程接管结果
 constexpr int WM_APP_QUIT = WM_APP + 3;  // 新版本接管：通知旧实例退出
+constexpr int WM_APP_ALT = WM_APP + 4;   // alt-search 守护进程：wParam 1=索引就绪；0=查询回复（lParam=AltReply*）
 constexpr int IDM_SETTINGS = 2001;
 constexpr int IDM_EXIT = 2002;
 constexpr int IDM_REFRESH = 2003;   // 托盘菜单：刷新应用缓存
@@ -1483,6 +1502,25 @@ static void ExecuteEverythingQuery() {
     // 结果异步回到本窗口（WM_COPYDATA，dwData == g.expectReply）
 }
 
+// 点击加权重排：同一有效搜索词下点过的文件/文件夹排前面（权重相同保持后端原序）；
+// 同样聚合前缀历史权重（自适应推荐：f bilibili 点过的文件，敲 f b / f bi 时也排前面）。
+// Everything 回复与 alt-search 守护进程回复共用。
+static void RerankRowsByWeight() {
+    if (g.weightEnabled && !g.evTermKey.empty() && g.items.size() > 1) {
+        const std::wstring& tk = g.evTermKey;
+        std::unordered_map<std::wstring, int> hist;
+        CollectPrefixWeights(tk, hist);
+        auto rowW = [&](const Row& r) {
+            int w = GetClickWeight(tk, r.action);
+            auto it = hist.find(r.action);
+            if (it != hist.end()) w += it->second;
+            return w;
+        };
+        std::stable_sort(g.items.begin(), g.items.end(),
+                         [&rowW](const Row& a, const Row& b) { return rowW(a) > rowW(b); });
+    }
+}
+
 static void HandleEverythingReply(const COPYDATASTRUCT* cds) {
     if (cds->dwData != g.expectReply || !cds->lpData) return;
     if (cds->cbData < sizeof(ev::List) - sizeof(ev::Item)) return;
@@ -1514,24 +1552,219 @@ static void HandleEverythingReply(const COPYDATASTRUCT* cds) {
         g.items.push_back(std::move(r));
         ++kept;
     }
-    // 点击加权重排：同一有效搜索词下点过的文件/文件夹排前面（权重相同保持 Everything 原序）；
-    // 同样聚合前缀历史权重（自适应推荐：f bilibili 点过的文件，敲 f b / f bi 时也排前面）
-    if (g.weightEnabled && !g.evTermKey.empty() && g.items.size() > 1) {
-        const std::wstring& tk = g.evTermKey;
-        std::unordered_map<std::wstring, int> hist;
-        CollectPrefixWeights(tk, hist);
-        auto rowW = [&](const Row& r) {
-            int w = GetClickWeight(tk, r.action);
-            auto it = hist.find(r.action);
-            if (it != hist.end()) w += it->second;
-            return w;
-        };
-        std::stable_sort(g.items.begin(), g.items.end(),
-                         [&rowW](const Row& a, const Row& b) { return rowW(a) > rowW(b); });
-    }
+    RerankRowsByWeight();
     if (g.items.empty()) AddHint(g.startingUp ? L"正在启动中…" : L"无结果");
     g.sel = 0;
     LayoutAndRepaint();
+}
+
+// ---------------- alt-search 守护进程（d/f 搜索后端，Everything IPC 为回退） ----------------
+// 以子进程拉起同目录 altsearch.exe --serve（Rust，索引全部分固定磁盘），行协议走
+// stdin/stdout；专用工作线程串行收发，新查询只认最新一条（代数计数丢弃过期回复）。
+// 生命周期：主程序退出时关闭 stdin（守护进程读到 EOF 落盘退出），另有 Job
+// kill-on-close 兜底防孤儿。守护进程未就绪/不可用时自动回退 Everything IPC。
+
+// 查询回复（堆分配，经 WM_APP_ALT 交主线程处理，处理后 delete）
+struct AltReply {
+    unsigned gen = 0;
+    std::wstring termKey;
+    std::vector<std::pair<bool, std::wstring>> hits;  // (是否文件夹, 完整路径)
+};
+
+// 请求给守护进程的条数：重排/过滤发生在本地，多取一些保证展示满 10 行
+constexpr int ALT_MAX_RESULTS = 50;
+
+static void AltMarkDown() {  // 守护进程不可用：后续 d/f 走 Everything IPC
+    if (g.altLockOk) {
+        EnterCriticalSection(&g.altLock);
+        g.altDown = true;
+        LeaveCriticalSection(&g.altLock);
+    } else {
+        g.altDown = true;
+    }
+}
+
+static unsigned WINAPI AltSearchThread(LPVOID) {
+    HANDLE rd = g.altStdoutRead;
+    auto readLine = [&](std::string& line) -> bool {
+        line.clear();
+        char ch = 0;
+        DWORD n = 0;
+        for (;;) {
+            if (!ReadFile(rd, &ch, 1, &n, nullptr) || n == 0) return false;
+            if (ch == '\n') return true;
+            if (ch != '\r') line.push_back(ch);
+        }
+    };
+
+    std::string line;
+    // 等索引就绪：先收 STATUS…，直到 READY（首次建索引可能数十秒不响应，
+    // 期间新查询只是排队，就绪后先处理最新一条）
+    for (;;) {
+        if (!readLine(line)) { AltMarkDown(); return 0; }
+        if (line.rfind("READY", 0) == 0) break;
+    }
+    EnterCriticalSection(&g.altLock);
+    g.altReady = true;
+    LeaveCriticalSection(&g.altLock);
+    PostMessageW(g.hwnd, WM_APP_ALT, 1, 0);
+
+    std::string u8;
+    DWORD written = 0;
+    for (;;) {
+        WaitForSingleObject(g.altWake, INFINITE);
+        std::wstring req, key;
+        unsigned myGen = 0;
+        EnterCriticalSection(&g.altLock);
+        req = g.altPending;
+        key = g.altPendingKey;
+        myGen = g.altGen;
+        LeaveCriticalSection(&g.altLock);
+        if (req.empty()) continue;
+
+        u8 = WStringToUtf8(req);
+        if (!WriteFile(g.altStdinWrite, u8.c_str(), (DWORD)u8.size(), &written, nullptr) ||
+            written != u8.size()) {
+            AltMarkDown();
+            return 0;
+        }
+
+        if (!readLine(line) || line.rfind("N\t", 0) != 0) { AltMarkDown(); return 0; }
+        AltReply* rep = new AltReply();
+        rep->gen = myGen;
+        rep->termKey = key;
+        int count = atoi(line.c_str() + 2);
+        count = (std::min)(count, 200);
+        for (int i = 0; i < count; ++i) {
+            if (!readLine(line)) { delete rep; AltMarkDown(); return 0; }
+            size_t tab = line.find('\t');
+            if (tab == std::string::npos) continue;
+            rep->hits.emplace_back(line[0] == 'd', Utf8ToWString(line.substr(tab + 1)));
+        }
+        // 过期回复丢弃：读取期间来了新查询（下一轮循环会立刻处理它）
+        bool stale = false;
+        EnterCriticalSection(&g.altLock);
+        stale = (g.altGen != myGen);
+        LeaveCriticalSection(&g.altLock);
+        if (stale) { delete rep; continue; }
+        PostMessageW(g.hwnd, WM_APP_ALT, 0, (LPARAM)rep);
+    }
+}
+
+// 把当前 d/f 查询发给守护进程；返回 false 表示不可用（调用方回退 Everything IPC）
+static bool AltDispatchQuery() {
+    if (g.altDown || !g.altReady || !g.altStdinWrite || g.altTerms.empty()) return false;
+    std::wstring line = std::wstring(L"Q\t") + (g.altIsFile ? L'f' : L'd') +
+                        L"\t" + std::to_wstring(ALT_MAX_RESULTS) + L"\t" + g.altTerms;
+    EnterCriticalSection(&g.altLock);
+    g.altPending = std::move(line);
+    g.altPendingKey = g.evTermKey;
+    g.altGen++;
+    LeaveCriticalSection(&g.altLock);
+    SetEvent(g.altWake);
+    return true;
+}
+
+// 守护进程查询回复 → 结果行（与 Everything 回复同款：排除过滤 + 权重重排）
+static void HandleAltReply(const AltReply& rep) {
+    g.items.clear();
+    for (const auto& h : rep.hits) {
+        const std::wstring& path = h.second;
+        size_t slash = path.find_last_of(L'\\');
+        Row r;
+        r.kind = h.first ? Row::Folder : Row::File;
+        r.title = (slash == std::wstring::npos) ? path : path.substr(slash + 1);
+        if (r.title.empty()) continue;  // 以分隔符结尾的异常路径：丢弃
+        r.sub = (slash == std::wstring::npos) ? L"" : path.substr(0, slash);
+        if (r.sub.size() == 2 && r.sub[1] == L':') r.sub += L'\\';  // 盘根相邻：C: 补成 C:\ 形态
+        r.action = path;
+        if (IsPathExcluded(r.action)) continue;  // 排除命中：直接丢弃
+        g.items.push_back(std::move(r));
+    }
+    RerankRowsByWeight();
+    if (g.items.size() > (size_t)ev::kMaxResults) g.items.resize(ev::kMaxResults);
+    if (g.items.empty()) AddHint(g.startingUp ? L"正在启动中…" : L"无结果");
+    g.sel = 0;
+    LayoutAndRepaint();
+}
+
+static void AltShutdown() {
+    // 关 stdin：守护进程读到 EOF 后保存缓存退出（Job kill-on-close 仅兜底）
+    if (g.altStdinWrite) {
+        CloseHandle(g.altStdinWrite);
+        g.altStdinWrite = nullptr;
+    }
+}
+
+static void StartAltSearchDaemon() {
+    if (g.altExe.empty()) return;
+
+    // 索引根：所有本地固定磁盘（与 Everything 默认范围对齐）
+    std::wstring args = L"\"" + g.altExe + L"\" --serve";
+    DWORD drives = GetLogicalDrives();
+    wchar_t root[4] = {L'A', L':', L'\\', 0};
+    for (int i = 0; i < 26; ++i) {
+        if (!(drives & (1u << i))) continue;
+        root[0] = wchar_t(L'A' + i);
+        if (GetDriveTypeW(root) == DRIVE_FIXED) {
+            args += L" --dir \"";
+            args += root;
+            // 命令行转义：引号前的尾随反斜杠必须翻倍，否则 \" 被解析成字面引号
+            // （C:\ 会变成 C:"，索引静默为空）
+            args += L'\\';
+            args += L'"';
+        }
+    }
+
+    SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
+    HANDLE inR = nullptr, outW = nullptr;
+    if (!CreatePipe(&inR, &g.altStdinWrite, &sa, 0)) return;
+    if (!CreatePipe(&g.altStdoutRead, &outW, &sa, 0)) {
+        CloseHandle(inR);
+        CloseHandle(g.altStdinWrite);
+        g.altStdinWrite = nullptr;
+        return;
+    }
+    // 本进程自用的两端不许被子进程继承
+    SetHandleInformation(g.altStdinWrite, HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(g.altStdoutRead, HANDLE_FLAG_INHERIT, 0);
+    HANDLE nul = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_WRITE,
+                             &sa, OPEN_EXISTING, 0, nullptr);  // stderr → NUL
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = inR;
+    si.hStdOutput = outW;
+    si.hStdError = (nul && nul != INVALID_HANDLE_VALUE) ? nul : outW;
+    PROCESS_INFORMATION pi{};
+    BOOL ok = CreateProcessW(nullptr, args.data(), nullptr, nullptr, TRUE,
+                             CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    CloseHandle(inR);
+    CloseHandle(outW);
+    if (nul && nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
+    if (!ok) {
+        CloseHandle(g.altStdinWrite);
+        g.altStdinWrite = nullptr;
+        CloseHandle(g.altStdoutRead);
+        g.altStdoutRead = nullptr;
+        return;
+    }
+    CloseHandle(pi.hThread);
+    g.altProc = pi.hProcess;
+
+    g.altJob = CreateJobObjectW(nullptr, nullptr);
+    if (g.altJob) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION ji{};
+        ji.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(g.altJob, JobObjectExtendedLimitInformation, &ji, sizeof(ji));
+        AssignProcessToJobObject(g.altJob, pi.hProcess);
+    }
+
+    InitializeCriticalSection(&g.altLock);
+    g.altLockOk = true;
+    g.altWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g.altThread = (HANDLE)_beginthreadex(nullptr, 0, AltSearchThread, nullptr, 0, nullptr);
 }
 
 // ---------------- 输入解析与刷新 ----------------
@@ -1883,6 +2116,8 @@ static void Refresh() {
             } else {
                 g.evQuery = BuildModifierQuery(tok == L"f" ? L"file:" : L"folder:", rest);
                 g.evTermKey = NormalizeSearchTerm(rest);  // 本次查询的有效搜索词（权重 key）
+                g.altTerms = rest;                        // 原始关键词（守护进程自行分词）
+                g.altIsFile = (tok == L"f");
                 AddHint(L"正在搜索…");
                 SetTimer(g.hwnd, kTimerDebounce, kDebounceMs, nullptr);
             }
@@ -5500,7 +5735,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_TIMER:
             if (wParam == kTimerDebounce) {
                 KillTimer(hwnd, kTimerDebounce);
-                if (g.mode == Mode::Everything) ExecuteEverythingQuery();
+                if (g.mode == Mode::Everything) {
+                    // d/f 搜索后端：优先 alt-search 守护进程（SIMD 查询层），
+                    // 未就绪/不可用时自动回退 Everything IPC，再不行走兜底行
+                    if (!AltDispatchQuery()) ExecuteEverythingQuery();
+                }
             } else if (wParam == kTimerWeightSave) {
                 KillTimer(hwnd, kTimerWeightSave);
                 SaveClickWeightsNow();  // 延迟合并写盘到期：一次写出全部权重
@@ -5564,6 +5803,24 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             g.startingUp = false;
             TrayUpdateTip();  // 提示文案从「正在启动中」切回热键名
             if (IsWindowVisible(hwnd)) LayoutAndRepaint();
+            return 0;
+        }
+
+        case WM_APP_ALT: {
+            // alt-search 守护进程：1=索引就绪；0=查询回复（lParam=AltReply*，此处释放）
+            if (wParam == 1) {
+                g.altReady = true;
+                // 用户已停在 d/f 模式等待的话，立即用守护进程重查一次
+                if (g.mode == Mode::Everything && !g.altTerms.empty()) AltDispatchQuery();
+                return 0;
+            }
+            AltReply* rep = (AltReply*)lParam;
+            if (rep) {
+                bool stale = (g.mode != Mode::Everything || rep->gen != g.altGen ||
+                              rep->termKey != g.evTermKey);
+                if (!stale) HandleAltReply(*rep);
+                delete rep;
+            }
             return 0;
         }
 
@@ -6412,6 +6669,17 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     _beginthreadex(nullptr, 0, ScanProgramsThread, nullptr, 0, nullptr);
     g.everythingExe = FindEverythingExe();
 
+    // alt-search 守护进程（d/f 搜索后端）：找同目录 altsearch.exe 并拉起；
+    // 找不到或启动失败时整套机制静默关闭，行为与旧版（Everything IPC）完全一致
+    {
+        WCHAR altbuf[MAX_PATH]{};
+        if (GetModuleFileNameW(nullptr, altbuf, MAX_PATH)) {
+            std::wstring cand = DirOf(altbuf) + L"\\altsearch.exe";
+            if (GetFileAttributesW(cand.c_str()) != INVALID_FILE_ATTRIBUTES) g.altExe = cand;
+        }
+        StartAltSearchDaemon();
+    }
+
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         // 设置框：回车一律保存（规则编辑框多行，会吞掉 Return，不走默认按钮）
@@ -6425,6 +6693,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
         DispatchMessageW(&msg);
     }
 
+    AltShutdown();  // 关闭守护进程 stdin：它读到 EOF 后落盘索引并退出
     fdj_uninit();  // 卸载文件对话框增强的钩子与 32 位助手
     RemoveWakeHook();
     UnregisterHotKey(g.hwnd, 1);

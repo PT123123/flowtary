@@ -24,5 +24,8 @@ Copy-Item (Join-Path $src 'flowtary.exe')       (Join-Path $Dist "flowtary-$ver.
 Copy-Item (Join-Path $src 'filedlg_hook64.dll') (Join-Path $Dist 'filedlg_hook64.dll') -Force
 Copy-Item (Join-Path $src 'filedlg_hook32.dll') (Join-Path $Dist 'filedlg_hook32.dll') -Force
 Copy-Item (Join-Path $src 'filedlg_agent32.exe')(Join-Path $Dist 'filedlg_agent32.exe') -Force
+if (Test-Path (Join-Path $src 'altsearch.exe')) {
+    Copy-Item (Join-Path $src 'altsearch.exe')  (Join-Path $Dist 'altsearch.exe') -Force
+}
 
 Write-Host ("[ok] {0}\flowtary-{1}.exe" -f $Dist, $ver)

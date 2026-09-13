@@ -13,8 +13,8 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
 
 | 输入 | 行为 |
 | :--- | :--- |
-| `f {关键词}` | Everything 只搜本地**文件**（`file:` 修饰符），回车直接打开 |
-| `d {关键词}` | Everything 只搜本地**文件夹**（`folder:` 修饰符），回车在资源管理器打开 |
+| `f {关键词}` | 只搜本地**文件**，回车直接打开（后端优先 alt-search 守护进程，回退 Everything） |
+| `d {关键词}` | 只搜本地**文件夹**，回车在资源管理器打开（后端同上） |
 | `bd {q}` | 百度 `https://www.baidu.com/#ie=UTF-8&wd={q}` |
 | `bili {q}` | B站 `https://search.bilibili.com/all?keyword={q}` |
 | `xhs {q}` | 小红书 `https://www.xiaohongshu.com/search_result?keyword={q}` |
@@ -156,10 +156,12 @@ make release     # 版本自增 + 完整构建 + 输出到 dist\（可用 OUT= �
 make clean       # 清理 CMake 生成的产物
 ```
 需要 VS 2022 / Build Tools 的 C++ 工作负载（x64 + x86）、CMake、GNU make、ninja（需在 PATH 中）；
-底层由 CMake 生成 Ninja 构建文件。
+底层由 CMake 生成 Ninja 构建文件。`d/f` 搜索后端 altsearch.exe 由 vendor 里的 Rust 源码经
+cargo 构建（需 Rust 工具链；缺 cargo 时跳过构建，搜索自动回退 Everything IPC，不影响主程序）。
 
 ```text
 build\flowtary.exe   :: 主程序，启动后无主窗口、常驻托盘，可被全局热键唤出
+build\altsearch.exe  :: d/f 搜索后端守护进程（vendor/alt-search Rust 源码构建）
 build\evtest.exe     :: Everything IPC 协议冒烟测试工具（控制台）
 ```
 
@@ -169,12 +171,34 @@ build\evtest.exe     :: Everything IPC 协议冒烟测试工具（控制台）
 > 注意：全屏独占游戏（如 VALORANT + Vanguard）前台时，热键可能被反作弊拦截或无法抢占
 > 焦点，这是系统限制；切回正常桌面后即可正常使用。
 
-运行前提：使用 `d`/`f` 前缀需要 **Everything 1.4+ 正在后台运行**。若未运行，列表会给出
-降级项「在 Everything 中搜索：…」，回车则以 `everything.exe -search "file:xxx"` 方式
-打开 Everything 窗口完成搜索（`everything.exe` 依次在 Program Files、`%LOCALAPPDATA%`、
-exe 同目录及 PATH 中查找）。
+`d`/`f` 搜索后端按可用性自动选择：
 
-## Everything IPC 协议说明（与原方案的差异更正）
+1. **alt-search 守护进程（默认）**：flowtary 启动时拉起同目录 `altsearch.exe --serve`
+   （Rust 守护进程，索引所有固定磁盘到 `%APPDATA%\AltSearch\cache.bin`，文件系统事件增量更新，
+   SIMD 名字查询毫秒级返回完整路径）。索引未就绪/守护进程缺失或崩溃时自动降级到下一级；
+   主程序退出（含崩溃）由 kill-on-close Job 连带结束守护进程，不留孤儿。
+2. **Everything IPC（回退）**：守护进程不可用且 Everything 1.4+ 正在后台运行时走原有
+   `WM_COPYDATA` 协议。
+3. **兜底项**：连 Everything 也未运行时，列表给出降级项「在 Everything 中搜索：…」，
+   回车以 `everything.exe -search "file:xxx"` 方式打开 Everything 窗口完成搜索
+   （`everything.exe` 依次在 Program Files、`%LOCALAPPDATA%`、exe 同目录及 PATH 中查找）。
+
+## d/f 搜索后端说明：alt-search（替代 Everything）
+
+`d/f` 搜索由内置的开源 [AlternativeLua/alt-search](https://github.com/AlternativeLua/alt-search)
+fork（MIT，`vendor/alt-search/`，Rust 实现）承担，flowtary 本体保持零依赖：
+
+- **守护进程**（`altsearch.exe --serve`）：常驻内存索引 + `notify` 文件系统监视增量更新；
+  首次启动全盘建索引（数分钟），之后每次启动从 zstd 缓存秒级恢复。stdin/stdout 行协议：
+  `Q<TAB>模式(f/d)<TAB>条数<TAB>关键词` → `N<TAB>条数` + 每行 `d|f<TAB>完整路径`；
+  stdin EOF（主程序退出）时落盘索引并退出。
+- **查询层**：所有小写文件名拼进连续缓冲区，`memchr` SIMD 子串扫描（160 万条目命中
+  ~7ms、未命中全扫 ~4ms，替代原实现 ~100-230ms 的逐名 contains）；前缀命中 > 词边界
+  命中 > 普通包含的排序，多词 AND，按文件/文件夹过滤，top-N 截断。
+- **接入方式**：flowtary 侧仅用 Win32 匿名管道 + 一个工作线程（带代数计数丢弃过期回复），
+  回复进入与 Everything 回复同一条处理链（排除路径过滤 → 点击加权重排 → 取前 10 展示）。
+
+## Everything IPC 协议说明（回退后端）
 
 实现严格对照 voidtools 官方 SDK 头文件 `ipc/everything_ipc.h`（Everything 1.4.1）：
 
@@ -200,6 +224,7 @@ vendor/ScreenCapture/  截图工具源码（git submodule，xland/ScreenCapture 
 vendor/Ling/           GUI 框架源码（git submodule，xland/Ling），OCR 链依赖
 vendor/TinyOCR/        OCR 推理引擎源码（git submodule，xland/TinyOCR），基于 onnxruntime
 vendor/ImageReader/    OCR 独立进程源码（git submodule，xland/ImageReader 1.0.2），构建产物 ImageReader.exe
+vendor/alt-search/     d/f 搜索后端源码（内置 fork：AlternativeLua/alt-search c3dd357，MIT，Rust），构建产物 altsearch.exe
 vendor/CMakeLists.txt  第三方源码构建定义（不改动 submodule 内部，所有 target 在此声明）
 cmake/msvc-include.cmake  MSVC include 路径自动检测（解决 ninja 生成器不传递 SDK 头文件路径的问题）
 cmake/wrapper/Util.h   Ling::Util 头文件包装（替换 MSVC 不完全支持的 C++20 template lambda 宏）
