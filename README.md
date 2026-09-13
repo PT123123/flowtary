@@ -130,7 +130,7 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
   1. 用户开始菜单 `%APPDATA%\Microsoft\Windows\Start Menu\Programs` 下全部 `.lnk`
   2. 系统开始菜单 `C:\ProgramData\Microsoft\Windows\Start Menu\Programs` 下全部 `.lnk`
   3. `C:\Program Files`、`C:\Program Files (x86)` 一级子目录下的 `.exe`
-- 匹配排序：**点击权重 >** 精确 > 前缀 > 包含 > 子序列模糊，同级内开始菜单优先于 Program Files；
+- 匹配排序：**点击权重（含自适应前缀推荐，见下）>** 精确 > 前缀 > 包含 > 子序列模糊，同级内开始菜单优先于 Program Files；
   最多显示 10 条。`.lnk` 通过 `IShellLink + IPersistFile` 解析目标路径，以其目录作为
   启动工作目录；图标懒加载缓存。
 - **点击加权排序**：点击 / 回车 / `Alt+` 快捷键 / 右键「打开」执行某个本地文件、文件夹或程序条目后，
@@ -141,6 +141,12 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
   - 命中不应保存的命令前缀（如 `gg`、`bd` 等网页指令）时，本次点击**完全不记录、不写入存储**
   - 条目以**文件完整绝对路径**为唯一标识，同名文件不混淆
   - Everything（`f`/`d`）结果返回后同样按权重稳定重排（权重相同保持 Everything 原序）
+  - **自适应前缀推荐**：搜索时额外聚合「已记录搜索词以当前输入为前缀」的历史权重
+    （按真实点击次数累加），于是多点几次 `bilibili` → 哔哩哔哩后，只敲 `b` / `bi`
+    也能把它顶到结果最前，输入随使用越来越短；单字符查询下有历史权重的条目
+    不受「只保留精确/前缀」过滤限制（点过的不算噪音）。Everything（`f`/`d`）重排
+    同样适用；跟随「启用点击权重记忆」开关，无独立设置项，现有 `weights.dat`
+    无需迁移、直接生效
 
 ## 构建与运行
 

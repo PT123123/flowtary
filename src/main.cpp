@@ -1284,19 +1284,39 @@ static int MatchScoreWithPinyin(const std::wstring& name, const std::wstring& pi
     return 0;
 }
 
+// 自适应推荐：把「已记录搜索词以当前查询为前缀」的历史权重按条目路径聚合。
+// 用户以前敲完整词（如 bilibili）点击过的条目，现在只敲前缀（b / bi）也能被顶到最前。
+// 只取严格比查询长的词：与查询等长的词由 GetClickWeight 精确命中，避免重复计权。
+// 权重按真实点击次数原样累加（与精确词同量纲）：点得多的自然排前面。
+static void CollectPrefixWeights(const std::wstring& ql, std::unordered_map<std::wstring, int>& out) {
+    out.clear();
+    if (!g.weightEnabled || ql.empty()) return;
+    for (auto& kv : g.weights) {
+        const std::wstring& term = kv.first;
+        if (term.size() <= ql.size()) continue;
+        if (wcsncmp(term.c_str(), ql.c_str(), ql.size()) != 0) continue;
+        for (auto& pv : kv.second) out[pv.first] += pv.second;
+    }
+}
+
 static void SearchPrograms(const std::wstring& query) {
     std::wstring ql = NormalizeSearchTerm(query);  // 与权重 key 同款标准化（去首尾空格+小写）
+    std::unordered_map<std::wstring, int> hist;    // 前缀历史权重：条目路径 → Σ
+    CollectPrefixWeights(ql, hist);
     struct Cand { Program* p; int score; int w; };
     std::vector<Cand> cands;
     // 单字符查询只保留精确(4)/前缀(3)：带上「包含/子序列」时命中面过宽
     // （实测 d 命中全部程序的 32%），刚敲第一个字母就撑满 10 行噪音结果。
+    // 有历史权重的条目例外：是用户此前真实点击过的，属于自适应推荐，不算噪音。
     const bool prefixOnly = (ql.size() < 2);
     for (auto& p : g.programs) {
         int s = MatchScoreWithPinyin(ToLowerW(p.name), p.pinyin, ql);
-        if (s > 0 && !(prefixOnly && s < 3)) {
-            int w = g.weightEnabled ? GetClickWeight(ql, p.path) : 0;
-            cands.push_back({&p, s, w});
-        }
+        int hw = 0;
+        auto hit = hist.find(p.path);
+        if (hit != hist.end()) hw = hit->second;
+        if (!(s > 0 && !(prefixOnly && s < 3)) && hw <= 0) continue;
+        int w = g.weightEnabled ? GetClickWeight(ql, p.path) + hw : 0;
+        cands.push_back({&p, s, w});
     }
     std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {
         if (a.w != b.w) return a.w > b.w;  // 点击权重最优先：点过的条目排前面
@@ -1494,12 +1514,20 @@ static void HandleEverythingReply(const COPYDATASTRUCT* cds) {
         g.items.push_back(std::move(r));
         ++kept;
     }
-    // 点击加权重排：同一有效搜索词下点过的文件/文件夹排前面（权重相同保持 Everything 原序）
+    // 点击加权重排：同一有效搜索词下点过的文件/文件夹排前面（权重相同保持 Everything 原序）；
+    // 同样聚合前缀历史权重（自适应推荐：f bilibili 点过的文件，敲 f b / f bi 时也排前面）
     if (g.weightEnabled && !g.evTermKey.empty() && g.items.size() > 1) {
         const std::wstring& tk = g.evTermKey;
-        std::stable_sort(g.items.begin(), g.items.end(), [&tk](const Row& a, const Row& b) {
-            return GetClickWeight(tk, a.action) > GetClickWeight(tk, b.action);
-        });
+        std::unordered_map<std::wstring, int> hist;
+        CollectPrefixWeights(tk, hist);
+        auto rowW = [&](const Row& r) {
+            int w = GetClickWeight(tk, r.action);
+            auto it = hist.find(r.action);
+            if (it != hist.end()) w += it->second;
+            return w;
+        };
+        std::stable_sort(g.items.begin(), g.items.end(),
+                         [&rowW](const Row& a, const Row& b) { return rowW(a) > rowW(b); });
     }
     if (g.items.empty()) AddHint(g.startingUp ? L"正在启动中…" : L"无结果");
     g.sel = 0;
