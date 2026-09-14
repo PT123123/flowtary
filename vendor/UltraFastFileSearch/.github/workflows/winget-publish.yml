@@ -1,0 +1,291 @@
+# SPDX-License-Identifier: MPL-2.0
+# Copyright (c) 2025-2026 SKY, LLC.
+#
+# WinGet Publish — auto-submit the winget-pkgs manifest on every release.
+#
+# When `release.yml` finishes and publishes a non-draft, non-prerelease
+# GitHub Release (it sets `draft: false`, `prerelease: false`), GitHub
+# emits a `release: released` event.  This workflow reacts to that event
+# and uses `winget-releaser` (komac under the hood) to open a pull
+# request against microsoft/winget-pkgs that bumps `SkyLLC.UFFS` to the
+# new version.
+#
+# The action clones the *previous* version's manifest as a template and
+# updates only the version, installer URL, SHA256, and release date — so
+# the nested-installer structure (InstallerType: zip / NestedInstallerType:
+# portable, the PortableCommandAliases uffs/uffsd/uffsmcp/uffs-mft + the
+# bundled uffs-tui demo) carries over automatically with no manifest
+# authoring on our side.
+#
+# ── nested-alias seeding (now AUTOMATIC) ─────────────────────────────
+# komac PRESERVES NestedInstallerFiles across version bumps but does NOT
+# auto-add executables it finds in the zip.  Each binary bundled beyond
+# the founding four (uffs/uffsd/uffsmcp/uffs-mft) — currently uffs-tui,
+# uffs-broker, and uffs-update — needs its alias seeded into the manifest.
+# This used to be a manual step; the "Seed nested aliases" job below now
+# does it AUTOMATICALLY on every release (draft → seed from
+# packaging/winget/nested-aliases.yaml → release).  Adding a future binary
+# is a one-line edit to that yaml — never a manual winget-pkgs commit.
+# Idempotent seeder: scripts/dev/winget_seed_aliases.sh (see
+# packaging/winget/README.md).  uffs-broker + uffs-update were first
+# auto-seeded in v0.6.3 (PR microsoft/winget-pkgs#388427).
+#
+# ── Required secret ──────────────────────────────────────────────────
+# `WINGET_TOKEN` — a **classic** Personal Access Token with the
+# `public_repo` scope (fine-grained tokens that can fork + push to
+# microsoft/winget-pkgs also work).  The default `GITHUB_TOKEN` CANNOT
+# be used: it has no permission to fork an external repo or push the
+# manifest branch.  Create it under the maintainer account that owns the
+# winget-pkgs fork (the same account that hand-submitted PR
+# microsoft/winget-pkgs#378294 for v0.5.102), then add it at
+# Settings → Secrets and variables → Actions → New repository secret.
+
+name: 📦 WinGet Publish
+
+run-name: 📦 WinGet ${{ inputs.release-tag }}
+
+# `workflow_dispatch` ONLY — deliberately NOT `on: release`.
+#
+# A GitHub Release published by `release.yml` using the default
+# `GITHUB_TOKEN` does **not** emit a `release` event: GitHub suppresses
+# event cascades from `GITHUB_TOKEN`-authored actions to prevent
+# workflow-trigger loops.  So an `on: release:` trigger here would
+# NEVER fire from our release pipeline — it was dead config.
+#
+# Instead, `release.yml`'s `submit-winget` job explicitly dispatches
+# this workflow via `gh workflow run` once the release is published
+# (the documented `GITHUB_TOKEN` → `workflow_dispatch` exception, which
+# IS permitted).  `release-tag` is therefore always supplied; this is
+# also the manual re-submit entry point if a release predates the
+# automation or a previous run failed (e.g. expired token).
+on:
+  workflow_dispatch:
+    inputs:
+      release-tag:
+        description: 'Git tag to publish to WinGet (e.g. v0.5.102)'
+        required: true
+        type: string
+
+# Serialise submissions so two releases landing close together queue
+# cleanly instead of racing to open competing winget-pkgs PRs.
+concurrency:
+  group: winget-publish-${{ inputs.release-tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Submit winget-pkgs manifest
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Never run from forks — only the canonical repo holds WINGET_TOKEN.
+    if: github.repository_owner == 'skyllc-ai'
+    steps:
+      # Needed so the post-submit step can run scripts/dev/winget_seed_aliases.sh
+      # and read packaging/winget/nested-aliases.yaml (the canonical alias list).
+      - name: Checkout UFFS (for the alias seeder)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Graceful no-op when the token is absent: warn (not ❌) so a
+      # missing/rotated secret never shows as a hard failure.  The
+      # weekly `winget-token-expiry-check.yml` is the durable alarm for
+      # this condition; here we just skip cleanly.  `outputs.present`
+      # gates the submit step below.
+      - name: Check WINGET_TOKEN is configured
+        id: token
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        shell: bash
+        run: |
+          if [[ -z "${WINGET_TOKEN:-}" ]]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=WINGET_TOKEN missing::Skipping winget-pkgs submission for ${{ inputs.release-tag }} — set the WINGET_TOKEN secret, then re-run this workflow manually."
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Fast-forward the fork to upstream BEFORE komac branches off it.
+      #
+      # Field failure 2026-08-12 (v0.6.31): the fork sat three weeks behind
+      # microsoft/winget-pkgs (7fb04c98 vs 50db148f) and komac aborted with
+      #     githubrobbi does not have the correct permissions to execute `CreateRef`
+      #     failed to create branch SkyLLC.UFFS-0.6.31-<hash>
+      # The message points at credentials, but the token was correct all
+      # along (classic PAT, `public_repo`, valid to 2027) — the branch
+      # simply could not be cut from a stale base.  Syncing the fork fixed
+      # it on the next attempt with no credential change whatsoever.
+      #
+      # This recurs by construction: every release that lands more than a
+      # few weeks after the previous one re-opens the same gap, because
+      # winget-pkgs moves constantly and nothing else ever pushes to the
+      # fork.  Syncing here makes the submission self-healing.
+      #
+      # `continue-on-error`: a sync hiccup must not block the submission —
+      # if the fork happens to be current, komac proceeds fine regardless.
+      # The `||` fallback keeps the step green while still surfacing the
+      # reason in the log.
+      - name: Sync winget-pkgs fork with upstream
+        if: steps.token.outputs.present == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          FORK_USER: githubrobbi
+        shell: bash
+        run: |
+          set -uo pipefail
+          before="$(gh api "repos/${FORK_USER}/winget-pkgs/commits/master" --jq .sha 2>/dev/null || echo unknown)"
+          upstream="$(gh api repos/microsoft/winget-pkgs/commits/master --jq .sha 2>/dev/null || echo unknown)"
+          if [[ "$before" == "$upstream" && "$before" != unknown ]]; then
+            echo "Fork already in sync at ${before}."
+            exit 0
+          fi
+          echo "Fork ${before} behind upstream ${upstream} — fast-forwarding."
+          gh api -X POST "repos/${FORK_USER}/winget-pkgs/merge-upstream" \
+            -f branch=master --jq '.message' \
+            || echo "::warning title=Fork sync failed::Could not fast-forward ${FORK_USER}/winget-pkgs; komac may fail to create its manifest branch."
+          after="$(gh api "repos/${FORK_USER}/winget-pkgs/commits/master" --jq .sha 2>/dev/null || echo unknown)"
+          echo "Fork now at ${after} (upstream ${upstream})."
+
+      - name: Submit manifest to winget-pkgs
+        if: steps.token.outputs.present == 'true'
+        uses: vedantmgoyal9/winget-releaser@4ffc7888bffd451b357355dc214d43bb9f23917e # v2
+        with:
+          identifier: SkyLLC.UFFS
+          # Match the Windows ZIP asset uploaded by release.yml. The
+          # action derives the package version from the release tag,
+          # stripping the leading `v` (v0.5.102 → 0.5.102).
+          installers-regex: 'uffs-windows-x64\.zip$'
+          release-tag: ${{ inputs.release-tag }}
+          # The account that owns the microsoft/winget-pkgs fork komac
+          # pushes the manifest branch to.  MUST match the account that
+          # owns WINGET_TOKEN — i.e. the maintainer who submitted the
+          # original PR microsoft/winget-pkgs#378294, NOT the `skyllc-ai`
+          # org (the action's default `github.repository_owner`, which
+          # has no winget-pkgs fork).
+          fork-user: githubrobbi
+          token: ${{ secrets.WINGET_TOKEN }}
+
+      # ── Auto-seed the extra nested aliases (fully automatic) ─────────────
+      #
+      # komac PRESERVES the previous manifest's NestedInstallerFiles but never
+      # auto-adds executables newly bundled into the zip.  So `uffs-update`
+      # (every tier) and `uffs-broker` (since v0.5.122) would NOT be installed
+      # by winget unless they are seeded into the manifest exactly once.  This
+      # step does that automatically, on the PR komac just opened, using the
+      # SAME WINGET_TOKEN (which can push to the fork) — so the winget package
+      # always installs the full binary set with NO manual step.
+      #
+      # Flow per release, hands-off end to end: flip the PR to **draft**
+      # (transient gate so nothing can merge mid-seed) → seed the manifest →
+      # push → **release the draft** (`gh pr ready`) so it proceeds straight to
+      # winget validation.  If the fork doesn't support drafts, the seed still
+      # happens and the PR stays ready.
+      #
+      # Resilient by design: every recoverable condition (PR not found yet,
+      # manifest absent, draft unsupported, nothing to seed, push failed)
+      # exits 0 with a warning, so the manual fallback in
+      # packaging/winget/README.md still applies and a hiccup never looks like
+      # a release failure.
+      - name: Seed nested aliases into the komac PR (auto-seed + release)
+        if: steps.token.outputs.present == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release-tag }}
+          FORK_USER: githubrobbi
+        shell: bash
+        run: |
+          set -uo pipefail
+          VERSION="${RELEASE_TAG#v}"
+
+          # Release the draft (best-effort) so the PR proceeds to validation.
+          # Reads $PR_URL at call time. A no-op if the PR was never drafted.
+          release_draft() {
+            if gh pr ready "$PR_URL" 2>/dev/null; then
+              echo "Released draft → winget validation."
+            else
+              echo "::notice::Could not auto-release the draft; mark ready manually: gh pr ready ${PR_URL}"
+            fi
+          }
+
+          echo "Locating the komac-opened SkyLLC.UFFS ${VERSION} PR on microsoft/winget-pkgs..."
+
+          # komac opens the PR asynchronously — poll for it.
+          PR_JSON=""
+          for attempt in $(seq 1 12); do
+            PR_JSON=$(gh pr list --repo microsoft/winget-pkgs \
+              --author "$FORK_USER" --state open \
+              --search "SkyLLC.UFFS ${VERSION}" \
+              --json number,url,title,headRefName --limit 10 2>/dev/null \
+              | jq -c --arg v "$VERSION" \
+                  '[.[] | select((.title + " " + .headRefName) | contains($v))][0] // empty')
+            [[ -n "$PR_JSON" ]] && break
+            echo "  not found yet (attempt ${attempt}/12); waiting 20s..."
+            sleep 20
+          done
+
+          if [[ -z "$PR_JSON" ]]; then
+            echo "::warning title=winget PR not found::Could not locate the SkyLLC.UFFS ${VERSION} PR within the poll window. Seed it manually per packaging/winget/README.md once komac's PR appears."
+            exit 0
+          fi
+
+          PR_URL=$(jq -r '.url' <<<"$PR_JSON")
+          PR_BRANCH=$(jq -r '.headRefName' <<<"$PR_JSON")
+          echo "Found PR ${PR_URL} (branch ${PR_BRANCH})"
+
+          # Draft gate (best-effort) — block any auto-merge before the seed.
+          if gh pr ready "$PR_URL" --undo 2>/tmp/draft.err; then
+            echo "Converted PR to draft."
+          else
+            echo "::notice::Could not draft the PR (fork drafts may be unsupported): $(cat /tmp/draft.err 2>/dev/null). Continuing to seed; PR stays ready."
+          fi
+
+          # Clone the fork PR branch and run the canonical-alias seeder.
+          rm -rf forkpr
+          if ! git clone --depth 1 --branch "$PR_BRANCH" \
+                 "https://x-access-token:${GH_TOKEN}@github.com/${FORK_USER}/winget-pkgs.git" forkpr 2>/dev/null; then
+            echo "::warning::Could not clone the fork PR branch ${PR_BRANCH}; seed manually."
+            exit 0
+          fi
+          MANIFEST="forkpr/manifests/s/SkyLLC/UFFS/${VERSION}/SkyLLC.UFFS.installer.yaml"
+          if [[ ! -f "$MANIFEST" ]]; then
+            echo "::warning::Expected manifest ${MANIFEST} not found; seed manually."
+            exit 0
+          fi
+
+          # The seeder reads packaging/winget/nested-aliases.yaml from THIS repo
+          # (checked out above) and edits the fork manifest in place. Idempotent.
+          if ! "${GITHUB_WORKSPACE}/scripts/dev/winget_seed_aliases.sh" "${GITHUB_WORKSPACE}/${MANIFEST}"; then
+            echo "::warning::Seeder reported a problem; seed manually per packaging/winget/README.md."
+            exit 0
+          fi
+
+          cd forkpr || { echo "::warning::cannot enter forkpr; seed manually."; exit 0; }
+          if git diff --quiet; then
+            echo "No new aliases to seed — manifest already complete."
+            release_draft   # nothing to push, but still release the draft
+            exit 0
+          fi
+          git config user.name  "uffs-winget-bot"
+          git config user.email "50460704+githubrobbi@users.noreply.github.com"
+          git commit -am "Seed nested aliases (uffs-update, uffs-broker, uffs-tui) for SkyLLC.UFFS ${VERSION}"
+          if git push origin "HEAD:${PR_BRANCH}" 2>/dev/null; then
+            echo "Seeded + pushed to ${PR_BRANCH}."
+          else
+            echo "::warning::Seed committed but push failed; push HEAD:${PR_BRANCH} manually."
+            exit 0
+          fi
+
+          # Release the draft so the PR proceeds straight to winget validation.
+          # The draft was only a transient gate to block any merge mid-seed —
+          # with that done, the flow is fully hands-off (no manual mark-ready).
+          release_draft
+
+          {
+            echo "## WinGet PR auto-seeded + released"
+            echo "- PR: ${PR_URL}"
+            echo "- Branch: \`${PR_BRANCH}\`"
+            echo "- Seeded the canonical NestedInstallerFiles from \`packaging/winget/nested-aliases.yaml\` (uffs-update, uffs-broker, uffs-tui)."
+            echo "- Released the draft → fully automatic. Microsoft's bot now validates + merges on their side."
+          } >> "$GITHUB_STEP_SUMMARY"

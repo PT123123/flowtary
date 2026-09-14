@@ -66,6 +66,10 @@ Copy-Item (Join-Path $src 'ImageReader.exe')     (Join-Path $dest 'ImageReader.e
 if (Test-Path (Join-Path $src 'altsearch.exe')) {
     Copy-Item (Join-Path $src 'altsearch.exe')   (Join-Path $dest 'altsearch.exe') -Force
 }
+# UFFS 守护进程：altsearch.exe（适配层）按同目录查找 uffsd.exe
+if (Test-Path (Join-Path $src 'uffsd.exe')) {
+    Copy-Item (Join-Path $src 'uffsd.exe')       (Join-Path $dest 'uffsd.exe') -Force
+}
 if (Test-Path (Join-Path $src 'dict')) {
     Copy-Item (Join-Path $src 'dict') (Join-Path $dest 'dict') -Recurse -Force
 }

@@ -1,0 +1,102 @@
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  UFFS Validation Test Definitions — Manifest
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#
+#  Shared test definitions consumed by both:
+#    - scripts/windows/cli-validation  (CLI validation)
+#    - scripts/windows/api-validation.rs       (JSON-RPC API validation)
+#
+#  Tests are split into per-group files under definitions/:
+#
+#    definitions/
+#    ├── 00-warmup.toml         Warmup / baseline tests
+#    ├── 01-general.toml        General search (pattern, limit, drives)
+#    ├── 02-filters.toml        Filter flags (--files, --dirs, --min-size…)
+#    ├── 03-sort.toml           Sort flags (--sort, --sort-dir)
+#    ├── 04-attributes.toml     Attribute filters (--hidden, --system…)
+#    ├── 05-time.toml           Time range filters (--newer, --older…)
+#    ├── 06-output.toml         Output format (--format, --columns, --out)
+#    ├── 07-search-mode.toml    Search mode (--regex, --exact, --ext…)
+#    ├── 08-combined.toml       Combined flag interactions
+#    ├── 09-aggregation.toml    Aggregation (--agg terms/stats/histogram…)
+#    ├── 10-error.toml          Error handling / invalid input
+#    └── 11-rpc.toml            Daemon RPC methods (status, drives, stats)
+#
+#  The validation scripts scan definitions/*.toml and merge all [[test]]
+#  entries.  Files are loaded in lexicographic order (00- first, 11- last).
+#
+#  To add new tests: create entries in the appropriate group file, or add
+#  a new file with the next sequence number.
+#
+#  ── Field reference ──────────────────────────────────────────────────
+#
+#  id           Required. Unique test ID (e.g. "T01", "S3A.1").
+#  group        Required. Logical group (e.g. "general", "filters",
+#               "sort", "aggregation", "output", "time", "error").
+#  name         Required. Short test name shown in the runner
+#               (e.g. "--files-only").
+#  title        Required. Human-readable title for reports.
+#  short_desc   Required. One-line description.
+#  long_desc    Optional. Multi-line description with rationale.
+#
+#  cli_args     Required. CLI arguments as an array of strings.
+#               The runner prepends the binary path and appends
+#               source flags (--data-dir / --mft-file).
+#  cli_format   Optional. Default "csv". Override with "json" or "table"
+#               if the test requires a specific output format.
+#
+#  rpc_method   Optional. JSON-RPC method name (default "search").
+#  rpc_params   Optional. JSON-RPC params as an inline JSON string.
+#               If omitted, derived from cli_args automatically.
+#
+#  ── Declarative validators ───────────────────────────────────────────
+#
+#  All are optional. When present, the runner checks each assertion
+#  and fails the test on the first violation.
+#
+#  expect_exit_code     Expected exit code (default 0).
+#  expect_min_rows      Minimum number of result rows (inclusive).
+#  expect_max_rows      Maximum number of result rows (inclusive).
+#
+#  expect_columns_all   If true, adds "--columns all" to CLI args
+#                       so column checks have all fields available.
+#
+#  [[test.column_checks]]  Per-row column assertions (array of tables):
+#    column      Column header name (e.g. "Directory Flag", "Size").
+#    op          "eq", "ne", "contains", "not_contains",
+#                "starts_with", "not_starts_with",
+#                "ends_with", "gt", "gte", "lt", "lte".
+#    value       String comparison value. For numeric ops (gt/gte/lt/lte)
+#                the value is parsed as u64.
+#    case        Optional. "lower" to lowercase before comparing.
+#
+#  [[test.sort_checks]]  Verify output is sorted:
+#    column      Column to check sort order on.
+#    order       "asc" or "desc".
+#    type        "u64" or "string" (default "u64").
+#
+#  stdout_contains      Array of substrings that must appear in stdout.
+#  stdout_not_contains  Array of substrings that must NOT appear.
+#  stderr_contains      Array of substrings that must appear in stderr.
+#
+#  [[test.json_checks]]  JSON output assertions (for --format json):
+#    path        JSONPath-like dot-notation (e.g. "buckets[0].key").
+#    op          "exists", "eq", "ne", "gt", "gte", "lt", "lte",
+#                "is_array", "array_len_gte".
+#    value       Expected value (as string; parsed per type).
+#
+#  validator    Optional. Name of a custom validator function in the
+#               script for complex checks that can't be declarative.
+#               When set, declarative checks still run first, then the
+#               custom validator runs on the raw output.
+#
+#  targets      Optional array of strings. Which runners should execute
+#               this test. Values: "cli", "api", "mcp".
+#               Default (if omitted): ["cli", "api"]
+#               Use ["api"] for API-only tests (e.g. facet_values RPC).
+#               Use ["cli"] for CLI-only tests (e.g. --out file).
+#
+#  skip         Optional bool. If true, test is skipped (for WIP tests).
+#  tags         Optional array of strings for filtering (e.g. ["slow"]).
+#
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

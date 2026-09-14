@@ -1,0 +1,140 @@
+# SPDX-License-Identifier: MPL-2.0
+# Copyright (c) 2025-2026 SKY, LLC.
+#
+# UFFS — nextest repository configuration
+# https://nexte.st/docs/configuration/reference/
+
+# Require nextest ≥ 0.9.130 (flaky-result, fail-fast object, run-extra-args)
+nextest-version = { required = "0.9.130", recommended = "0.9.132" }
+
+# ---------------------------------------------------------------------------
+# Default profile — local development
+# ---------------------------------------------------------------------------
+[profile.default]
+# Auto-detect CPUs; reserve 2 for the OS / IDE / language server.
+test-threads = -2
+retries = 0
+fail-fast = true
+
+slow-timeout = { period = "120s", terminate-after = 2, grace-period = "10s" }
+leak-timeout = "100ms"
+
+failure-output = "immediate-final"
+success-output = "never"
+status-level = "pass"
+final-status-level = "flaky"
+
+# ---------------------------------------------------------------------------
+# CI profile — conservative, deterministic, full diagnostics
+# Usage: cargo nextest run --profile ci
+# ---------------------------------------------------------------------------
+[profile.ci]
+test-threads = 4
+retries = { backoff = "exponential", count = 3, delay = "1s", max-delay = "10s", jitter = true }
+fail-fast = false
+flaky-result = "fail"
+
+slow-timeout = { period = "300s", terminate-after = 3, grace-period = "15s" }
+leak-timeout = "500ms"
+
+failure-output = "immediate-final"
+success-output = "never"
+status-level = "skip"
+final-status-level = "all"
+
+[profile.ci.junit]
+path = "junit.xml"
+report-name = "uffs-ci"
+store-success-output = false
+store-failure-output = true
+
+# ---------------------------------------------------------------------------
+# pre-push-smoke — mandatory fast test subset at git-push time (Phase 1 of
+# dev-flow-implementation-plan.md § 3).  Budget: 10-20 s warm on a developer
+# laptop.
+# Usage: cargo nextest run --profile pre-push-smoke --locked
+#
+# Selection is a denylist expressed in nextest's filterset language:
+#   - Exclude the validation suite (`validate_*`) — heavy integration,
+#     runs in the CI `ci` profile.  (Pre-2026-05 these were named
+#     `test_validate_*`; renamed workspace-wide for clippy::redundant_test_prefix.)
+#   - Exclude the entire `uffs-client` package — its shmem tests serialise
+#     globally via `threads-required = num-cpus` and would dominate wall-time.
+#   - Everything else: unit tests across all remaining crates.
+#
+# Long term: replace package-level denylist with per-test overrides that
+# carry an explicit `slow` attribute, so the filter becomes
+# `not attr(slow)` rather than a list of package / binary names.
+# ---------------------------------------------------------------------------
+[profile.pre-push-smoke]
+test-threads = -2
+retries = 0
+fail-fast = true
+
+slow-timeout = { period = "30s", terminate-after = 1 }
+leak-timeout = "100ms"
+
+failure-output = "immediate-final"
+success-output = "never"
+status-level = "fail"
+final-status-level = "flaky"
+
+default-filter = """
+    not test(/^validate/)
+  & not package(uffs-client)
+"""
+
+# ---------------------------------------------------------------------------
+# Slow / integration profile — for #[ignore] tests on Windows with live MFT
+# Usage: cargo nextest run --profile slow --run-ignored ignored-only
+# ---------------------------------------------------------------------------
+[profile.slow]
+test-threads = 4
+retries = 1
+fail-fast = false
+
+slow-timeout = { period = "600s", terminate-after = 3 }
+leak-timeout = "1s"
+
+failure-output = "immediate-final"
+final-status-level = "all"
+
+# ---------------------------------------------------------------------------
+# Per-test overrides
+# ---------------------------------------------------------------------------
+# Integration / validation tests are heavyweight (disk I/O, large DataFrames).
+[[profile.default.overrides]]
+filter = 'test(/^validate/)'
+threads-required = 2
+slow-timeout = { period = "300s", terminate-after = 2 }
+
+# Shmem tests share a global temp directory — the GC test sweeps ALL .bin
+# files, racing with write/read tests in other nextest processes.
+# Serialise them so only one shmem test runs at a time.
+[[profile.default.overrides]]
+filter = 'package(uffs-client) & test(shmem::)'
+threads-required = 'num-cpus'
+
+[[profile.ci.overrides]]
+filter = 'package(uffs-client) & test(shmem::)'
+threads-required = 'num-cpus'
+
+# The `tests_perf` suite asserts WALL-CLOCK budgets (e.g. tree metrics
+# under 100 ms for 100 K files).  Run under the normal fan-out — 2 400+
+# tests saturating every core — those numbers measure scheduler
+# contention, not the code: the same test that takes ~88 ms alone was
+# observed at 118 ms and 436 ms while the rest of the suite ran, i.e. a
+# false failure on an unchanged code path (verified by measuring the
+# identical test before and after the polars 0.54→0.55 bump: 86-93 ms vs
+# 88 ms).
+#
+# Give them the whole machine so the measurement means something.  The
+# budgets themselves are deliberately UNCHANGED — the fix is to measure
+# honestly, never to widen the threshold until it stops failing.
+[[profile.default.overrides]]
+filter = 'package(uffs-mft) & test(tests_perf::)'
+threads-required = 'num-cpus'
+
+[[profile.ci.overrides]]
+filter = 'package(uffs-mft) & test(tests_perf::)'
+threads-required = 'num-cpus'

@@ -1,0 +1,21 @@
+# File size exceptions for scripts/ci/check_file_size_policy.sh
+# Format: relative_path|reason
+# All files listed here MUST also have an `//! Exception:` comment in their first 60 lines.
+#
+# --- Permanent exceptions (documented justification) ---
+crates/uffs-core/src/search/field/field_metadata.rs|PERMANENT: Single const fn match table — one FieldMeta per FieldId variant; cannot be split without breaking the match
+crates/uffs-core/src/search/filters/tests.rs|PERMANENT: Integration test suite for filter pipeline; splitting further would scatter related test fixtures
+crates/uffs-core/src/search/filters/mod.rs|PERMANENT: Cohesive SearchFilters/SearchFilterParams definitions + from_params construction; kept together so the full per-field filter contract is auditable in one place
+crates/uffs-client/src/schema/field_metadata.rs|PERMANENT: Single const fn match table — one FieldMeta per FieldId variant; mirrors uffs-core version
+crates/uffs-mft/src/reader/index_read.rs|PERMANENT: Single impl MftReader block with tightly coupled cfg-gated pipeline stages
+crates/uffs-diag/src/bin/compare_scan_parity.rs|PERMANENT: Standalone diagnostic binary; single-file readability outweighs LOC policy for tooling
+crates/uffs-mcp/src/cookbook.rs|PERMANENT: Declarative JSON data (curated agent cookbook examples); splitting by line count would fragment the cohesive narrative
+crates/uffs-core/src/compact_cache.rs|PERMANENT: Serialize/deserialize pipeline for compact index cache (heap path + Phase 2b runtime mmap path), tightly coupled with shared parse_compact_body + assemble_compact_index helpers; tests already extracted to compact_cache/tests.rs sibling module
+crates/uffs-daemon/src/index/aggregation.rs|PERMANENT: Daemon-side aggregation dispatch; tightly coupled helpers, only 54 over limit
+crates/uffs-client/src/protocol/tests.rs|PERMANENT: Wire format round-trip test suite; splitting fragments test cohesion
+crates/uffs-core/src/search/backend_tests.rs|PERMANENT: Backend sort/filter integration test suite; shared fixtures require cohesion
+crates/uffs-core/src/search/query_tests.rs|PERMANENT: Integration query test suite; shared synthetic index fixture requires cohesion
+crates/uffs-core/src/aggregate/integration_tests.rs|PERMANENT: Aggregate engine integration test suite; shared synthetic drive fixture requires cohesion
+crates/uffs-mft/src/platform/volume.rs|PERMANENT: Volume handle + write-protect fallback handles; splitting would fragment the handle lifecycle
+crates/uffs-mft/src/platform/system.rs|PERMANENT: Cross-platform module covering Windows Win32 FFI (privilege, volume, drive detection) and Unix stubs (geteuid, /proc/meminfo, sysctl); splitting by OS would duplicate shared types or add indirection for marginal gain
+crates/uffs-daemon/src/lifecycle.rs|PERMANENT: LifecycleManager + LifecycleHandle + idle-timer state machine; splitting the cohesive run_idle_timer + load_stalled_force_retire + extended_timeout_for_activity cluster fragments the active-connection / load-stall / shutdown semantics across files
