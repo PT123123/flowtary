@@ -1,0 +1,84 @@
+# rpc tests
+# Auto-split from test-definitions.toml
+
+[[test]]
+id = "RPC.1"
+group = "rpc"
+name = "RPC.1 status method"
+title = "RPC.1 daemon status --json"
+short_desc = "Daemon status returns pid, uptime, status, and loaded drives"
+cli_args = ["daemon", "status", "--json"]
+targets = ["cli", "api"]
+rpc_method = "status"
+rpc_params = "{}"
+validator = "RPC.1"
+stdout_contains = ['"running"', '"pid"', '"uptime_secs"']
+
+[[test]]
+id = "RPC.2"
+group = "rpc"
+name = "RPC.2 drives method"
+title = "RPC.2 loaded drives"
+short_desc = "Drives method returns loaded drive info with record counts"
+cli_args = ["daemon", "status", "--json"]
+targets = ["cli", "api"]
+rpc_method = "drives"
+rpc_params = "{}"
+validator = "RPC.2"
+stdout_contains = ['"drives"', '"letter"', '"records"']
+
+[[test]]
+id = "RPC.3"
+group = "rpc"
+name = "RPC.3 info method"
+title = "RPC.3 info method"
+short_desc = "Info method looks up a file by path"
+cli_args = []
+targets = ["api"]
+rpc_method = "info"
+rpc_params = "{\"path\": \"C:\\\\Windows\\\\System32\\\\notepad.exe\"}"
+validator = "RPC.3"
+
+[[test]]
+id = "RPC.4"
+group = "rpc"
+name = "RPC.4 stats method"
+title = "RPC.4 daemon status --json (stats folded in)"
+short_desc = "Daemon performance stats: uptime, records, queries"
+cli_args = ["daemon", "status", "--json"]
+targets = ["cli", "api"]
+rpc_method = "stats"
+rpc_params = "{}"
+validator = "RPC.4"
+stdout_contains = ['"stats"', '"total_records"', '"total_queries"']
+
+# RPC.5 — negative-path test for JSON-RPC unknown-method handling.
+#
+# Calls a method name the daemon does not know and expects a
+# structured JSON-RPC error response with code -32601
+# (MethodNotFound), not a crash and not a silent success.  This
+# mirrors the M700 MCP test (which covers the same daemon-layer
+# behaviour via the MCP tool-call envelope) and the daemon's own
+# integration test at
+# `crates/uffs-daemon/tests/ipc_integration.rs:209-218`.
+#
+# `expect_error = true` tells api-validation.rs to:
+#   1. Require the RPC response to contain `error` (not `result`).
+#   2. Pass the FULL response to the `RPC.5` custom validator so it
+#      can inspect the error code / message.
+#   3. Skip the normal row/column/sort/anti-vacuous checks.
+#
+# Not targeted at CLI: the CLI does not expose arbitrary JSON-RPC
+# methods — only specific subcommands (daemon status, stats, etc.) —
+# so there's no surface to test "unknown method" at the CLI layer.
+[[test]]
+id = "RPC.5"
+group = "rpc"
+name = "RPC.5 unknown method"
+title = "RPC.5 unknown method returns JSON-RPC error"
+short_desc = "Calling a nonexistent RPC method returns -32601 (MethodNotFound)"
+targets = ["api"]
+rpc_method = "this_method_does_not_exist"
+rpc_params = "{}"
+expect_error = true
+validator = "RPC.5"

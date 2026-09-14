@@ -27,5 +27,9 @@ Copy-Item (Join-Path $src 'filedlg_agent32.exe')(Join-Path $Dist 'filedlg_agent3
 if (Test-Path (Join-Path $src 'altsearch.exe')) {
     Copy-Item (Join-Path $src 'altsearch.exe')  (Join-Path $Dist 'altsearch.exe') -Force
 }
+# UFFS 守护进程：altsearch.exe（适配层）按同目录查找 uffsd.exe
+if (Test-Path (Join-Path $src 'uffsd.exe')) {
+    Copy-Item (Join-Path $src 'uffsd.exe')  (Join-Path $Dist 'uffsd.exe') -Force
+}
 
 Write-Host ("[ok] {0}\flowtary-{1}.exe" -f $Dist, $ver)

@@ -22,3 +22,7 @@ build_vs/
 .zcode/
 # Runtime logs
 logs/
+
+# rustc-wrapper 编译产物（可从 main.rs 重建）
+tools/rustc-wrapper/*.exe
+tools/rustc-wrapper/*.pdb

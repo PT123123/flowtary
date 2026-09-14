@@ -322,25 +322,38 @@ foreach(_t yoga Ling Clipper2 TinyOCR)
 endforeach()
 
 # =====================================================================
-# alt-search（Fork 自 AlternativeLua/alt-search c3dd357，MIT）→ altsearch.exe
-#   Rust 实现的文件名索引/搜索守护进程，Flowtary 的 d/f 搜索后端
-#   （替代 Everything IPC；找不到本 exe 时自动回退 Everything）。
-#   与其余 vendor 不同：本目录源码为仓库内置 fork（需本地修改，非 submodule），
-#   通过 cargo 构建，产物复制到 build\ 与 flowtary.exe 同目录。
+# UltraFastFileSearch（MPL-2.0，vendor/UltraFastFileSearch）→ altsearch.exe + uffsd.exe
+#   Flowtary 的 d/f 搜索后端（替代 Everything IPC；找不到本 exe 时自动回退 Everything）。
+#   altsearch.exe —— ALTSEARCH 协议适配层（CLI/协议与旧版完全一致，main.cpp 零改动）；
+#   uffsd.exe    —— UFFS 守护进程：直接读 NTFS MFT 二进制记录建索引（无全盘目录遍历）、
+#                   USN Journal 增量更新、持久化索引缓存热启（启动不再全盘扫描）。
+#   适配层按“同目录”查找 uffsd.exe，两个产物必须复制到同一目录。
+#   构建需要 nightly-2026-08-21（rust-toolchain.toml pin；RUSTUP_TOOLCHAIN 显式指定，
+#   避免本机工具链组件记录不一致导致的 rustup 同步失败），首次构建含 polars 较慢
+#   （产物缓存于 vendor/UltraFastFileSearch/target）。
+#   .cargo/config.toml 的 rustc-wrapper 在 Windows 需原生转发器（cmd 版有 8K 命令行
+#   上限，windows-sys 的 rustc 参数会超长），见 tools/rustc-wrapper/。
 #   未安装 Rust 工具链时跳过，不影响主构建。
 # =====================================================================
-set(ALTSEARCH_DIR "${CMAKE_CURRENT_SOURCE_DIR}/alt-search")
-if(EXISTS "${ALTSEARCH_DIR}/Cargo.toml")
+set(UFFS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/UltraFastFileSearch")
+if(EXISTS "${UFFS_DIR}/Cargo.toml")
   find_program(CARGO_EXECUTABLE cargo)
   if(CARGO_EXECUTABLE)
-    set(ALTSEARCH_EXE "${ALTSEARCH_DIR}/target/release/altsearch.exe")
+    set(RUSTC_WRAPPER_EXE "${CMAKE_CURRENT_SOURCE_DIR}/../tools/rustc-wrapper/rustc-wrapper.exe")
     add_custom_target(altsearch ALL
-      COMMAND "${CARGO_EXECUTABLE}" build --release
+      COMMAND ${CMAKE_COMMAND} -E env
+        "RUSTUP_TOOLCHAIN=nightly-2026-08-21"
+        "RUSTC_WRAPPER=${RUSTC_WRAPPER_EXE}"
+        "${CARGO_EXECUTABLE}" build --profile debug-optimized -p altsearch -p uffs-daemon
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${ALTSEARCH_EXE}" "${CMAKE_BINARY_DIR}/altsearch.exe"
-      BYPRODUCTS "${ALTSEARCH_EXE}"
-      WORKING_DIRECTORY "${ALTSEARCH_DIR}"
-      COMMENT "[vendor] cargo build alt-search -> altsearch.exe"
+        "${UFFS_DIR}/target/debug-optimized/altsearch.exe" "${CMAKE_BINARY_DIR}/altsearch.exe"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${UFFS_DIR}/target/debug-optimized/uffsd.exe" "${CMAKE_BINARY_DIR}/uffsd.exe"
+      BYPRODUCTS
+        "${UFFS_DIR}/target/debug-optimized/altsearch.exe"
+        "${UFFS_DIR}/target/debug-optimized/uffsd.exe"
+      WORKING_DIRECTORY "${UFFS_DIR}"
+      COMMENT "[vendor] cargo build UFFS -> altsearch.exe + uffsd.exe"
       VERBATIM)
   else()
     message(STATUS "[vendor] 未找到 cargo，跳过 altsearch.exe 构建"

@@ -13,7 +13,7 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
 
 | 输入 | 行为 |
 | :--- | :--- |
-| `f {关键词}` | 只搜本地**文件**，回车直接打开（后端优先 alt-search 守护进程，回退 Everything） |
+| `f {关键词}` | 只搜本地**文件**，回车直接打开（后端优先 UFFS 守护进程，回退 Everything） |
 | `d {关键词}` | 只搜本地**文件夹**，回车在资源管理器打开（后端同上） |
 | `bd {q}` | 百度 `https://www.baidu.com/#ie=UTF-8&wd={q}` |
 | `bili {q}` | B站 `https://search.bilibili.com/all?keyword={q}` |
@@ -156,14 +156,16 @@ make release     # 版本自增 + 完整构建 + 输出到 dist\（可用 OUT= �
 make clean       # 清理 CMake 生成的产物
 ```
 需要 VS 2022 / Build Tools 的 C++ 工作负载（x64 + x86）、CMake、GNU make、ninja（需在 PATH 中）；
-底层由 CMake 生成 Ninja 构建文件。`d/f` 搜索后端 altsearch.exe 由 vendor 里的 Rust 源码经
-cargo 构建（需 Rust 工具链；缺 cargo 时跳过构建，搜索自动回退 Everything IPC，不影响主程序）。
+底层由 CMake 生成 Ninja 构建文件。`d/f` 搜索后端 altsearch.exe（+ uffsd.exe）由
+vendor/UltraFastFileSearch（Rust）经 cargo 构建，需 nightly-2026-08-21 工具链
+（首次构建含 polars 依赖耗时较长；缺 cargo 时跳过构建，搜索自动回退 Everything IPC）。
 
 ```text
 build\flowtary.exe   :: 主程序，启动后无主窗口、常驻托盘，可被全局热键唤出
-build\altsearch.exe  :: d/f 搜索后端守护进程（vendor/alt-search Rust 源码构建）
+build\flowtary.exe   :: 主程序，启动后无主窗口、常驻托盘，可被全局热键唤出
+build\altsearch.exe  :: d/f 搜索后端协议适配层（vendor/UltraFastFileSearch，UFFS）
+build\uffsd.exe      :: UFFS 索引守护进程（NTFS MFT 直读 + USN Journal 增量）
 build\evtest.exe     :: Everything IPC 协议冒烟测试工具（控制台）
-```
 
 > **热键占用提示**：若 `Alt + Space` 已被其他程序（如 Flow.Launcher）注册，启动时会弹窗
 > 提示一次，并自动改用备用热键 `Alt + Q`。本机实测：稳态工作集 0.3~5MB、私有内存约
@@ -173,35 +175,45 @@ build\evtest.exe     :: Everything IPC 协议冒烟测试工具（控制台）
 
 `d`/`f` 搜索后端按可用性自动选择：
 
-1. **alt-search 守护进程（默认）**：常驻单例（监听 `127.0.0.1:47771`），由 flowtary
-   按需 detached 拉起同目录 `altsearch.exe --serve`，**独立于 flowtary 存活**——首次
-   全盘索引耗时较长（索引遍历限流在 2~4 线程，约 15~25% CPU），跨多次 flowtary 重启
-   也只需完成一次，之后每次启动从版本化缓存秒级恢复；文件系统事件增量更新，SIMD
-   名字查询毫秒级返回完整路径。索引未就绪时 d/f 显示「索引建立中」并暂用 Everything；
-   守护进程空闲半小时（无客户端）自动落盘退出。
+1. **UFFS 适配层守护进程（默认）**：常驻单例（监听 `127.0.0.1:47771`），由 flowtary
+   按需 detached 拉起同目录 `altsearch.exe --serve`（协议适配层），内部驱动同目录
+   `uffsd.exe`（UFFS 守护进程，**Everything 同款架构**）：直接读 NTFS MFT 二进制记录
+   建索引（顺序 I/O，首次冷建远快于目录遍历且 CPU 占用低）、USN Journal 轮询增量更新
+   （守护进程存活期间不漏变更）、持久化索引热启（秒级恢复，**启动不再全盘扫描**）。
+   索引未就绪时 d/f 显示「索引建立中」并暂用 Everything；空闲半小时（无客户端）退出，
+   uffsd 空闲 24h 才退休，下次启动通常直接复用（无 UAC、无 CPU 尖峰）。
 2. **Everything IPC（回退）**：守护进程不可用且 Everything 1.4+ 正在后台运行时走原有
    `WM_COPYDATA` 协议。
 3. **兜底项**：连 Everything 也未运行时，列表给出降级项「在 Everything 中搜索：…」，
    回车以 `everything.exe -search "file:xxx"` 方式打开 Everything 窗口完成搜索
    （`everything.exe` 依次在 Program Files、`%LOCALAPPDATA%`、exe 同目录及 PATH 中查找）。
 
-## d/f 搜索后端说明：alt-search（替代 Everything）
+## d/f 搜索后端说明：UltraFastFileSearch（UFFS，替代 Everything）
 
-`d/f` 搜索由内置的开源 [AlternativeLua/alt-search](https://github.com/AlternativeLua/alt-search)
-fork（MIT，`vendor/alt-search/`，Rust 实现）承担，flowtary 本体保持零依赖：
+`d/f` 搜索由开源 [skylic-ai/UltraFastFileSearch](https://github.com/skyllc-ai/UltraFastFileSearch)
+（MPL-2.0，`vendor/UltraFastFileSearch/`，Rust）承担，flowtary 本体保持零依赖；本地新增
+`crates/altsearch-adapter`（协议适配层，产物 `altsearch.exe`）与 UFFS 自带的守护进程
+`uffsd.exe`：
 
-- **常驻单例守护进程**（`altsearch.exe --serve`，端口 47771）：独立于 flowtary 生命周期
-  （detached 启动，主程序退出不影响首次索引的建立）；加载/建完索引才发 READY；无客户端
-  空闲 30 分钟自动落盘退出，下次使用时再被拉起并从缓存恢复。首次索引用 `--threads`
-  限流（默认按核数压到 2~4 线程），范围与力度可用 `--dir`/`--reindex`/`--threads` 调整。
-  行协议（localhost TCP）：连接后 `ALTSEARCH` 握手 → `STATUS`/`READY` → 查询
-  `Q<TAB>模式(f/d)<TAB>条数<TAB>关键词` → `N<TAB>条数` + 每行 `d|f<TAB>完整路径`。
-- **查询层**：所有小写文件名拼进连续缓冲区，`memchr` SIMD 子串扫描（160 万条目命中
-  ~7ms、未命中全扫 ~4ms，替代原实现 ~100-230ms 的逐名 contains）；前缀命中 > 词边界
-  命中 > 普通包含的排序，多词 AND，按文件/文件夹过滤，top-N 截断。
-- **缓存版本化**：`cache.bin`（`%APPDATA%\AltSearch\`）带格式版本号，alt-search 代码
-  迭代（搜索逻辑/守护进程改动）不影响既有索引复用；只有序列化结构真正变化时才升
-  版本触发一次重建。根目录列表也存入缓存，范围变化自动重建。
+- **Everything 同款索引架构**：`uffsd` 打开 NTFS 卷的原始句柄，直接解析 MFT 二进制
+  FILE 记录建索引（不做全盘目录遍历，冷建快且 CPU 低）；运行期轮询 USN Journal 应用
+  增量（创建/删除/改名/写入），守护进程停机期间的变更也不遗漏；索引持久化缓存，
+  重启秒级热启，**启动不再做全量扫描**——这正是旧 alt-search 每次启动 CPU 狂飙的根因。
+- **适配层**（`altsearch.exe --serve`，端口 47771）：CLI 与行协议和旧版完全一致，
+  flowtary 主程序零改动。连接后 `ALTSEARCH` 握手 → `STATUS`/`READY` → 查询
+  `Q<TAB>模式(f/d)<TAB>条数<TAB>关键词` → `N<TAB>条数` + 每行 `d|f<TAB>完整路径`；
+  多关键词保 AND 语义（首词走 UFFS 检索，其余词在文件名上过滤）。
+- **已修复的上游 bug（vendor 内直接改）**：`uffs-core` trigram/前缀搜索路径原先
+  **先按条数截断候选、之后才应用 f/d 类型过滤**，导致 `Q f`/`Q d` 结果塌缩为 1 条
+  （候选前几条恰好全是被排除的类型时，有效匹配被提前丢弃）。已把 `filter_mode`
+  过滤并入 per-record 阶段（截断之前），`Q f`/`Q d` 均按类型返回完整结果。
+- **常驻 CPU 调优**：适配层默认设 `UFFS_USN_POLL_INTERVAL_MS=2000`（未显式设置时），
+  USN 轮询从 500ms 放宽到 2s，变化累积后一起应用，搜索新鲜度不受影响；安静时段
+  daemon 实测近 0% CPU（默认 500ms 时约 12% 单核）。
+- **权限模型**：读 MFT 需要管理员。首次拉起 daemon 时经一次 UAC 提权
+  （`--no-elevate` 可关）；之后 `uffsd` 常驻（空闲 24h 退休），日常启动直接复用。
+  更彻底的无感方案是安装 `uffs-broker` Windows 服务（`uffs-broker --install`，一次性
+  提权），daemon 即可长期以普通用户运行、永不弹 UAC。
 - **接入方式**：flowtary 侧仅用 localhost TCP + 一个工作线程（断线自动重连、代数计数
   丢弃过期回复），回复进入与 Everything 回复同一条处理链（排除路径过滤 → 点击权重
   重排 → 取前 10 展示）。
@@ -228,11 +240,13 @@ fork（MIT，`vendor/alt-search/`，Rust 实现）承担，flowtary 本体保持
 ```
 src/main.cpp         全部实现（Everything IPC / 网页指令 / 程序枚举匹配 / 拼音搜索 / 自绘 UI / 热键）
 tools/evtest.cpp     Everything IPC 协议测试工具
+tools/rustc-wrapper/ Windows rustc 原生转发器（UFFS .cargo/config.toml 的 rustc-wrapper 需要）
 vendor/ScreenCapture/  截图工具源码（git submodule，xland/ScreenCapture 2.4.25），构建产物 ScreenCapture.exe
 vendor/Ling/           GUI 框架源码（git submodule，xland/Ling），OCR 链依赖
 vendor/TinyOCR/        OCR 推理引擎源码（git submodule，xland/TinyOCR），基于 onnxruntime
 vendor/ImageReader/    OCR 独立进程源码（git submodule，xland/ImageReader 1.0.2），构建产物 ImageReader.exe
-vendor/alt-search/     d/f 搜索后端源码（内置 fork：AlternativeLua/alt-search c3dd357，MIT，Rust），构建产物 altsearch.exe
+vendor/UltraFastFileSearch/  d/f 搜索后端源码（skylic-ai/UltraFastFileSearch，MPL-2.0，Rust），
+                            构建产物 altsearch.exe（适配层）+ uffsd.exe（守护进程）
 vendor/CMakeLists.txt  第三方源码构建定义（不改动 submodule 内部，所有 target 在此声明）
 cmake/msvc-include.cmake  MSVC include 路径自动检测（解决 ninja 生成器不传递 SDK 头文件路径的问题）
 cmake/wrapper/Util.h   Ling::Util 头文件包装（替换 MSVC 不完全支持的 C++20 template lambda 宏）
