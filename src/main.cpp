@@ -52,7 +52,8 @@ namespace ev {
 constexpr DWORD kCopyDataQueryW = 2;  // EVERYTHING_IPC_COPYDATAQUERYW
 constexpr DWORD kReplyBase      = 0x46540000;  // 回复消息基值，低 16 位放查询序号
 constexpr DWORD kFlagFolder     = 0x1;
-constexpr DWORD kMaxResults     = 10;
+constexpr DWORD kMaxResults     = 10;   // 展示上限：过滤后最多保留的结果行数
+constexpr DWORD kMaxFetch       = 50;   // 单次向 Everything 索取上限：过滤噪音后仍能凑满展示上限
 
 #pragma pack(push, 1)
 struct Query {
@@ -393,6 +394,10 @@ struct App {
     bool beautifySaved = true; // 设置窗打开时的初始值（取消时回退）
     bool antiGhost = false;    // 抗残影双缓冲（实验性）：开启 WS_EX_COMPOSITED 整窗双缓冲，消除切换 Tab 残影
     bool antiGhostSaved = false; // 设置窗打开时的初始值（取消时回退）
+    // 点开头文件夹过滤（默认开，UI 在设置「排除路径」Tab）：搜索文件/文件夹时，
+    // 路径中任一层目录名以 '.' 开头（.git / .vscode / .cache 等）即连同其内容一并跳过。
+    bool skipDotFolders = true;
+    bool skipDotFoldersSaved = true;  // 设置窗打开时的初始值（取消时回退）
     bool fdjEnabled = true;    // 文件对话框跳转总开关（默认开；UI 在设置「常规」Tab，不再放托盘菜单）
     bool fdjEnabledSaved = true;  // 设置窗打开时的初始值（取消时回退）
     bool topEnabled = true;    // top 命令开关（默认开：空格+top 回车置顶/取消置顶当前窗口）
@@ -961,11 +966,36 @@ static void RebuildExcludeNorm() {
     for (const auto& p : g.excludePaths) g.excludePathsNorm.push_back(NormalizePatternForExclude(p));
 }
 
-// 路径是否被排除：与 g.excludePaths 任一模式匹配（模式不含通配符时按前缀匹配）
+// 路径中是否含有「以 . 开头的目录层」（.git / .vscode / .cache 这类隐藏目录）。
+// lastIsDir = true 时最后一层也按目录算（搜索文件夹：.git 这类目录自身也要跳过）；
+// false 时忽略最后一层（搜索文件：`C:\proj\.gitignore` 在本层就是个文件，不算命中）。
+// 盘符（C:）与 UNC（\\server\share）前缀不参与判断；相对路径的非绝对成分照常按层处理。
+static bool PathHasDotFolder(const std::wstring& path, bool lastIsDir) {
+    if (path.empty()) return false;
+    std::wstring np = NormalizePathForExclude(path);  // 统一 '\\'，大小写对 '.' 判断无影响
+    size_t i = 0;
+    if (np.size() >= 2 && np[1] == L':') i = 2;       // 跳过盘符
+    while (i < np.size() && np[i] == L'\\') ++i;      // 跳过盘符后的分隔符 / UNC 前置
+    while (i < np.size()) {
+        size_t j = np.find(L'\\', i);
+        bool last = (j == std::wstring::npos);
+        if (last && !lastIsDir) break;                // 最后一层是文件：不参与判断
+        if (np[i] == L'.') return true;
+        if (last) break;
+        i = j + 1;
+        while (i < np.size() && np[i] == L'\\') ++i;  // 连续分隔符折叠
+    }
+    return false;
+}
+
+// 路径是否被排除：点开头文件夹开关（全局）+ g.excludePaths 任一模式命中
+// （模式不含通配符时按前缀匹配）
 // 匹配一律大小写不敏感：np 已小写，模式取 g.excludePathsNorm 里对应的归一化副本
 // （曾经直接拿用户原文比较，导致 `C:\$RECYCLE.BIN` 这类含大写的默认项永远不命中）。
-static bool IsPathExcluded(const std::wstring& path) {
-    if (g.excludePaths.empty() || path.empty()) return false;
+static bool IsPathExcluded(const std::wstring& path, bool lastIsDir = false) {
+    if (path.empty()) return false;
+    if (g.skipDotFolders && PathHasDotFolder(path, lastIsDir)) return true;
+    if (g.excludePaths.empty()) return false;
     std::wstring np = NormalizePathForExclude(path);
     for (size_t i = 0; i < g.excludePaths.size(); ++i) {
         const std::wstring& raw = g.excludePaths[i];
@@ -1468,7 +1498,7 @@ static void ExecuteEverythingQuery() {
     q->reply_copydata_message = g.expectReply;
     q->search_flags = 0;
     q->offset = 0;
-    q->max_results = ev::kMaxResults;
+    q->max_results = ev::kMaxFetch;
     memcpy(q->search_string, g.evQuery.c_str(), (len + 1) * sizeof(WCHAR));
 
     COPYDATASTRUCT cds{};
@@ -1489,10 +1519,10 @@ static void HandleEverythingReply(const COPYDATASTRUCT* cds) {
     const ev::List* list = (const ev::List*)cds->lpData;
 
     g.items.clear();
-    DWORD n = (std::min)(list->numitems, ev::kMaxResults);
+    DWORD n = (std::min)(list->numitems, ev::kMaxFetch);
     size_t headerBytes = sizeof(ev::List) - sizeof(ev::Item) + (size_t)n * sizeof(ev::Item);
     if (headerBytes > cds->cbData) n = 0;
-    int kept = 0;  // 排除路径过滤后仍向 Everything 索取的最大条数（保证展示满 10 行）
+    int kept = 0;  // 已保留的展示行数（过滤后凑满 kMaxResults 即停）
     int want = (int)ev::kMaxResults;
     for (DWORD i = 0; i < n && kept < want; ++i) {
         const ev::Item& it = list->items[i];
@@ -1510,7 +1540,8 @@ static void HandleEverythingReply(const COPYDATASTRUCT* cds) {
         } else {
             r.action = r.sub + L"\\" + r.title;
         }
-        if (IsPathExcluded(r.action)) continue;  // 排除命中：直接丢弃
+        // 排除命中：直接丢弃（文件夹结果连自身一起判，文件结果只看所在目录层）
+        if (IsPathExcluded(r.action, r.kind == Row::Folder)) continue;
         g.items.push_back(std::move(r));
         ++kept;
     }
@@ -2708,6 +2739,14 @@ static void LoadSettings() {
         g.antiGhost = v != 0;
     else
         g.antiGhost = false;  // 默认关（实验性）
+    // 点开头文件夹过滤（搜索时跳过 .git / .vscode / .cache 这类隐藏目录及其内容；默认开）
+    v = 1;
+    cb = sizeof(v);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"SkipDotFolders",
+                     RRF_RT_REG_DWORD, nullptr, &v, &cb) == ERROR_SUCCESS)
+        g.skipDotFolders = v != 0;
+    else
+        g.skipDotFolders = true;  // 默认开
     cb = sizeof(v);
     // 主题微调（透明度/圆角）：按主题读回 blob；主题数量变化时整体忽略（用预设默认）
     {
@@ -2994,13 +3033,23 @@ static std::wstring ExcludePathsToText(const std::vector<std::wstring>& pats) {
     return t;
 }
 
-// 默认排除项：每个本地盘符的回收站 + 系统还原信息 + 旧式 RECYCLER。
+// 排除默认项版本：升级时若注册表里缺失新版默认项则一次性补齐（合并后不再重复添加）。
+// 1 = 旧版（仅回收站等系统目录）；2 = 新增开发噪音过滤（node_modules/.git/__pycache__/备份文件）；
+// 3 = 点开头文件夹（.git / .vscode …）改由「不搜索点开头文件夹」开关统一处理，
+//     默认项里那三条硬编码的 .git/.vscode 条目撤销（否则开关关掉后 .git 依然搜不到）。
+constexpr DWORD kExcludeDefaultsVer = 3;
+
+// 默认排除项：每个本地盘符的回收站 + 系统还原信息 + 旧式 RECYCLER +
+// 开发/编辑器噪音（node_modules、__pycache__、备份与临时文件）。
+// 点开头文件夹（.git/.vscode/.cache 等）不在此列——那由「不搜索点开头文件夹」开关统一控制。
 // 用 GetLogicalDrives 动态展开，确保多盘用户也覆盖到。
 static std::wstring DefaultExcludePathsText() {
     std::wstring t =
         L"# 排除路径：每行一条，支持通配符 * ?。路径以排除项开头即视为命中（含整棵子树）。\r\n"
         L"# 作用于 Everything 搜索（d/f 前缀）与本地程序搜索的结果，网页与一键组不受影响。\r\n"
-        L"# 默认已排除各盘符下的回收站、系统还原信息等系统目录，可继续追加自定义路径。\r\n";
+        L"# 默认已排除各盘符回收站、系统目录，以及 node_modules/__pycache__ 等开发噪音目录\r\n"
+        L"# 和编辑器备份/临时文件（*~、~$、*.swp 等），可自行增删。\r\n"
+        L"# 以 . 开头的文件夹（.git/.vscode/.cache …）由上方开关统一跳过，无需在此逐条填写。\r\n";
     DWORD bits = GetLogicalDrives();
     for (int i = 0; i < 26; ++i) {
         if (!(bits & (1u << i))) continue;
@@ -3010,7 +3059,25 @@ static std::wstring DefaultExcludePathsText() {
     }
     t += L"*\\System Volume Information\\*\r\n";
     t += L"*\\RECYCLER\\*\r\n";
+    t += L"*\\node_modules\r\n";
+    t += L"*\\node_modules\\*\r\n";
+    t += L"*\\__pycache__\\*\r\n";
+    t += L"*~\r\n";
+    t += L"*\\~$*\r\n";
+    t += L"*.swp\r\n";
+    t += L"*.swo\r\n";
     return t;
+}
+
+// 版本 2 及更早的默认项里硬编码的点开头文件夹条目：3 版起已被「不搜索点开头文件夹」开关取代。
+// 迁移时按归一化形式精确比对后剔除（只删这三条内置默认，用户自加的其它项一律保留）。
+static const WCHAR* const kLegacyDotDefaults[] = {L"*\\.git", L"*\\.git\\*",
+                                                  L"*\\.vscode\\extensions\\*"};
+static bool IsLegacyDotDefault(const std::wstring& pat) {
+    std::wstring np = NormalizePatternForExclude(pat);
+    for (auto* d : kLegacyDotDefaults)
+        if (np == NormalizePatternForExclude(d)) return true;
+    return false;
 }
 
 // 「恢复默认」按钮用的纯默认（不含用户自定义项）
@@ -3026,7 +3093,22 @@ static std::vector<std::wstring> DefaultExcludePaths() {
     }
     out.push_back(L"*\\System Volume Information\\*");
     out.push_back(L"*\\RECYCLER\\*");
+    out.push_back(L"*\\node_modules");
+    out.push_back(L"*\\node_modules\\*");
+    out.push_back(L"*\\__pycache__\\*");
+    out.push_back(L"*~");
+    out.push_back(L"*\\~$*");
+    out.push_back(L"*.swp");
+    out.push_back(L"*.swo");
     return out;
+}
+
+// 列表是否已含与 p 等价的排除模式（按归一化形式比较，避免大小写/尾部反斜杠差异导致重复）
+static bool HasExcludePattern(const std::vector<std::wstring>& pats, const std::wstring& p) {
+    std::wstring np = NormalizePatternForExclude(p);
+    for (auto& e : pats)
+        if (NormalizePatternForExclude(e) == np) return true;
+    return false;
 }
 
 static void LoadExcludePaths() {
@@ -3037,9 +3119,34 @@ static void LoadExcludePaths() {
         SaveRegText(L"ExcludePaths", def);
         g.excludePaths = DefaultExcludePaths();
         RebuildExcludeNorm();
+        DWORD nv = kExcludeDefaultsVer;
+        RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"ExcludeVer",
+                        REG_DWORD, &nv, sizeof(nv));
         return;
     }
     auto parsed = ParseExcludePaths(text);
+    DWORD ver = 0;
+    DWORD sz = sizeof(ver);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"ExcludeVer",
+                     RRF_RT_REG_DWORD, nullptr, &ver, &sz) != ERROR_SUCCESS)
+        ver = 0;
+    if (ver < kExcludeDefaultsVer) {
+        // 旧版本升级：先剔除 3 版起改由「不搜索点开头文件夹」开关统一管辖的点开头文件夹旧默认项
+        //（只删内置默认，用户自加项一律保留），再把新增默认噪音过滤项并入，一次性落盘并标记版本
+        std::vector<std::wstring> merged;
+        for (auto& p : parsed)
+            if (!IsLegacyDotDefault(p)) merged.push_back(p);
+        if (merged.empty()) merged = DefaultExcludePaths();
+        for (auto& d : DefaultExcludePaths())
+            if (!HasExcludePattern(merged, d)) merged.push_back(d);
+        g.excludePaths = merged;
+        RebuildExcludeNorm();
+        SaveRegText(L"ExcludePaths", ExcludePathsToText(merged));
+        DWORD nv = kExcludeDefaultsVer;
+        RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"ExcludeVer",
+                        REG_DWORD, &nv, sizeof(nv));
+        return;
+    }
     g.excludePaths = parsed.empty() ? DefaultExcludePaths() : parsed;
     RebuildExcludeNorm();
 }
@@ -3522,6 +3629,7 @@ constexpr int IDC_EDT_EXCLUDE = 3049;        // 多行编辑器：每行一条�
 constexpr int IDC_BTN_EXCLUDE_DEFAULT = 3050; // 「恢复默认」按钮：填入系统默认排除项
 constexpr int IDC_LBL_EXCLUDEHINT = 3051;    // 排除路径说明：语法、作用范围、命中规则
 constexpr int IDC_LBL_EXCLUDECOUNT = 3052;   // 当前已记忆 N 条排除项
+constexpr int IDC_CHK_DOTFOLDER = 3096;      // 排除路径页：不搜索以 . 开头的文件夹（含其中内容）
 constexpr int IDM_THEME_BASE = 4200;  // 主题下拉菜单指令基值
 constexpr int IDM_FLUSH_BASE = 4410;  // 写入时机下拉菜单指令基值
 constexpr int IDM_MAXENT_BASE = 4420; // 条目上限下拉菜单指令基值
@@ -3693,6 +3801,7 @@ static void ShowSettingsTab(HWND h, int tab) {
     vis(IDC_LBL_WCOUNT, weight);
     vis(IDC_LBL_WEIHINT, weight);
     bool exclude = (tab == 5);
+    vis(IDC_CHK_DOTFOLDER, exclude);
     vis(IDC_LBL_EXCLUDEHINT, exclude);
     vis(IDC_EDT_EXCLUDE, exclude);
     vis(IDC_BTN_EXCLUDE_DEFAULT, exclude);
@@ -3829,10 +3938,11 @@ static void ApplyLayoutRule(int id, CtlGeom& cg) {
             cg.stretchW = true;
             cg.stretchH = true;
             break;
+        case IDC_CHK_DOTFOLDER:
         case IDC_LBL_EXCLUDEHINT:
         case IDC_LBL_EXCLUDECOUNT:
         case IDC_BTN_EXCLUDE_DEFAULT:
-            cg.stretchW = true;  // 排除路径页提示/计数/按钮：宽度跟随
+            cg.stretchW = true;  // 排除路径页开关/提示/计数/按钮：宽度跟随
             break;
         // Shell 与窗口页：标签/下拉/编辑宽度跟随内容区
         case IDC_LBL_SHELLTYPE:
@@ -3970,6 +4080,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             g.weightMaxSaved = g.weightMaxEntries;
             g.fdjEnabled = fdj_enabled();         // 初始化自注册表（默认开）
             g.fdjEnabledSaved = g.fdjEnabled;
+            g.skipDotFoldersSaved = g.skipDotFolders;  // 点开头文件夹过滤（取消时回退）
             g.topEnabledSaved = g.topEnabled;     // top 命令开关（取消时回退）
             g.cmdEnabledSaved = g.cmdEnabled;     // cmd 命令开关（取消时回退）
             g.winEnabledSaved = g.winEnabled;     // w 命令开关（取消时回退）
@@ -4302,18 +4413,30 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                                 (HMENU)(INT_PTR)IDC_LBL_WEIHINT, g.inst, nullptr);
             SendMessageW(c, WM_SETFONT, (WPARAM)g.fList, TRUE);
 
-            // 排除路径 Tab（索引 5）：多行编辑器 + 「恢复默认」按钮 + 提示 + 当前条数
+            // 排除路径 Tab（索引 5）：点开头文件夹开关 + 多行编辑器 + 「恢复默认」按钮 + 提示 + 当前条数
+            // 纵向：开关 S(16) → 提示 S(44)（3 行）→ 编辑器 S(102)，编辑器下沿仍停在 S(280)，
+            // 与底部按钮行的间隔和改动前一致（stretchH 的 gapPx 由下沿算出，不受上移影响）。
+            // 标签刻意收短：自绘复选框的文字从方框右侧 S(10) 起画，可用宽度 = contentW - S(28)，
+            // 最小窗口（S(560)）下只有约 348px，长标签会被直接截断（示例放下面说明行里）。
+            c = CreateWindowExW(0, L"BUTTON",
+                                L"不搜索以 . 开头的文件夹（含其中内容）",
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                margin, S(16), contentW, S(24), h,
+                                (HMENU)(INT_PTR)IDC_CHK_DOTFOLDER, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+
             c = CreateWindowExW(0, L"STATIC",
                                 L"每行一条路径，大小写不敏感，支持通配符 * ?。以排除项开头的文件/文件夹/程序会被过滤。"
-                                L"网页与一键组不受影响。保存后生效。",
-                                WS_CHILD | WS_VISIBLE, margin, S(20), contentW, S(36), h,
+                                L"网页与一键组不受影响，点开头文件夹（.git / .vscode 等）由上方开关统一跳过。"
+                                L"保存后生效。",
+                                WS_CHILD | WS_VISIBLE, margin, S(44), contentW, S(54), h,
                                 (HMENU)(INT_PTR)IDC_LBL_EXCLUDEHINT, g.inst, nullptr);
             SendMessageW(c, WM_SETFONT, (WPARAM)g.fList, TRUE);
 
             c = CreateWindowExW(0, L"EDIT", nullptr,
                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_MULTILINE |
                                     ES_AUTOVSCROLL | WS_VSCROLL,
-                                margin, S(60), contentW, S(220), h,
+                                margin, S(102), contentW, S(178), h,
                                 (HMENU)(INT_PTR)IDC_EDT_EXCLUDE, g.inst, nullptr);
             SendMessageW(c, WM_SETFONT, (WPARAM)g.fList, TRUE);
             SetWindowTextW(c, ExcludePathsToText(g.excludePaths).c_str());
@@ -4767,6 +4890,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 if (id == IDC_CHK_CMD || id == IDC_CHK_WIN || id == IDC_CHK_CAPTURE ||
                     id == IDC_CHK_START || id == IDC_CHK_BEAUTIFY ||
                     id == IDC_CHK_WEIGHTON || id == IDC_CHK_FILEDLGJUMP ||
+                    id == IDC_CHK_DOTFOLDER ||
                     id == IDC_CHK_TOP || id == IDC_CHK_GHOST ||
                     id == IDC_CHK_SHOWWIN || id == IDC_CHK_WINGROUP ||
                     id == IDC_CHK_WINUWP || id == IDC_CHK_WINPROC) {
@@ -4785,6 +4909,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     bool checked = (id == IDC_CHK_START) ? g.startupWanted
                                  : (id == IDC_CHK_BEAUTIFY) ? g.beautify
                                  : (id == IDC_CHK_FILEDLGJUMP) ? g.fdjEnabled
+                                 : (id == IDC_CHK_DOTFOLDER) ? g.skipDotFolders
                                  : (id == IDC_CHK_TOP) ? g.topEnabled
                                  : (id == IDC_CHK_CMD) ? g.cmdEnabled
                                  : (id == IDC_CHK_WIN) ? g.winEnabled
@@ -4976,6 +5101,9 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"WeightMaxEntries",
                                 REG_DWORD, &vwm, sizeof(vwm));
                 fdj_set_enabled(g.fdjEnabled);  // 文件对话框跳转开关持久化到注册表
+                DWORD vsd = g.skipDotFolders ? 1 : 0;  // 点开头文件夹过滤（默认开）
+                RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"SkipDotFolders",
+                                REG_DWORD, &vsd, sizeof(vsd));
                 SetStartup(g.startupWanted);
                 DWORD vtop = g.topEnabled ? 1 : 0;
                 RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"TopCmd",
@@ -5099,6 +5227,9 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             } else if (id == IDC_CHK_FILEDLGJUMP && HIWORD(wp) == BN_CLICKED) {
                 g.fdjEnabled = !g.fdjEnabled;
                 InvalidateRect(GetDlgItem(h, IDC_CHK_FILEDLGJUMP), nullptr, TRUE);
+            } else if (id == IDC_CHK_DOTFOLDER && HIWORD(wp) == BN_CLICKED) {
+                g.skipDotFolders = !g.skipDotFolders;
+                InvalidateRect(GetDlgItem(h, IDC_CHK_DOTFOLDER), nullptr, TRUE);
             } else if (id == IDC_CHK_TOP && HIWORD(wp) == BN_CLICKED) {
                 g.topEnabled = !g.topEnabled;
                 InvalidateRect(GetDlgItem(h, IDC_CHK_TOP), nullptr, TRUE);
@@ -5216,6 +5347,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 g.weightFlush = g.weightFlushSaved;
                 g.weightMaxEntries = g.weightMaxSaved;
                 g.fdjEnabled = g.fdjEnabledSaved;    // 文件对话框跳转：取消即回退
+                g.skipDotFolders = g.skipDotFoldersSaved;  // 点开头文件夹过滤：取消即回退
                 g.topEnabled = g.topEnabledSaved;    // top 命令开关：取消即回退
                 // 抗残影双缓冲（实验性）：取消即回退 WS_EX_COMPOSITED 状态
                 g.antiGhost = g.antiGhostSaved;
