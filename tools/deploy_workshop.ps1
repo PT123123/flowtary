@@ -42,7 +42,10 @@ Write-Output ("[deploy] bumped patch digit to {0}" -f $p)
 # ---- build ----
 Push-Location $Root
 try {
-    cmd /c "make build"
+    # NB: use $env:ComSpec explicitly. An npm global package (command-code) puts a
+    # fake `cmd.ps1` shim into %APPDATA%\npm, and PowerShell would resolve `cmd`
+    # to that shim, which dies with "too many arguments" instead of running make.
+    & $env:ComSpec /c "make build"
     if ($LASTEXITCODE -ne 0) { Write-Error 'build failed'; exit 1 }
 } finally { Pop-Location }
 
