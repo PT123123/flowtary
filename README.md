@@ -16,7 +16,7 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
 | `f {关键词}` | Everything 只搜本地**文件**（`file:` 修饰符），回车直接打开 |
 | `d {关键词}` | Everything 只搜本地**文件夹**（`folder:` 修饰符），回车在资源管理器打开 |
 | （`f`/`d` 兜底） | 按名字搜不到任何结果时，自动改按**整条路径**逐词再搜一次（`folder: path:词1 path:词2`），如 `d aw-qtui software` 命中 `C:\software\aw-qtui` |
-| （`f`/`d` 自学习） | 用 `f`/`d` 搜开并**成功打开**过的条目自动记忆（在 `%APPDATA%\Flowtary\learned` 生成 `.lnk` 快捷方式），下次搜同词/前缀词时无视 Everything 直接**置顶**，exe 优先、长期保留；参数见设置 `自学习` 页 |
+| （自学习） | 用 `f`/`d` 搜开（或普通搜索打开程序）并**成功打开**过的条目自动记忆（在 `%APPDATA%\Flowtary\learned` 生成 `.lnk` 快捷方式），下次搜同词/前缀词时无视 Everything/程序索引直接**置顶**，exe 优先、长期保留；参数见设置 `自学习` 页 |
 | `bd {q}` | 百度 `https://www.baidu.com/#ie=UTF-8&wd={q}` |
 | `bili {q}` | B站 `https://search.bilibili.com/all?keyword={q}` |
 | `xhs {q}` | 小红书 `https://www.xiaohongshu.com/search_result?keyword={q}` |
@@ -129,10 +129,13 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
       **点开头文件夹由上方开关统一处理，不再写成硬编码默认项**
       （旧版本写入的 `*\.git` / `*\.vscode\extensions\*` 会在升级时自动撤掉，用户自加项保留），
       否则开关关掉后这些目录仍搜不到
-  - `自学习` 页：**f/d 打开记忆**——用 `f`/`d` 前缀搜索并成功打开一个文件/文件夹后，
-    按「本次搜索词 → 完整路径」记为长期记忆，并在 `%APPDATA%\Flowtary\learned` 镜像一个
-    `.lnk` 快捷方式；下次搜同一个词（或它的前缀）时，学习项无视 Everything 是否命中，
-    直接**置顶**出现在结果最前面（精确词组在前，**exe 优先**，再按打开次数与最近使用时间）。
+  - `自学习` 页：**打开记忆**——用 `f`/`d` 前缀搜索（或直接普通搜索）并成功打开一个
+    文件/文件夹/程序后，按「本次搜索词 → 完整路径」记为长期记忆，并在
+    `%APPDATA%\Flowtary\learned` 镜像一个 `.lnk` 快捷方式；下次搜同一个词（或它的前缀）时，
+    学习项无视 Everything / 程序索引是否命中，直接**置顶**出现在结果最前面
+    （精确词组在前，**exe 优先**，再按打开次数与最近使用时间）。
+    普通搜索记忆的范围同样受 `记录范围` 约束：默认只记 exe 与文件夹，所以
+    不在开始菜单索引里的程序（如某些绿色 exe）也能靠一次打开被记住
     - `启用自学习`：总开关，**默认勾选**（存 `HKCU\Software\Flowtary\LearnEnabled`）
     - `记录范围`：仅 exe / **exe 与文件夹（默认）** / 所有文件与文件夹（存 `LearnScope`）。
       `d` 搜出的文件夹在默认档下也会记忆

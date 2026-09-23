@@ -2026,6 +2026,8 @@ static void Refresh() {
             addGroup(FindGroup(g.groupsLaunch, key), false);
             addGroup(FindGroup(g.groupsKill, key), true);
             SearchPrograms(t);
+            // 自学习结果同样参与普通搜索（覆盖不在程序索引里的条目）
+            PrependLearnedRows(NormalizeSearchTerm(t));
         }
     }
     LayoutAndRepaint();
@@ -3634,12 +3636,24 @@ static void ScheduleLearnedSave() {
     // weightFlush == 2：仅退出时写入（主窗 WM_DESTROY 一并落盘）
 }
 
-// 打开成功后记录学习项（仅 f/d 模式下的本地文件/文件夹条目；范围受 learnScope 控制）
+// 打开成功后记录学习项。来源两类：
+//   - f/d（Everything）模式下的本地文件/文件夹行 → 词 = f/d 前缀后的有效搜索词
+//   - 普通程序搜索模式下的程序行（元宝这类不在开始菜单索引里的程序，就是从这学的）
+//     → 词 = 整条输入；范围仍受 learnScope 控制
 static void RecordLearned(const Row& r) {
     if (!g.learnEnabled) return;
-    if (g.mode != Mode::Everything) return;
-    if (r.kind != Row::File && r.kind != Row::Folder) return;
-    std::wstring term = g.evTermKey;  // f/d 前缀后的有效搜索词（已标准化）
+    std::wstring term;
+    if (g.mode == Mode::Everything && (r.kind == Row::File || r.kind == Row::Folder)) {
+        term = g.evTermKey;  // f/d 前缀后的有效搜索词（已标准化）
+    } else if (g.mode == Mode::Programs && r.kind == Row::Prog) {
+        if (g.text.empty() || g.text[0] == L' ') return;  // 空格命令派生的程序搜索不学
+        term = NormalizeSearchTerm(g.text);
+        if (term.find(L'\\') != std::wstring::npos ||
+            term.find(L'/') != std::wstring::npos ||
+            term.find(L'%') != std::wstring::npos) return;  // 输入本身是路径：学了没意义
+    } else {
+        return;
+    }
     if (term.empty()) return;
     std::wstring path = r.action;
     if (path.empty()) return;
@@ -3925,7 +3939,10 @@ static void PrependLearnedRows(const std::wstring& term) {
         r.title = (s == std::wstring::npos) ? c.path : c.path.substr(s + 1);
         r.sub = c.path;
         r.action = c.path;
-        g.items.insert(g.items.begin(), std::move(r));
+        // 插在「一键组」行之后（显式关键字命中的组动作保持最高位）
+        size_t pos = 0;
+        while (pos < g.items.size() && g.items[pos].kind == Row::Group) ++pos;
+        g.items.insert(g.items.begin() + pos, std::move(r));
     }
 }
 
