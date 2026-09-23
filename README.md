@@ -15,6 +15,7 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
 | :--- | :--- |
 | `f {关键词}` | Everything 只搜本地**文件**（`file:` 修饰符），回车直接打开 |
 | `d {关键词}` | Everything 只搜本地**文件夹**（`folder:` 修饰符），回车在资源管理器打开 |
+| （`f`/`d` 兜底） | 按名字搜不到任何结果时，自动改按**整条路径**逐词再搜一次（`folder: path:词1 path:词2`），如 `d aw-qtui software` 命中 `C:\software\aw-qtui` |
 | `bd {q}` | 百度 `https://www.baidu.com/#ie=UTF-8&wd={q}` |
 | `bili {q}` | B站 `https://search.bilibili.com/all?keyword={q}` |
 | `xhs {q}` | 小红书 `https://www.xiaohongshu.com/search_result?keyword={q}` |
@@ -109,10 +110,10 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
     - 页面显示当前已记忆条数；数据文件为 `%APPDATA%\Flowtary\weights.dat`
       （UTF-16 文本，每行 `搜索词 \x1f 文件完整路径 \x1f 权重`）
   - `排除路径` 页：**点开头文件夹开关** + 自定义排除路径列表
-    - `不搜索以 . 开头的文件夹`：**默认勾选**。开启后，搜索文件/文件夹（`d`/`f`）与本地程序时，
-      路径中任一层目录名以 `.` 开头（`.git` / `.vscode` / `.cache` / `.config` …）即**连同其内容一并跳过**；
-      搜索文件夹时该目录自身也不出现，搜索文件时只按「所在目录层」判断
-      （`C:\proj\.gitignore` 这种本身以点开头的**文件**不在排除范围内）。
+    - `不搜索 . 开头的文件与文件夹`：**默认勾选**。开启后，搜索文件/文件夹（`d`/`f`）时，
+      路径中**任一层**名字以 `.` 开头即过滤——目录（`.git` / `.vscode` / `.cache` …）连同其内容跳过，
+      以点开头的**文件**本身（`C:\proj\.gitignore`、`.env` 等）也一并过滤；搜文件夹时该目录自身也不出现。
+      本地程序搜索只按「所在目录层」判断（程序名一般不以点开头）。
       存 `HKCU\Software\Flowtary\SkipDotFolders`（`1`=开 / `0`=关，缺省为开）
     - 排除路径列表：多行编辑器，每行一条（大小写不敏感，支持 `*` `?` 通配符），
       以排除项开头的文件/文件夹/程序会被过滤；`#` 开头为注释；「恢复默认」一键还原系统默认项
@@ -146,8 +147,8 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
   2. 系统开始菜单 `C:\ProgramData\Microsoft\Windows\Start Menu\Programs` 下全部 `.lnk`
   3. `C:\Program Files`、`C:\Program Files (x86)` 一级子目录下的 `.exe`
 - 过滤：Everything（`d`/`f`）结果与上述程序搜索结果都受设置 `排除路径` 页影响——
-  **默认跳过以 `.` 开头的文件夹及其内容**（该开关默认开），再叠加用户排除列表；
-  网页指令与一键组不受影响。
+  **默认跳过路径任一层以 `.` 开头的结果（含 `.gitignore` 这类点开头文件）**（该开关默认开），
+  再叠加用户排除列表；网页指令与一键组不受影响。
 - 匹配排序：**点击权重（含自适应前缀推荐，见下）>** 精确 > 前缀 > 包含 > 子序列模糊，同级内开始菜单优先于 Program Files；
   最多显示 10 条。`.lnk` 通过 `IShellLink + IPersistFile` 解析目标路径，以其目录作为
   启动工作目录；图标懒加载缓存。
@@ -207,6 +208,10 @@ exe 同目录及 PATH 中查找）。
    `filename_offset/path_offset` 相对列表结构起始；`flags & 0x1` 表示文件夹。
 4. `file:` / `folder:` 是 Everything 搜索语法中的修饰符，**仅作用于紧随其后的一个词**，
    故多词关键词逐词添加前缀（`d foo bar` → `file:foo file:bar`），引号短语整体传递。
+   注意它们只匹配**名字**，不匹配所在目录层级。
+4b. 因此主查询（逐词 `file:`/`folder:`）**零结果**时会自动追发一条路径级兜底查询：
+   类型过滤单独成词 + 逐词 `path:`（`d aw-qtui software` → `folder: path:aw-qtui path:software`），
+   让关键词分布在路径任意层级也能命中；兜底只发一次，不循环。
 5. 协议验证工具：`build\evtest.exe [查询串]` 可直接打印 IPC 返回结果。
 
 ## 目录结构

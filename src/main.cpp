@@ -394,8 +394,8 @@ struct App {
     bool beautifySaved = true; // 设置窗打开时的初始值（取消时回退）
     bool antiGhost = false;    // 抗残影双缓冲（实验性）：开启 WS_EX_COMPOSITED 整窗双缓冲，消除切换 Tab 残影
     bool antiGhostSaved = false; // 设置窗打开时的初始值（取消时回退）
-    // 点开头文件夹过滤（默认开，UI 在设置「排除路径」Tab）：搜索文件/文件夹时，
-    // 路径中任一层目录名以 '.' 开头（.git / .vscode / .cache 等）即连同其内容一并跳过。
+    // 点开头过滤（默认开，UI 在设置「排除路径」Tab）：搜索文件/文件夹时，
+    // 路径中任一层名以 '.' 开头（目录 .git / .vscode，或文件 .gitignore）即过滤该行。
     bool skipDotFolders = true;
     bool skipDotFoldersSaved = true;  // 设置窗打开时的初始值（取消时回退）
     bool fdjEnabled = true;    // 文件对话框跳转总开关（默认开；UI 在设置「常规」Tab，不再放托盘菜单）
@@ -464,6 +464,8 @@ struct App {
     int sel = 0;
 
     std::wstring evQuery;      // 待发往 Everything 的完整查询串（含 file:/folder:）
+    std::wstring evFallbackQuery;  // 路径级兜底查询：主查询（按名字）零结果时自动追发一次；发出即清空
+    std::wstring evSentQuery;  // 上一次实际发出的查询串（回复到达时核对仍处于同一阶段）
     DWORD expectReply = 0;     // 期待的结果消息 dwData
     DWORD serial = 0;
 
@@ -1500,6 +1502,7 @@ static void ExecuteEverythingQuery() {
     q->offset = 0;
     q->max_results = ev::kMaxFetch;
     memcpy(q->search_string, g.evQuery.c_str(), (len + 1) * sizeof(WCHAR));
+    g.evSentQuery = g.evQuery;
 
     COPYDATASTRUCT cds{};
     cds.dwData = ev::kCopyDataQueryW;
@@ -1540,10 +1543,24 @@ static void HandleEverythingReply(const COPYDATASTRUCT* cds) {
         } else {
             r.action = r.sub + L"\\" + r.title;
         }
-        // 排除命中：直接丢弃（文件夹结果连自身一起判，文件结果只看所在目录层）
-        if (IsPathExcluded(r.action, r.kind == Row::Folder)) continue;
+        // 排除命中：直接丢弃。点开头检测覆盖整条路径的每一层——
+        // 目录层（.git/.vscode）与 . 开头的文件名（.gitignore/.env）都过滤。
+        if (IsPathExcluded(r.action, true)) continue;
         g.items.push_back(std::move(r));
         ++kept;
+    }
+    // 主查询（关键词匹配名字）零结果：自动追发一次「路径级」查询——
+    // 关键词改匹配整条路径（含所在目录），如 d aw-qtui software 命中 C:\software\aw-qtui。
+    // 条件：兜底串未发过、且发出去的仍是本次主查询（用户中途改输入则作废）。
+    if (g.items.empty() && !g.evFallbackQuery.empty() && !g.startingUp &&
+        g.evSentQuery == g.evQuery) {
+        g.evQuery = g.evFallbackQuery;
+        g.evFallbackQuery.clear();
+        ExecuteEverythingQuery();
+        if (g.items.empty()) AddHint(L"正在搜索…");  // IPC 断开时上面已换成回退行
+        g.sel = 0;
+        LayoutAndRepaint();
+        return;
     }
     // 点击加权重排：同一有效搜索词下点过的文件/文件夹排前面（权重相同保持 Everything 原序）；
     // 同样聚合前缀历史权重（自适应推荐：f bilibili 点过的文件，敲 f b / f bi 时也排前面）
@@ -1595,6 +1612,17 @@ static std::wstring BuildModifierQuery(const std::wstring& mod, const std::wstri
         i = j;
     }
     while (!out.empty() && out.back() == L' ') out.pop_back();
+    return out;
+}
+
+// 路径级兜底查询：typeFilter（folder: / file: 单独成词，作类型过滤）+ 每个关键词 path:word。
+// Everything 里 path: 匹配整条路径文本（所在目录 + 名字），关键词因此可以分布在不同层级：
+// d aw-qtui software -> "folder: path:aw-qtui path:software" 命中 C:\software\aw-qtui。
+static std::wstring BuildPathFallbackQuery(const WCHAR* typeFilter, const std::wstring& kw) {
+    std::wstring out = BuildModifierQuery(L"path:", kw);
+    if (out.empty()) return out;
+    out.insert(0, typeFilter);
+    out.insert(std::wcslen(typeFilter), L" ");
     return out;
 }
 
@@ -1910,9 +1938,13 @@ static void Refresh() {
         } else if (tok == L"d" || tok == L"f") {
             g.mode = Mode::Everything;
             if (rest.empty()) {
+                g.evFallbackQuery.clear();
                 AddHint(tok == L"f" ? L"输入关键词搜索文件" : L"输入关键词搜索文件夹");
             } else {
-                g.evQuery = BuildModifierQuery(tok == L"f" ? L"file:" : L"folder:", rest);
+                bool isFile = tok == L"f";
+                g.evQuery = BuildModifierQuery(isFile ? L"file:" : L"folder:", rest);
+                // 主查询无结果时自动追发的路径级兜底（见 HandleEverythingReply）
+                g.evFallbackQuery = BuildPathFallbackQuery(isFile ? L"file:" : L"folder:", rest);
                 g.evTermKey = NormalizeSearchTerm(rest);  // 本次查询的有效搜索词（权重 key）
                 AddHint(L"正在搜索…");
                 SetTimer(g.hwnd, kTimerDebounce, kDebounceMs, nullptr);
@@ -2739,7 +2771,7 @@ static void LoadSettings() {
         g.antiGhost = v != 0;
     else
         g.antiGhost = false;  // 默认关（实验性）
-    // 点开头文件夹过滤（搜索时跳过 .git / .vscode / .cache 这类隐藏目录及其内容；默认开）
+    // 点开头过滤（搜索时跳过 .git / .vscode 这类隐藏目录及其内容；. 开头的文件同样过滤；默认开）
     v = 1;
     cb = sizeof(v);
     if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"SkipDotFolders",
@@ -3049,7 +3081,7 @@ static std::wstring DefaultExcludePathsText() {
         L"# 作用于 Everything 搜索（d/f 前缀）与本地程序搜索的结果，网页与一键组不受影响。\r\n"
         L"# 默认已排除各盘符回收站、系统目录，以及 node_modules/__pycache__ 等开发噪音目录\r\n"
         L"# 和编辑器备份/临时文件（*~、~$、*.swp 等），可自行增删。\r\n"
-        L"# 以 . 开头的文件夹（.git/.vscode/.cache …）由上方开关统一跳过，无需在此逐条填写。\r\n";
+        L"# 以 . 开头的文件/文件夹（.git/.vscode/.gitignore …）由上方开关统一跳过，无需在此逐条填写。\r\n";
     DWORD bits = GetLogicalDrives();
     for (int i = 0; i < 26; ++i) {
         if (!(bits & (1u << i))) continue;
@@ -3629,7 +3661,7 @@ constexpr int IDC_EDT_EXCLUDE = 3049;        // 多行编辑器：每行一条�
 constexpr int IDC_BTN_EXCLUDE_DEFAULT = 3050; // 「恢复默认」按钮：填入系统默认排除项
 constexpr int IDC_LBL_EXCLUDEHINT = 3051;    // 排除路径说明：语法、作用范围、命中规则
 constexpr int IDC_LBL_EXCLUDECOUNT = 3052;   // 当前已记忆 N 条排除项
-constexpr int IDC_CHK_DOTFOLDER = 3096;      // 排除路径页：不搜索以 . 开头的文件夹（含其中内容）
+constexpr int IDC_CHK_DOTFOLDER = 3096;      // 排除路径页：不搜索 . 开头的文件与文件夹
 constexpr int IDM_THEME_BASE = 4200;  // 主题下拉菜单指令基值
 constexpr int IDM_FLUSH_BASE = 4410;  // 写入时机下拉菜单指令基值
 constexpr int IDM_MAXENT_BASE = 4420; // 条目上限下拉菜单指令基值
@@ -4419,7 +4451,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             // 标签刻意收短：自绘复选框的文字从方框右侧 S(10) 起画，可用宽度 = contentW - S(28)，
             // 最小窗口（S(560)）下只有约 348px，长标签会被直接截断（示例放下面说明行里）。
             c = CreateWindowExW(0, L"BUTTON",
-                                L"不搜索以 . 开头的文件夹（含其中内容）",
+                                L"不搜索 . 开头的文件与文件夹（.git / .gitignore …）",
                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                                 margin, S(16), contentW, S(24), h,
                                 (HMENU)(INT_PTR)IDC_CHK_DOTFOLDER, g.inst, nullptr);
@@ -4427,7 +4459,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 
             c = CreateWindowExW(0, L"STATIC",
                                 L"每行一条路径，大小写不敏感，支持通配符 * ?。以排除项开头的文件/文件夹/程序会被过滤。"
-                                L"网页与一键组不受影响，点开头文件夹（.git / .vscode 等）由上方开关统一跳过。"
+                                L"网页与一键组不受影响，. 开头的文件/文件夹（.git / .gitignore 等）由上方开关统一跳过。"
                                 L"保存后生效。",
                                 WS_CHILD | WS_VISIBLE, margin, S(44), contentW, S(54), h,
                                 (HMENU)(INT_PTR)IDC_LBL_EXCLUDEHINT, g.inst, nullptr);
