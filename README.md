@@ -16,6 +16,7 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
 | `f {关键词}` | Everything 只搜本地**文件**（`file:` 修饰符），回车直接打开 |
 | `d {关键词}` | Everything 只搜本地**文件夹**（`folder:` 修饰符），回车在资源管理器打开 |
 | （`f`/`d` 兜底） | 按名字搜不到任何结果时，自动改按**整条路径**逐词再搜一次（`folder: path:词1 path:词2`），如 `d aw-qtui software` 命中 `C:\software\aw-qtui` |
+| （`f`/`d` 自学习） | 用 `f`/`d` 搜开并**成功打开**过的条目自动记忆（在 `%APPDATA%\Flowtary\learned` 生成 `.lnk` 快捷方式），下次搜同词/前缀词时无视 Everything 直接**置顶**，exe 优先、长期保留；参数见设置 `自学习` 页 |
 | `bd {q}` | 百度 `https://www.baidu.com/#ie=UTF-8&wd={q}` |
 | `bili {q}` | B站 `https://search.bilibili.com/all?keyword={q}` |
 | `xhs {q}` | 小红书 `https://www.xiaohongshu.com/search_result?keyword={q}` |
@@ -50,7 +51,7 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
 - **设置窗口**（右键托盘 → 设置，黑暗模式自绘，与主界面同风格，**可拖动边框调整大小**，
   最小 `560×430` 逻辑像素）：
   - 左侧 **Tab 栏**：`常规` / `网页规则` / `主题` / `一键` / `搜索权重` / `排除路径` / `Shell 与窗口` /
-    `命令` / `截图工具`。点击切换，关闭窗口后仍记住上次停留的 Tab；
+    `命令` / `截图工具` / `自学习`。点击切换，关闭窗口后仍记住上次停留的 Tab；
     侧栏顶部有 `Flowtary` 品牌标题，激活页用主题强调色 + 左侧竖条高亮。
   - `常规` 页：
     - `开机自动启动`：勾选后写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\Flowtary`，
@@ -66,7 +67,12 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
     - `唤醒位置`：屏幕居中 / 跟随鼠标（存 `HKCU\Software\Flowtary\CenterWake`）
     - `文件对话框跳转`：在系统标准文件对话框中直接用 Flowtary 定位/跳转到某个文件夹（类 Listary
       Quick-Switch），**默认勾选**。勾选状态存 `HKCU\Software\Flowtary\FileDlgJump`（`1`=开 / `0`=关，
-      缺省为开）；取消则不再劫持文件对话框。**本项已从托盘右键菜单移除，仅在此设置页调整**
+      缺省为开）；取消则不再劫持文件对话框。**本项已从托盘右键菜单移除，仅在此设置页调整**。
+      实现上全局钩子会把 `filedlg_hook64.dll`/`filedlg_hook32.dll` 映射进几乎所有 GUI 进程，导致安装
+      目录里的这两个文件在退出前无法删除。为此实际加载的是版本化副本
+      `%LOCALAPPDATA%\Flowtary\hooks\filedlg_hook64_<版本号>.dll`（32 位副本路径由命令行传给
+      `filedlg_agent32.exe`），安装目录的 .dll 只作拷贝源、永不被加载，因此部署时可直接覆盖；
+      旧版本副本在每次启动时尽力清理（仍被占用的留到下次）
     - `命令` 页（新增）：集中管理输入框命令开关，以下三种命令**均需在前面加一个空格键触发**：
       - `top 命令`：勾选后输入 `空格 top` 回车，对「唤醒前的前台窗口」切换置顶/取消置顶（`WS_EX_TOPMOST`），
         结果在目标窗口位置弹出快速消失的轻量提示「已置顶/取消置顶」；**默认勾选**。存 `HKCU\Software\Flowtary\TopCmd`（`1`=开 / `0`=关）
@@ -123,6 +129,25 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
       **点开头文件夹由上方开关统一处理，不再写成硬编码默认项**
       （旧版本写入的 `*\.git` / `*\.vscode\extensions\*` 会在升级时自动撤掉，用户自加项保留），
       否则开关关掉后这些目录仍搜不到
+  - `自学习` 页：**f/d 打开记忆**——用 `f`/`d` 前缀搜索并成功打开一个文件/文件夹后，
+    按「本次搜索词 → 完整路径」记为长期记忆，并在 `%APPDATA%\Flowtary\learned` 镜像一个
+    `.lnk` 快捷方式；下次搜同一个词（或它的前缀）时，学习项无视 Everything 是否命中，
+    直接**置顶**出现在结果最前面（精确词组在前，**exe 优先**，再按打开次数与最近使用时间）。
+    - `启用自学习`：总开关，**默认勾选**（存 `HKCU\Software\Flowtary\LearnEnabled`）
+    - `记录范围`：仅 exe / **exe 与文件夹（默认）** / 所有文件与文件夹（存 `LearnScope`）。
+      `d` 搜出的文件夹在默认档下也会记忆
+    - `条目上限`：100 / 200 / 500（默认）/ 1000 / 2000 / 5000 条（存 `LearnMaxEntries`），
+      超限时优先淘汰「打开次数最少、其次最久未用」的条目并连带删除其 `.lnk`
+    - `过期清理`：**永不过期（默认，长期保留）** / 90 / 180 / 365 天未使用即清理
+      （存 `LearnExpireDays`，启动时执行清理）
+    - `打开快捷方式目录`：在资源管理器中打开 `%APPDATA%\Flowtary\learned`
+    - `清空自学习数据`：两步确认（3 秒内再点一次才执行），删除全部记忆与 `.lnk`
+    - 数据文件 `%APPDATA%\Flowtary\learned.dat`（UTF-16 文本，每行
+      `搜索词 \x1f 完整路径 \x1f 次数 \x1f 最近使用时间 \x1f 快捷方式文件名`）；
+      它是权威数据，`.lnk` 目录可人工查看/增删，**启动时双向同步一次**：
+      被删掉的 `.lnk` 会遗忘对应条目；手动放进来的 `.lnk` 会以次数 1 被吸收为学习项
+    - 写盘时机沿用 `搜索权重` 页的「写入时机」策略；命中排除路径/点开头过滤的条目不记录；
+      `learned` 目录内的条目自身不会被学习
 - **热键**：依次尝试 `Alt+Space` → `Alt+Q` → `Ctrl+Alt+Space`，全部被占用时弹窗提示；
   实际生效的组合显示在托盘提示文案中（本机 Alt+Space 常被 Flow.Launcher 等占用）。
   当输入框已聚焦时，这些本软件自带的全局 `Alt` 热键会被暂时屏蔽（交给「结果项快捷键」独占），不影响输入；

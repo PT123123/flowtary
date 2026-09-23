@@ -11,6 +11,7 @@
 
 #include "filedlg_jump.h"
 #include <windows.h>
+#include <shellapi.h>
 
 static HHOOK  g_hhk = nullptr;     // WH_CBT 钩子
 static HHOOK  g_hhkMsg = nullptr;  // WH_GETMESSAGE 钩子
@@ -22,10 +23,21 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
+    // DLL 路径：优先用宿主传入的命令行参数（版本化副本，避免安装目录文件被全局钩子锁定）；
+    // 无参数时回退到同目录 filedlg_hook32.dll（旧行为）。
     WCHAR path[MAX_PATH];
-    if (!GetModuleFileNameW(nullptr, path, _countof(path))) return 1;
-    WCHAR* s = wcsrchr(path, L'\\');
-    if (s) lstrcpyW(s + 1, L"filedlg_hook32.dll");
+    path[0] = 0;
+    int argc = 0;
+    if (LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc)) {
+        if (argc > 1 && argv[1] && argv[1][0])
+            lstrcpynW(path, argv[1], _countof(path));
+        LocalFree(argv);
+    }
+    if (!path[0]) {
+        if (!GetModuleFileNameW(nullptr, path, _countof(path))) return 1;
+        WCHAR* s = wcsrchr(path, L'\\');
+        if (s) lstrcpyW(s + 1, L"filedlg_hook32.dll");
+    }
     g_mod = LoadLibraryW(path);
     if (!g_mod) return 1;
 

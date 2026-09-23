@@ -358,6 +358,13 @@ struct CmdGroup {
     std::vector<std::wstring> targets;
 };
 
+// 自学习条目：f/d 搜索打开过的文件/文件夹，记为「搜索词 → 路径」的长期记忆
+struct LearnVal {
+    int count = 0;          // 打开次数（排序用，越大越前）
+    long long last = 0;     // 最近一次打开（Unix 秒，过期清理用）
+    std::wstring lnk;       // 镜像快捷方式文件名（learned 目录内，空=尚未创建）
+};
+
 enum class Mode { None, Everything, Web, Programs, Shell, Window, Top, Capture };
 
 // 窗口枚举缓存项
@@ -387,7 +394,7 @@ struct App {
     bool startupSaved = false; // 设置窗打开时的初始值（取消时回退）
     bool hotkeyWake = true;    // 唤起快捷键总开关（托盘菜单切换；关闭时不再注册 Alt+Space 等）
     int hotkeyModeSaved = 0;   // 同上，结果项快捷键方案（取消时回退）
-    int settingsTab = 0;        // 设置窗当前 Tab：0=常规, 1=网页规则, 2=主题, 3=一键, 4=搜索权重, 5=排除路径, 6=Shell 与窗口, 7=命令, 8=截图工具（关闭后仍记住上次选择）
+    int settingsTab = 0;        // 设置窗当前 Tab：0=常规, 1=网页规则, 2=主题, 3=一键, 4=搜索权重, 5=排除路径, 6=Shell 与窗口, 7=命令, 8=截图工具, 9=自学习（关闭后仍记住上次选择）
     int themeIdx = 0;          // 当前主题索引（设置窗切换后、保存前为暂存值）
     int themeSaved = 0;        // 设置窗打开时的初始主题（取消时回退）
     bool beautify = true;      // 界面美化：暗色标题栏 + 圆角窗口 + 强制暗色菜单（默认开）
@@ -419,6 +426,19 @@ struct App {
     std::unordered_map<std::wstring, std::unordered_map<std::wstring, int>> weights;
     size_t weightCount = 0;    // weights 中（词,路径）对总数
     bool weightsDirty = false; // 有未写盘的权重变更
+    // ---- f/d 自学习（打开即记忆为快捷方式，下次同词搜索直接置顶；设置「自学习」Tab） ----
+    bool learnEnabled = true;   // 自学习总开关（默认开）
+    int learnScope = 1;         // 记录范围：0=仅 exe, 1=exe+文件夹, 2=所有文件+文件夹
+    int learnMaxEntries = 500;  // 学习条目上限（超出淘汰打开次数最少的一条）
+    int learnExpire = 0;        // 过期清理：0=永不过期（长期保留），否则为「N 天未使用即清理」
+    bool learnEnabledSaved = true;   // 设置窗打开时的初始值（取消时回退）
+    int learnScopeSaved = 1;
+    int learnMaxSaved = 500;
+    int learnExpireSaved = 0;
+    // 学习存储：有效搜索词（f/d 前缀后的关键词，标准化小写） → 路径 → 条目
+    std::unordered_map<std::wstring, std::unordered_map<std::wstring, LearnVal>> learned;
+    size_t learnCount = 0;     // learned 中（词,路径）对总数
+    bool learnedDirty = false; // 有未写盘的学习变更
     bool startingUp = true;    // 程序扫描尚未完成：托盘提示/右键菜单显示「正在启动中」
     Theme* theme = nullptr;
     std::vector<Star> stars;   // 星空主题星点坐标
@@ -576,6 +596,13 @@ static std::wstring NormalizeSearchTerm(const std::wstring& s);
 static int GetClickWeight(const std::wstring& term, const std::wstring& path);
 static void RecordClickWeight(const Row& r);
 static void SaveClickWeightsNow();
+// f/d 自学习（定义在「自学习」小节）
+static void RecordLearned(const Row& r);
+static void PrependLearnedRows(const std::wstring& term);
+static void SaveLearnedNow();
+static void LoadLearned();
+static void ClearLearned();
+static std::wstring LearnedDirPath();
 static void TrayBalloon(const std::wstring& title, const std::wstring& msg);
 static HWND TopTargetWindow();  // top 命令的目标窗口（唤醒前的前台窗口）
 static void ShowTopToast(HWND target, const std::wstring& text);  // top 命令轻量 toast
@@ -1485,6 +1512,8 @@ static void UseEverythingFallback() {
     r.sub = L"IPC 未连接，回车将打开 Everything 窗口";
     r.action = L"-search \"" + g.evQuery + L"\"";
     g.items.push_back(std::move(r));
+    // Everything 未连接时自学习结果照常可用：置顶插入
+    PrependLearnedRows(g.evTermKey);
     g.sel = 0;
     LayoutAndRepaint();
 }
@@ -1583,6 +1612,8 @@ static void HandleEverythingReply(const COPYDATASTRUCT* cds) {
         std::stable_sort(g.items.begin(), g.items.end(),
                          [&rowW](const Row& a, const Row& b) { return rowW(a) > rowW(b); });
     }
+    // f/d 自学习：命中的学习项摘出原行后置顶（exe 优先）；有学习结果时不再显示「无结果」
+    PrependLearnedRows(g.evTermKey);
     if (g.items.empty()) AddHint(g.startingUp ? L"正在启动中…" : L"无结果");
     g.sel = 0;
     LayoutAndRepaint();
@@ -1954,6 +1985,8 @@ static void Refresh() {
                 g.evFallbackQuery = BuildPathFallbackQuery(isFile ? L"file:" : L"folder:", rest);
                 g.evTermKey = NormalizeSearchTerm(rest);  // 本次查询的有效搜索词（权重 key）
                 AddHint(L"正在搜索…");
+                // f/d 自学习：以前打开过的条目先置顶（Everything 结果到达后再合并）
+                PrependLearnedRows(g.evTermKey);
                 SetTimer(g.hwnd, kTimerDebounce, kDebounceMs, nullptr);
             }
         } else if (FindWebCmd(tok)) {
@@ -2147,7 +2180,10 @@ static ExecKind ResolveExecKind(bool ctrl, bool shift) {
 static void ExecuteSelected(ExecKind ek = ExecKind::Normal) {
     if (g.sel < 0 || g.sel >= (int)g.items.size()) return;
     RecordClickWeight(g.items[g.sel]);  // 点击/回车/快捷键选中即记权重（内部过滤非本地条目与不保存的前缀）
-    if (ExecuteRow(g.items[g.sel], ek)) Hide();
+    if (ExecuteRow(g.items[g.sel], ek)) {
+        RecordLearned(g.items[g.sel]);  // f/d 打开成功 → 记为自学习条目（含 .lnk 快捷方式）
+        Hide();
+    }
 }
 
 // 以管理员（提升权限）模式打开：仅对可执行项（程序 / 文件）有意义，使用 runas 动词提权
@@ -2323,7 +2359,7 @@ static void ShowRowMenu(HWND hwnd) {
     switch (cmd) {
         case IDM_OPEN:
             RecordClickWeight(r);  // 右键打开同样记权重
-            ExecuteRow(r);
+            if (ExecuteRow(r)) RecordLearned(r);  // 右键打开成功同样记自学习
             break;
         case IDM_OPENLOC:
             if (r.kind == Row::Folder) {
@@ -2830,6 +2866,32 @@ static void LoadSettings() {
         g.weightMaxEntries = (int)v;
     if (g.weightMaxEntries < 100) g.weightMaxEntries = 5000;
     if (g.weightMaxEntries > 200000) g.weightMaxEntries = 200000;
+    // f/d 自学习（设置「自学习」Tab）
+    v = 1;
+    cb = sizeof(v);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"LearnEnabled",
+                     RRF_RT_REG_DWORD, nullptr, &v, &cb) == ERROR_SUCCESS)
+        g.learnEnabled = v != 0;
+    else
+        g.learnEnabled = true;  // 默认开
+    v = 1;
+    cb = sizeof(v);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"LearnScope",
+                     RRF_RT_REG_DWORD, nullptr, &v, &cb) == ERROR_SUCCESS)
+        g.learnScope = (int)v;
+    if (g.learnScope < 0 || g.learnScope > 2) g.learnScope = 1;
+    v = 500;
+    cb = sizeof(v);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"LearnMaxEntries",
+                     RRF_RT_REG_DWORD, nullptr, &v, &cb) == ERROR_SUCCESS)
+        g.learnMaxEntries = (int)v;
+    if (g.learnMaxEntries < 10 || g.learnMaxEntries > 100000) g.learnMaxEntries = 500;
+    v = 0;
+    cb = sizeof(v);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"LearnExpireDays",
+                     RRF_RT_REG_DWORD, nullptr, &v, &cb) == ERROR_SUCCESS)
+        g.learnExpire = (int)v;
+    if (g.learnExpire < 0) g.learnExpire = 0;
 
     // top 命令开关（空格+top 回车置顶/取消置顶当前窗口；默认开）
     cb = sizeof(v);
@@ -3247,6 +3309,19 @@ static const WCHAR* WeightFlushText(int m) {
                   : L"仅程序退出时写入磁盘";
 }
 
+// 自学习设置项的显示文字（下拉当前值与列表项共用）
+static const WCHAR* LearnScopeText(int s) {
+    return s == 0 ? L"仅 exe"
+         : s == 1 ? L"exe 与文件夹"
+                  : L"所有文件与文件夹";
+}
+static const WCHAR* LearnExpireText(int days) {
+    return days == 0 ? L"永不过期（长期保留）"
+         : days == 90 ? L"90 天未使用即清理"
+         : days == 180 ? L"180 天未使用即清理"
+                       : L"365 天未使用即清理";
+}
+
 // 标准化有效搜索词：去除首尾空格、统一小写，作为权重记录的 key
 static std::wstring NormalizeSearchTerm(const std::wstring& s) {
     return ToLowerW(TrimW(s));
@@ -3411,6 +3486,447 @@ static void ClearClickWeights() {
     g.weightCount = 0;
     g.weightsDirty = true;
     SaveClickWeightsNow();
+}
+
+// ---------------- f/d 自学习（打开即记忆，下次同词搜索直接置顶） ----------------
+// 用户在 f / d 前缀搜索里成功打开一个文件/文件夹后，把「本次有效搜索词 → 完整路径」
+// 记为长期记忆（learned.dat），并在 %APPDATA%\Flowtary\learned 镜像一个 .lnk 快捷方式。
+// 之后敲同一词（或它的前缀）时，学习项无视 Everything 是否命中，直接置顶展示：
+// 精确词组在前，exe 优先，再按打开次数与最近使用时间。
+// learned.dat 是权威数据；.lnk 目录可人工查看/增删：启动时双向同步一次
+// （被删掉的 .lnk 会遗忘对应条目；手动放进来的 .lnk 会以次数 1 被吸收为学习项）。
+
+static long long FileTimeToUnix(const FILETIME& ft) {
+    ULARGE_INTEGER u;
+    u.LowPart = ft.dwLowDateTime;
+    u.HighPart = ft.dwHighDateTime;
+    return (long long)(u.QuadPart / 10000000ULL - 11644473600ULL);
+}
+
+static long long NowUnix() {
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    return FileTimeToUnix(ft);
+}
+
+static std::wstring LearnedDirPath() {
+    WCHAR buf[MAX_PATH]{};
+    std::wstring dir;
+    if (GetEnvironmentVariableW(L"APPDATA", buf, MAX_PATH))
+        dir = std::wstring(buf) + L"\\Flowtary";
+    else
+        dir = DirOf(GetExePath());
+    return dir + L"\\learned";
+}
+
+static std::wstring LearnedDataFilePath() {
+    WCHAR buf[MAX_PATH]{};
+    std::wstring dir;
+    if (GetEnvironmentVariableW(L"APPDATA", buf, MAX_PATH))
+        dir = std::wstring(buf) + L"\\Flowtary";
+    else
+        dir = DirOf(GetExePath());
+    return dir + L"\\learned.dat";
+}
+
+// 搜索词 → 安全文件名：替换 Windows 非法字符，去尾部空格/点，截断长度
+static std::wstring SanitizeTermForFile(const std::wstring& term) {
+    std::wstring out;
+    for (WCHAR ch : term) {
+        if (ch < 32 || wcschr(L"<>:\"/\\|?*", ch)) out += L'_';
+        else out += ch;
+    }
+    if (out.size() > 100) {
+        out.resize(100);
+        WCHAR last = out.back();
+        if (last >= 0xD800 && last <= 0xDBFF) out.pop_back();  // 别把代理对截半
+    }
+    while (!out.empty() && (out.back() == L' ' || out.back() == L'.')) out.pop_back();
+    if (out.empty()) out = L"learned";
+    return out;
+}
+
+static bool CreateShortcutFile(const std::wstring& lnkPath, const std::wstring& target,
+                               const std::wstring& desc) {
+    bool ok = false;
+    IShellLinkW* psl = nullptr;
+    if (SUCCEEDED(CoCreateInstance(kCLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+                                   kIID_IShellLinkW, (void**)&psl))) {
+        psl->SetPath(target.c_str());
+        std::wstring dir = DirOf(target);
+        if (!dir.empty()) psl->SetWorkingDirectory(dir.c_str());
+        if (!desc.empty()) psl->SetDescription(desc.c_str());
+        IPersistFile* pf = nullptr;
+        if (SUCCEEDED(psl->QueryInterface(kIID_IPersistFile, (void**)&pf))) {
+            ok = SUCCEEDED(pf->Save(lnkPath.c_str(), TRUE));
+            pf->Release();
+        }
+        psl->Release();
+    }
+    return ok;
+}
+
+// 给条目分配未被占用的 .lnk 文件名（同词多目标时追加 " (2)" 序号）
+static std::wstring AllocLnkName(const std::wstring& term) {
+    std::vector<std::wstring> used;
+    for (auto& kv : g.learned)
+        for (auto& pv : kv.second)
+            if (!pv.second.lnk.empty()) used.push_back(pv.second.lnk);
+    std::wstring base = SanitizeTermForFile(term);
+    for (int i = 0; i < 10000; ++i) {
+        std::wstring name = i ? base + L" (" + std::to_wstring(i + 1) + L").lnk"
+                              : base + L".lnk";
+        bool dup = false;
+        for (auto& u : used)
+            if (_wcsicmp(u.c_str(), name.c_str()) == 0) { dup = true; break; }
+        if (!dup) return name;
+    }
+    return L"";
+}
+
+static void DeleteEntryLnk(const LearnVal& v) {
+    if (v.lnk.empty()) return;
+    DeleteFileW((LearnedDirPath() + L"\\" + v.lnk).c_str());
+}
+
+// 确保条目有对应的 .lnk（缺失或指向不对时重建；失败不致命，下次启动同步会再试）
+static void EnsureEntryLnk(const std::wstring& term, const std::wstring& path, LearnVal& v) {
+    if (v.lnk.empty()) v.lnk = AllocLnkName(term);
+    if (v.lnk.empty()) return;
+    std::wstring full = LearnedDirPath() + L"\\" + v.lnk;
+    if (GetFileAttributesW(full.c_str()) != INVALID_FILE_ATTRIBUTES &&
+        _wcsicmp(ResolveLnkTarget(full).c_str(), path.c_str()) == 0)
+        return;  // 已存在且指向正确，不重写
+    CreateDirectoryW(LearnedDirPath().c_str(), nullptr);
+    CreateShortcutFile(full, path, L"Flowtary 自学习：" + term);
+}
+
+// 到达上限时淘汰「次数最少、其次最久未用」的一条（跳过即将写入的新条目），连带删 .lnk
+static void PruneOneLearned(const std::wstring& keepTerm, const std::wstring& keepPath) {
+    std::wstring minTerm, minPath;
+    LearnVal* minV = nullptr;
+    for (auto& kv : g.learned) {
+        for (auto& pv : kv.second) {
+            if (kv.first == keepTerm && pv.first == keepPath) continue;
+            if (!minV || pv.second.count < minV->count ||
+                (pv.second.count == minV->count && pv.second.last < minV->last)) {
+                minV = &pv.second;
+                minTerm = kv.first;
+                minPath = pv.first;
+            }
+        }
+    }
+    if (!minV) return;
+    DeleteEntryLnk(*minV);
+    auto it = g.learned.find(minTerm);
+    it->second.erase(minPath);
+    if (it->second.empty()) g.learned.erase(it);
+    if (g.learnCount > 0) --g.learnCount;
+}
+
+static void ScheduleLearnedSave() {
+    // 写盘时机沿用「搜索权重」页的延迟合并策略
+    if (g.weightFlush == 0) {
+        SaveLearnedNow();
+    } else if (g.weightFlush == 1) {
+        SetTimer(g.hwnd, kTimerWeightSave, kWeightSaveDelayMs, nullptr);
+    }
+    // weightFlush == 2：仅退出时写入（主窗 WM_DESTROY 一并落盘）
+}
+
+// 打开成功后记录学习项（仅 f/d 模式下的本地文件/文件夹条目；范围受 learnScope 控制）
+static void RecordLearned(const Row& r) {
+    if (!g.learnEnabled) return;
+    if (g.mode != Mode::Everything) return;
+    if (r.kind != Row::File && r.kind != Row::Folder) return;
+    std::wstring term = g.evTermKey;  // f/d 前缀后的有效搜索词（已标准化）
+    if (term.empty()) return;
+    std::wstring path = r.action;
+    if (path.empty()) return;
+    // 不学习 learned 快捷方式目录里的条目本身（避免把记忆产物当成记忆对象）
+    std::wstring ldir = LearnedDirPath() + L"\\";
+    if (path.size() > ldir.size() &&
+        _wcsnicmp(path.c_str(), ldir.c_str(), ldir.size()) == 0) return;
+    if (IsPathExcluded(path, r.kind == Row::Folder)) return;
+
+    bool isFolder = (r.kind == Row::Folder);
+    bool isExe = !isFolder && EndsWithI(path, L".exe");
+    if (g.learnScope == 0 && !isExe) return;
+    if (g.learnScope == 1 && !isExe && !isFolder) return;
+
+    auto& m = g.learned[term];
+    auto it = m.find(path);
+    long long now = NowUnix();
+    if (it == m.end()) {
+        if (g.learnCount >= (size_t)(std::max)(10, g.learnMaxEntries))
+            PruneOneLearned(term, path);
+        LearnVal v;
+        v.count = 1;
+        v.last = now;
+        it = m.emplace(path, v).first;
+        ++g.learnCount;
+    } else {
+        ++it->second.count;
+        it->second.last = now;
+    }
+    EnsureEntryLnk(term, path, it->second);
+    g.learnedDirty = true;
+    ScheduleLearnedSave();
+}
+
+// 立即写盘：按排序键裁剪到上限（连带删除被挤出条目的 .lnk）后整体写出
+static void SaveLearnedNow() {
+    if (!g.learnedDirty) return;
+    g.learnedDirty = false;
+
+    struct E { const std::wstring* term; const std::wstring* path; LearnVal* v; };
+    std::vector<E> all;
+    all.reserve(g.learnCount);
+    for (auto& kv : g.learned)
+        for (auto& pv : kv.second) all.push_back({&kv.first, &pv.first, &pv.second});
+    std::sort(all.begin(), all.end(), [](const E& a, const E& b) {
+        if (a.v->count != b.v->count) return a.v->count > b.v->count;
+        return a.v->last > b.v->last;
+    });
+    size_t cap = (size_t)(std::max)(10, g.learnMaxEntries);
+    if (all.size() > cap) {
+        for (size_t i = cap; i < all.size(); ++i) {
+            DeleteEntryLnk(*all[i].v);
+            auto t = g.learned.find(*all[i].term);
+            if (t != g.learned.end()) {
+                t->second.erase(*all[i].path);
+                if (t->second.empty()) g.learned.erase(t);
+            }
+            if (g.learnCount > 0) --g.learnCount;
+        }
+        all.resize(cap);
+    }
+
+    std::wstring text;
+    for (auto& e : all) {
+        text += *e.term; text += kWeightSep;
+        text += *e.path; text += kWeightSep;
+        text += std::to_wstring(e.v->count); text += kWeightSep;
+        text += std::to_wstring(e.v->last); text += kWeightSep;
+        text += e.v->lnk;
+        text += L"\r\n";
+    }
+    std::wstring file = LearnedDataFilePath();
+    CreateDirectoryW(DirOf(file).c_str(), nullptr);
+    HANDLE f = CreateFileW(file.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) { g.learnedDirty = true; return; }
+    DWORD wr = 0;
+    WriteFile(f, text.data(), (DWORD)(text.size() * sizeof(WCHAR)), &wr, nullptr);
+    CloseHandle(f);
+}
+
+// 启动时加载 learned.dat，并与 .lnk 目录双向同步 + 按过期策略清理
+static void LoadLearned() {
+    g.learned.clear();
+    g.learnCount = 0;
+    g.learnedDirty = false;
+
+    HANDLE f = CreateFileW(LearnedDataFilePath().c_str(), GENERIC_READ, FILE_SHARE_READ,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f != INVALID_HANDLE_VALUE) {
+        DWORD sz = GetFileSize(f, nullptr);
+        if (sz != INVALID_FILE_SIZE && sz >= sizeof(WCHAR) && sz <= 64u * 1024 * 1024) {
+            std::vector<WCHAR> buf(sz / sizeof(WCHAR) + 1, 0);
+            DWORD rd = 0;
+            BOOL ok = ReadFile(f, buf.data(), (sz / sizeof(WCHAR)) * sizeof(WCHAR), &rd,
+                               nullptr);
+            if (ok) {
+                std::wstring text(buf.data(), rd / sizeof(WCHAR));
+                size_t cap = (size_t)(std::max)(10, g.learnMaxEntries);
+                size_t i = 0, n = text.size();
+                while (i < n && g.learnCount < cap) {
+                    size_t j = text.find_first_of(L"\r\n", i);
+                    if (j == std::wstring::npos) j = n;
+                    std::wstring line = text.substr(i, j - i);
+                    i = j + 1;
+                    size_t s1 = line.find(kWeightSep);
+                    size_t s2 = (s1 == std::wstring::npos) ? std::wstring::npos
+                                                           : line.find(kWeightSep, s1 + 1);
+                    size_t s3 = (s2 == std::wstring::npos) ? std::wstring::npos
+                                                           : line.find(kWeightSep, s2 + 1);
+                    if (s1 == std::wstring::npos || s2 == std::wstring::npos ||
+                        s3 == std::wstring::npos) continue;
+                    std::wstring term = line.substr(0, s1);
+                    std::wstring path = line.substr(s1 + 1, s2 - s1 - 1);
+                    LearnVal v;
+                    v.count = _wtoi(line.c_str() + s2 + 1);
+                    v.last = _wtoi64(line.c_str() + s3 + 1);
+                    v.lnk = line.substr(s3 + 1);
+                    if (term.empty() || path.empty() || v.count <= 0) continue;
+                    if (g.learned[term].emplace(path, v).second) ++g.learnCount;
+                }
+            }
+        }
+        CloseHandle(f);
+    }
+
+    // 与快捷方式目录双向同步（目录存在才检查：删除同步 + 手动添加吸收）
+    std::wstring dir = LearnedDirPath();
+    {
+        WIN32_FIND_DATAW fd{};
+        HANDLE h = FindFirstFileW((dir + L"\\*.lnk").c_str(), &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            std::vector<std::wstring> present;  // 目录里现存的 .lnk 文件名
+            std::vector<std::pair<std::wstring, FILETIME>> stamps;  // 对应写入时间（吸收时当 last）
+            do {
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                present.push_back(fd.cFileName);
+                stamps.push_back({fd.cFileName, fd.ftLastWriteTime});
+            } while (FindNextFileW(h, &fd));
+            FindClose(h);
+
+            auto referenced = [&present](const std::wstring& name) {
+                if (name.empty()) return true;  // 尚未建出 .lnk 的条目不参与删除同步
+                for (auto& p : present)
+                    if (_wcsicmp(p.c_str(), name.c_str()) == 0) return true;
+                return false;
+            };
+            // 用户手动删了 .lnk：对应条目一并遗忘
+            for (auto tk = g.learned.begin(); tk != g.learned.end();) {
+                for (auto pk = tk->second.begin(); pk != tk->second.end();) {
+                    if (!referenced(pk->second.lnk)) {
+                        pk = tk->second.erase(pk);
+                        if (g.learnCount > 0) --g.learnCount;
+                        g.learnedDirty = true;
+                    } else ++pk;
+                }
+                if (tk->second.empty()) tk = g.learned.erase(tk);
+                else ++tk;
+            }
+            // 用户手动放进来的 .lnk：以次数 1 吸收为学习项（词 = 文件名去扩展名与序号）
+            size_t cap = (size_t)(std::max)(10, g.learnMaxEntries);
+            for (size_t pi = 0; pi < present.size() && g.learnCount < cap; ++pi) {
+                const std::wstring& name = present[pi];
+                bool known = false;
+                for (auto& kv : g.learned)
+                    for (auto& pv : kv.second)
+                        if (!_wcsicmp(pv.second.lnk.c_str(), name.c_str())) { known = true; break; }
+                if (known) continue;
+                std::wstring target = ResolveLnkTarget(dir + L"\\" + name);
+                if (target.empty() ||
+                    GetFileAttributesW(target.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+                std::wstring stem = name.substr(0, name.size() - 4);  // 去 .lnk
+                if (stem.size() > 4) {  // 去 " (N)" 序号尾巴
+                    size_t rp = stem.find_last_of(L')');
+                    if (rp != std::wstring::npos && rp + 1 == stem.size() && rp >= 3) {
+                        size_t lp = stem.rfind(L'(', rp);
+                        if (lp != std::wstring::npos && lp + 1 < rp) {
+                            bool digits = true;
+                            for (size_t k = lp + 1; k < rp; ++k)
+                                if (stem[k] < L'0' || stem[k] > L'9') { digits = false; break; }
+                            if (digits && lp > 0 && stem[lp - 1] == L' ')
+                                stem.resize(lp - 1);
+                        }
+                    }
+                }
+                std::wstring term = NormalizeSearchTerm(stem);
+                if (term.empty()) continue;
+                LearnVal v;
+                v.count = 1;
+                v.last = FileTimeToUnix(stamps[pi].second);
+                v.lnk = name;
+                if (g.learned[term].emplace(target, v).second) {
+                    ++g.learnCount;
+                    g.learnedDirty = true;
+                }
+            }
+        }
+    }
+
+    // 过期清理：N 天未使用即遗忘（0 = 永不过期，长期保留）
+    if (g.learnExpire > 0) {
+        long long cutoff = NowUnix() - (long long)g.learnExpire * 86400;
+        for (auto tk = g.learned.begin(); tk != g.learned.end();) {
+            for (auto pk = tk->second.begin(); pk != tk->second.end();) {
+                if (pk->second.last < cutoff) {
+                    DeleteEntryLnk(pk->second);
+                    pk = tk->second.erase(pk);
+                    if (g.learnCount > 0) --g.learnCount;
+                    g.learnedDirty = true;
+                } else ++pk;
+            }
+            if (tk->second.empty()) tk = g.learned.erase(tk);
+            else ++tk;
+        }
+    }
+    if (g.learnedDirty) SaveLearnedNow();
+}
+
+// 清空全部学习数据（设置页两步确认后调用）：删除目录里的 .lnk，立即写空文件
+static void ClearLearned() {
+    WIN32_FIND_DATAW fd{};
+    std::wstring dir = LearnedDirPath();
+    HANDLE h = FindFirstFileW((dir + L"\\*.lnk").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+                DeleteFileW((dir + L"\\" + fd.cFileName).c_str());
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    g.learned.clear();
+    g.learnCount = 0;
+    g.learnedDirty = true;
+    SaveLearnedNow();
+}
+
+// 把命中的学习项插到结果最前面（exe 优先；与当前结果按路径去重后重新置顶）
+static void PrependLearnedRows(const std::wstring& term) {
+    if (!g.learnEnabled || term.empty()) return;
+    struct Cand {
+        std::wstring path;
+        int count;
+        long long last;
+        bool exact;   // 学习词与查询词完全一致（优先于前缀命中）
+        bool isExe;
+        bool isDir;
+    };
+    std::vector<Cand> cs;
+    size_t plen = term.size();
+    for (auto& kv : g.learned) {
+        bool exact = kv.first == term;
+        if (!exact && (kv.first.size() <= plen ||
+                       wcsncmp(kv.first.c_str(), term.c_str(), plen) != 0))
+            continue;
+        for (auto& pv : kv.second) {
+            DWORD attr = GetFileAttributesW(pv.first.c_str());
+            if (attr == INVALID_FILE_ATTRIBUTES) continue;  // 目标暂不在：本次不展示
+            bool isDir = (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            cs.push_back({pv.first, pv.second.count, pv.second.last, exact,
+                          !isDir && EndsWithI(pv.first, L".exe"), isDir});
+        }
+    }
+    if (cs.empty()) return;
+    std::sort(cs.begin(), cs.end(), [](const Cand& a, const Cand& b) {
+        if (a.exact != b.exact) return a.exact;
+        if (a.isExe != b.isExe) return a.isExe;   // exe 优先
+        if (a.count != b.count) return a.count > b.count;
+        return a.last > b.last;
+    });
+    size_t n = (std::min)(cs.size(), (size_t)10);
+    for (size_t i = 0; i < n; ++i) {
+        const Cand& c = cs[i];
+        // 同一目标已在结果里（Everything 命中或权重重排）：摘掉原行，改由学习位置顶
+        for (size_t k = 0; k < g.items.size();) {
+            if (g.items[k].kind != Row::Hint && _wcsicmp(g.items[k].action.c_str(),
+                                                         c.path.c_str()) == 0)
+                g.items.erase(g.items.begin() + k);
+            else ++k;
+        }
+        Row r;
+        r.kind = c.isDir ? Row::Folder : Row::File;
+        size_t s = c.path.find_last_of(L"\\/");
+        r.title = (s == std::wstring::npos) ? c.path : c.path.substr(s + 1);
+        r.sub = c.path;
+        r.action = c.path;
+        g.items.insert(g.items.begin(), std::move(r));
+    }
 }
 
 // ---------------- 绘制 ----------------
@@ -3669,6 +4185,19 @@ constexpr int IDC_BTN_EXCLUDE_DEFAULT = 3050; // 「恢复默认」按钮：填�
 constexpr int IDC_LBL_EXCLUDEHINT = 3051;    // 排除路径说明：语法、作用范围、命中规则
 constexpr int IDC_LBL_EXCLUDECOUNT = 3052;   // 当前已记忆 N 条排除项
 constexpr int IDC_CHK_DOTFOLDER = 3096;      // 排除路径页：不搜索 . 开头的文件与文件夹
+// 自学习 Tab（索引 9）：f/d 打开记忆的设置参数
+constexpr int IDC_TAB_LEARN = 3100;          // 左侧 Tab：自学习
+constexpr int IDC_CHK_LEARNON = 3101;        // 启用自学习开关
+constexpr int IDC_LBL_LEARNSCOPE = 3102;     // 「记录范围」标签
+constexpr int IDC_CMB_LEARNSCOPE = 3103;     // 记录范围下拉（仅 exe / exe+文件夹 / 全部）
+constexpr int IDC_LBL_LEARNMAX = 3104;       // 「条目上限」标签
+constexpr int IDC_CMB_LEARNMAX = 3105;       // 条目上限下拉
+constexpr int IDC_LBL_LEARNEXPIRE = 3106;    // 「过期清理」标签
+constexpr int IDC_CMB_LEARNEXPIRE = 3107;    // 过期策略下拉（永不过期 / N 天未使用）
+constexpr int IDC_BTN_LEARNOPEN = 3108;      // 打开快捷方式目录
+constexpr int IDC_BTN_LEARNWIPE = 3109;      // 清空自学习数据（两步确认）
+constexpr int IDC_LBL_LCOUNT = 3110;         // 当前已学习条数
+constexpr int IDC_LBL_LEARNHINT = 3111;      // 自学习页说明文字
 constexpr int IDM_THEME_BASE = 4200;  // 主题下拉菜单指令基值
 constexpr int IDM_FLUSH_BASE = 4410;  // 写入时机下拉菜单指令基值
 constexpr int IDM_MAXENT_BASE = 4420; // 条目上限下拉菜单指令基值
@@ -3795,6 +4324,14 @@ static bool DownloadFile(HWND hParent, const WCHAR* url, const WCHAR* destPath) 
 
 // 设置窗口 Tab 切换：按 g.settingsTab 显示/隐藏对应分组控件，
 // 并把「保存/取消」按钮位置随 Tab 调整（通用页按钮上移，避免大片留白）。
+static void UpdateLearnedCountLabel(HWND hSettings) {
+    if (!hSettings) return;
+    HWND w = GetDlgItem(hSettings, IDC_LBL_LCOUNT);
+    if (!w) return;
+    std::wstring cnt = L"当前已学习 " + std::to_wstring(g.learnCount) + L" 条快捷方式";
+    SetWindowTextW(w, cnt.c_str());
+}
+
 static void ShowSettingsTab(HWND h, int tab) {
     g.settingsTab = tab;
     auto vis = [h](int id, bool show) {
@@ -3872,6 +4409,19 @@ static void ShowSettingsTab(HWND h, int tab) {
     vis(IDC_LBL_CAPTURE_HINT, capture);
     vis(IDC_LBL_CAPTURE_NOTE, capture);
     if (capture) UpdateCaptureStatus(h);  // 切换到截图工具页时刷新状态
+    bool learn = (tab == 9);
+    vis(IDC_CHK_LEARNON, learn);
+    vis(IDC_LBL_LEARNSCOPE, learn);
+    vis(IDC_CMB_LEARNSCOPE, learn);
+    vis(IDC_LBL_LEARNMAX, learn);
+    vis(IDC_CMB_LEARNMAX, learn);
+    vis(IDC_LBL_LEARNEXPIRE, learn);
+    vis(IDC_CMB_LEARNEXPIRE, learn);
+    vis(IDC_BTN_LEARNOPEN, learn);
+    vis(IDC_BTN_LEARNWIPE, learn);
+    vis(IDC_LBL_LCOUNT, learn);
+    vis(IDC_LBL_LEARNHINT, learn);
+    if (learn) UpdateLearnedCountLabel(h);  // 切到自学习页时刷新条数
     // 保存/取消/恢复默认：始终显示，贴底并整行居中（由 LayoutSettings 统一处理）
     LayoutSettings(h);
     InvalidateRect(h, nullptr, TRUE);
@@ -3933,6 +4483,7 @@ static std::vector<CtlGeom> sCtl;
 static int sSettingsMargin = 0;    // 内容区左边距（像素，= S(156)）
 static int sRecordedClientH = 0;   // 记录几何时的客户区高度（用于计算纵向余量）
 static bool sWipeArmed = false;    // 「清空权重数据」两步确认的武装状态（3 秒后自动解除）
+static bool sLearnWipeArmed = false;  // 「清空自学习数据」两步确认的武装状态
 
 static void ApplyLayoutRule(int id, CtlGeom& cg) {
     switch (id) {
@@ -3982,6 +4533,17 @@ static void ApplyLayoutRule(int id, CtlGeom& cg) {
         case IDC_LBL_EXCLUDECOUNT:
         case IDC_BTN_EXCLUDE_DEFAULT:
             cg.stretchW = true;  // 排除路径页开关/提示/计数/按钮：宽度跟随
+            break;
+        case IDC_CHK_LEARNON:
+        case IDC_LBL_LEARNSCOPE:
+        case IDC_CMB_LEARNSCOPE:
+        case IDC_LBL_LEARNMAX:
+        case IDC_CMB_LEARNMAX:
+        case IDC_LBL_LEARNEXPIRE:
+        case IDC_CMB_LEARNEXPIRE:
+        case IDC_LBL_LCOUNT:
+        case IDC_LBL_LEARNHINT:
+            cg.stretchW = true;  // 自学习页控件：宽度跟随
             break;
         // Shell 与窗口页：标签/下拉/编辑宽度跟随内容区
         case IDC_LBL_SHELLTYPE:
@@ -4117,6 +4679,10 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             g.weightEnabledSaved = g.weightEnabled;  // 取消时回退用
             g.weightFlushSaved = g.weightFlush;
             g.weightMaxSaved = g.weightMaxEntries;
+            g.learnEnabledSaved = g.learnEnabled;    // 自学习参数（取消时回退）
+            g.learnScopeSaved = g.learnScope;
+            g.learnMaxSaved = g.learnMaxEntries;
+            g.learnExpireSaved = g.learnExpire;
             g.fdjEnabled = fdj_enabled();         // 初始化自注册表（默认开）
             g.fdjEnabledSaved = g.fdjEnabled;
             g.skipDotFoldersSaved = g.skipDotFolders;  // 点开头文件夹过滤（取消时回退）
@@ -4171,6 +4737,11 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                                 S(10), S(376), S(120), S(36), h,
                                 (HMENU)(INT_PTR)IDC_TAB_CAPTURE, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+            c = CreateWindowExW(0, L"BUTTON", L"自学习",
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                S(10), S(420), S(120), S(36), h,
+                                (HMENU)(INT_PTR)IDC_TAB_LEARN, g.inst, nullptr);
             SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
 
             c = CreateWindowExW(0, L"BUTTON", L"开机自动启动",
@@ -4689,6 +5260,106 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                                 (HMENU)(INT_PTR)IDC_LBL_CAPTURE_NOTE, g.inst, nullptr);
             SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
 
+            // 自学习 Tab（索引 9）：f/d 打开记忆的参数
+            c = CreateWindowExW(0, L"BUTTON",
+                                L"启用自学习（f/d 搜索打开过的条目自动记忆，下次同词搜索置顶）",
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                margin, S(20), contentW, S(24), h,
+                                (HMENU)(INT_PTR)IDC_CHK_LEARNON, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+
+            c = CreateWindowExW(0, L"STATIC", L"记录范围：",
+                                WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE, margin, S(54), S(90),
+                                S(28), h, (HMENU)(INT_PTR)IDC_LBL_LEARNSCOPE, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+            c = CreateWindowExW(0, L"COMBOBOX", nullptr,
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST |
+                                    CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL,
+                                margin + S(90), S(56), contentW - S(90), S(28), h,
+                                (HMENU)(INT_PTR)IDC_CMB_LEARNSCOPE, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+            SetWindowTheme(c, L"DarkMode_Explorer", nullptr);
+            {
+                for (int i = 0; i < 3; ++i)
+                    SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)LearnScopeText(i));
+                SendMessageW(c, CB_SETCURSEL, g.learnScope, 0);
+            }
+
+            c = CreateWindowExW(0, L"STATIC", L"条目上限：",
+                                WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE, margin, S(90), S(90),
+                                S(28), h, (HMENU)(INT_PTR)IDC_LBL_LEARNMAX, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+            c = CreateWindowExW(0, L"COMBOBOX", nullptr,
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST |
+                                    CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL,
+                                margin + S(90), S(92), contentW - S(90), S(28), h,
+                                (HMENU)(INT_PTR)IDC_CMB_LEARNMAX, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+            SetWindowTheme(c, L"DarkMode_Explorer", nullptr);
+            {
+                static const int kLearnMaxOpts[] = {100, 200, 500, 1000, 2000, 5000};
+                WCHAR buf[6][32];
+                int sel = 2;
+                for (int i = 0; i < 6; ++i) {
+                    swprintf_s(buf[i], L"%d 条", kLearnMaxOpts[i]);
+                    SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)buf[i]);
+                    if (kLearnMaxOpts[i] == g.learnMaxEntries) sel = i;
+                }
+                SendMessageW(c, CB_SETCURSEL, sel, 0);
+            }
+
+            c = CreateWindowExW(0, L"STATIC", L"过期清理：",
+                                WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE, margin, S(126), S(90),
+                                S(28), h, (HMENU)(INT_PTR)IDC_LBL_LEARNEXPIRE, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+            c = CreateWindowExW(0, L"COMBOBOX", nullptr,
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST |
+                                    CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL,
+                                margin + S(90), S(128), contentW - S(90), S(28), h,
+                                (HMENU)(INT_PTR)IDC_CMB_LEARNEXPIRE, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+            SetWindowTheme(c, L"DarkMode_Explorer", nullptr);
+            {
+                static const int kExpireOpts[] = {0, 90, 180, 365};
+                for (int i = 0; i < 4; ++i)
+                    SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)LearnExpireText(kExpireOpts[i]));
+                int sel = 0;
+                for (int i = 0; i < 4; ++i)
+                    if (kExpireOpts[i] == g.learnExpire) sel = i;
+                SendMessageW(c, CB_SETCURSEL, sel, 0);
+            }
+
+            c = CreateWindowExW(0, L"BUTTON", L"打开快捷方式目录",
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                margin, S(166), S(160), S(32), h,
+                                (HMENU)(INT_PTR)IDC_BTN_LEARNOPEN, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+            c = CreateWindowExW(0, L"BUTTON", L"清空自学习数据…",
+                                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                margin + S(172), S(166), S(160), S(32), h,
+                                (HMENU)(INT_PTR)IDC_BTN_LEARNWIPE, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+
+            {
+                c = CreateWindowExW(0, L"STATIC", L"",
+                                    WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE, margin, S(208),
+                                    contentW, S(20), h, (HMENU)(INT_PTR)IDC_LBL_LCOUNT,
+                                    g.inst, nullptr);
+                SendMessageW(c, WM_SETFONT, (WPARAM)g.fList, TRUE);
+                std::wstring cnt = L"当前已学习 " + std::to_wstring(g.learnCount) +
+                                   L" 条快捷方式";
+                SetWindowTextW(c, cnt.c_str());
+            }
+
+            c = CreateWindowExW(0, L"STATIC",
+                                L"仅在 f / d 前缀搜索生效：打开成功后按「搜索词 → 路径」记入 "
+                                L"%APPDATA%\\Flowtary\\learned.dat，并在同目录 learned 文件夹镜像一个 "
+                                L".lnk 快捷方式（可拷贝、可备份）。同词或前缀词搜索时学习项置顶，"
+                                L"exe 优先；删除 .lnk 即遗忘对应条目。写盘时机沿用「搜索权重」页设置。",
+                                WS_CHILD | WS_VISIBLE, margin, S(236), contentW, S(72), h,
+                                (HMENU)(INT_PTR)IDC_LBL_LEARNHINT, g.inst, nullptr);
+            SendMessageW(c, WM_SETFONT, (WPARAM)g.fList, TRUE);
+
             RecordSettingsLayout(h);            // 记录初始几何，之后可随窗口缩放重排
             ShowSettingsTab(h, g.settingsTab);  // 按当前 Tab 初始化分组可见性并重排
             UpdateCaptureStatus(h);             // 初始化截图工具状态标签
@@ -4717,6 +5388,13 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 sWipeArmed = false;
                 SetWindowTextW(GetDlgItem(h, IDC_BTN_WIPE), L"清空权重数据…");
                 InvalidateRect(GetDlgItem(h, IDC_BTN_WIPE), nullptr, TRUE);
+            }
+            // 「清空自学习数据」两步确认超时解除
+            if (wp == 9002 && sLearnWipeArmed) {
+                KillTimer(h, 9002);
+                sLearnWipeArmed = false;
+                SetWindowTextW(GetDlgItem(h, IDC_BTN_LEARNWIPE), L"清空自学习数据…");
+                InvalidateRect(GetDlgItem(h, IDC_BTN_LEARNWIPE), nullptr, TRUE);
             }
             return 0;
 
@@ -4929,7 +5607,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 if (id == IDC_CHK_CMD || id == IDC_CHK_WIN || id == IDC_CHK_CAPTURE ||
                     id == IDC_CHK_START || id == IDC_CHK_BEAUTIFY ||
                     id == IDC_CHK_WEIGHTON || id == IDC_CHK_FILEDLGJUMP ||
-                    id == IDC_CHK_DOTFOLDER ||
+                    id == IDC_CHK_DOTFOLDER || id == IDC_CHK_LEARNON ||
                     id == IDC_CHK_TOP || id == IDC_CHK_GHOST ||
                     id == IDC_CHK_SHOWWIN || id == IDC_CHK_WINGROUP ||
                     id == IDC_CHK_WINUWP || id == IDC_CHK_WINPROC) {
@@ -4949,6 +5627,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                                  : (id == IDC_CHK_BEAUTIFY) ? g.beautify
                                  : (id == IDC_CHK_FILEDLGJUMP) ? g.fdjEnabled
                                  : (id == IDC_CHK_DOTFOLDER) ? g.skipDotFolders
+                                 : (id == IDC_CHK_LEARNON) ? g.learnEnabled
                                  : (id == IDC_CHK_TOP) ? g.topEnabled
                                  : (id == IDC_CHK_CMD) ? g.cmdEnabled
                                  : (id == IDC_CHK_WIN) ? g.winEnabled
@@ -4984,7 +5663,8 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 if (id == IDC_CMB_WAKE || id == IDC_CMB_THEME || id == IDC_CMB_HOTKEY ||
                     id == IDC_CMB_FLUSH || id == IDC_CMB_MAXENT ||
                     id == IDC_CMB_SHELLTYPE || id == IDC_CMB_SHELLCWD ||
-                    id == IDC_CMB_WINCACHE) {
+                    id == IDC_CMB_WINCACHE || id == IDC_CMB_LEARNSCOPE ||
+                    id == IDC_CMB_LEARNMAX || id == IDC_CMB_LEARNEXPIRE) {
                     // 下拉按钮：深底 + 描边 + 当前项文字 + ▾ 箭头（唤醒位置/主题/快捷键方案/权重参数共用）
                     bool pressed = (dis->itemState & ODS_SELECTED) != 0;
                     HBRUSH bks = CreateSolidBrush(pressed ? t.editBg : t.menuBg);
@@ -5005,6 +5685,9 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                       : id == IDC_CMB_SHELLTYPE ? ShellTypeName(g.shellType)
                       : id == IDC_CMB_SHELLCWD ? ShellCwdName(g.shellDefaultCwd)
                       : id == IDC_CMB_WINCACHE ? (swprintf_s(maxBuf, L"%d 秒", g.winCacheSec), maxBuf)
+                      : id == IDC_CMB_LEARNSCOPE ? LearnScopeText(g.learnScope)
+                      : id == IDC_CMB_LEARNEXPIRE ? LearnExpireText(g.learnExpire)
+                      : id == IDC_CMB_LEARNMAX ? (swprintf_s(maxBuf, L"%d 条", g.learnMaxEntries), maxBuf)
                       : (swprintf_s(maxBuf, L"%d 条", g.weightMaxEntries), maxBuf);
                     RECT tr = dis->rcItem;
                     tr.left += S(10);
@@ -5028,7 +5711,8 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 if (id == IDC_TAB_GENERAL || id == IDC_TAB_WEB || id == IDC_TAB_THEME ||
                     id == IDC_TAB_GROUP || id == IDC_TAB_WEIGHT || id == IDC_TAB_EXCLUDE ||
-                    id == IDC_TAB_SHELL || id == IDC_TAB_CMD || id == IDC_TAB_CAPTURE) {
+                    id == IDC_TAB_SHELL || id == IDC_TAB_CMD || id == IDC_TAB_CAPTURE ||
+                    id == IDC_TAB_LEARN) {
                     // 左侧 Tab 按钮：激活项用强调色高亮，并加左侧竖条
                     int idx = (id == IDC_TAB_GENERAL) ? 0
                             : (id == IDC_TAB_WEB)     ? 1
@@ -5038,7 +5722,8 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                             : (id == IDC_TAB_EXCLUDE) ? 5
                             : (id == IDC_TAB_SHELL)   ? 6
                             : (id == IDC_TAB_CMD)     ? 7
-                                                      : 8;
+                            : (id == IDC_TAB_CAPTURE) ? 8
+                                                      : 9;
                     bool active = (g.settingsTab == idx);
                     bool hover = (dis->itemState & ODS_HOTLIGHT) != 0;
                     HBRUSH bk = CreateSolidBrush(active ? t.menuHi : (hover ? t.editBg : t.menuBg));
@@ -5065,7 +5750,8 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                                      : (id == IDC_TAB_EXCLUDE) ? L"排除路径"
                                      : (id == IDC_TAB_SHELL)   ? L"Shell 与窗口"
                                      : (id == IDC_TAB_CMD)     ? L"命令"
-                                                                : L"截图工具";
+                                     : (id == IDC_TAB_CAPTURE) ? L"截图工具"
+                                                               : L"自学习";
                     RECT tr = dis->rcItem;
                     tr.left += S(10);
                     DrawTextW(dis->hDC, lbl, -1, &tr,
@@ -5139,6 +5825,19 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 DWORD vwm = (DWORD)g.weightMaxEntries;
                 RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"WeightMaxEntries",
                                 REG_DWORD, &vwm, sizeof(vwm));
+                // —— 自学习参数持久化 ——
+                DWORD vle = g.learnEnabled ? 1 : 0;
+                RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"LearnEnabled",
+                                REG_DWORD, &vle, sizeof(vle));
+                DWORD vlsc = (DWORD)g.learnScope;
+                RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"LearnScope",
+                                REG_DWORD, &vlsc, sizeof(vlsc));
+                DWORD vlm = (DWORD)g.learnMaxEntries;
+                RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"LearnMaxEntries",
+                                REG_DWORD, &vlm, sizeof(vlm));
+                DWORD vld = (DWORD)g.learnExpire;
+                RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"LearnExpireDays",
+                                REG_DWORD, &vld, sizeof(vld));
                 fdj_set_enabled(g.fdjEnabled);  // 文件对话框跳转开关持久化到注册表
                 DWORD vsd = g.skipDotFolders ? 1 : 0;  // 点开头文件夹过滤（默认开）
                 RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"SkipDotFolders",
@@ -5269,6 +5968,9 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             } else if (id == IDC_CHK_DOTFOLDER && HIWORD(wp) == BN_CLICKED) {
                 g.skipDotFolders = !g.skipDotFolders;
                 InvalidateRect(GetDlgItem(h, IDC_CHK_DOTFOLDER), nullptr, TRUE);
+            } else if (id == IDC_CHK_LEARNON && HIWORD(wp) == BN_CLICKED) {
+                g.learnEnabled = !g.learnEnabled;
+                InvalidateRect(GetDlgItem(h, IDC_CHK_LEARNON), nullptr, TRUE);
             } else if (id == IDC_CHK_TOP && HIWORD(wp) == BN_CLICKED) {
                 g.topEnabled = !g.topEnabled;
                 InvalidateRect(GetDlgItem(h, IDC_CHK_TOP), nullptr, TRUE);
@@ -5300,6 +6002,37 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 static const int kMaxEntOpts[] = {1000, 5000, 20000, 50000};
                 int s = (int)SendMessageW((HWND)lp, CB_GETCURSEL, 0, 0);
                 if (s >= 0 && s < 4) g.weightMaxEntries = kMaxEntOpts[s];
+            } else if (id == IDC_CMB_LEARNSCOPE && HIWORD(wp) == CBN_SELCHANGE) {
+                int s = (int)SendMessageW((HWND)lp, CB_GETCURSEL, 0, 0);
+                if (s >= 0 && s < 3) g.learnScope = s;
+            } else if (id == IDC_CMB_LEARNMAX && HIWORD(wp) == CBN_SELCHANGE) {
+                static const int kLearnMaxOpts[] = {100, 200, 500, 1000, 2000, 5000};
+                int s = (int)SendMessageW((HWND)lp, CB_GETCURSEL, 0, 0);
+                if (s >= 0 && s < 6) g.learnMaxEntries = kLearnMaxOpts[s];
+            } else if (id == IDC_CMB_LEARNEXPIRE && HIWORD(wp) == CBN_SELCHANGE) {
+                static const int kExpireOpts[] = {0, 90, 180, 365};
+                int s = (int)SendMessageW((HWND)lp, CB_GETCURSEL, 0, 0);
+                if (s >= 0 && s < 4) g.learnExpire = kExpireOpts[s];
+            } else if (id == IDC_BTN_LEARNOPEN && HIWORD(wp) == BN_CLICKED) {
+                // 打开自学习快捷方式目录（不存在则先创建）
+                std::wstring dir = LearnedDirPath();
+                CreateDirectoryW(dir.c_str(), nullptr);
+                ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            } else if (id == IDC_BTN_LEARNWIPE && HIWORD(wp) == BN_CLICKED) {
+                // 清空自学习数据：两步确认（3 秒内再点一次才执行，避免误触）
+                HWND bw = GetDlgItem(h, IDC_BTN_LEARNWIPE);
+                if (!sLearnWipeArmed) {
+                    sLearnWipeArmed = true;
+                    SetWindowTextW(bw, L"再次点击确认清空");
+                    SetTimer(h, 9002, 3000, nullptr);
+                } else {
+                    KillTimer(h, 9002);
+                    sLearnWipeArmed = false;
+                    SetWindowTextW(bw, L"清空自学习数据…");
+                    ClearLearned();
+                    UpdateLearnedCountLabel(h);
+                }
+                InvalidateRect(bw, nullptr, TRUE);
             } else if (id == IDC_BTN_WIPE && HIWORD(wp) == BN_CLICKED) {
                 // 清空权重数据：两步确认（3 秒内再点一次才执行，避免误触）
                 HWND bw = GetDlgItem(h, IDC_BTN_WIPE);
@@ -5319,7 +6052,8 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 } else if ((id == IDC_TAB_GENERAL || id == IDC_TAB_WEB || id == IDC_TAB_THEME ||
                           id == IDC_TAB_GROUP || id == IDC_TAB_WEIGHT ||
                           id == IDC_TAB_EXCLUDE || id == IDC_TAB_SHELL ||
-                          id == IDC_TAB_CMD || id == IDC_TAB_CAPTURE) &&
+                          id == IDC_TAB_CMD || id == IDC_TAB_CAPTURE ||
+                          id == IDC_TAB_LEARN) &&
                          HIWORD(wp) == BN_CLICKED) {
                 ShowSettingsTab(h, (id == IDC_TAB_GENERAL) ? 0
                                  : (id == IDC_TAB_WEB)    ? 1
@@ -5329,7 +6063,8 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                                  : (id == IDC_TAB_EXCLUDE) ? 5
                                  : (id == IDC_TAB_SHELL)   ? 6
                                  : (id == IDC_TAB_CMD)     ? 7
-                                                           : 8);
+                                 : (id == IDC_TAB_CAPTURE) ? 8
+                                                           : 9);
              } else if (id == IDC_CMB_WAKE && HIWORD(wp) == CBN_SELCHANGE) {
                 int s = (int)SendMessageW((HWND)lp, CB_GETCURSEL, 0, 0);
                 if (s >= 0 && s < 2) g.centerWake = (s == 0);
@@ -5385,6 +6120,11 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 g.weightEnabled = g.weightEnabledSaved;
                 g.weightFlush = g.weightFlushSaved;
                 g.weightMaxEntries = g.weightMaxSaved;
+                // 自学习页：取消即回退未保存的参数
+                g.learnEnabled = g.learnEnabledSaved;
+                g.learnScope = g.learnScopeSaved;
+                g.learnMaxEntries = g.learnMaxSaved;
+                g.learnExpire = g.learnExpireSaved;
                 g.fdjEnabled = g.fdjEnabledSaved;    // 文件对话框跳转：取消即回退
                 g.skipDotFolders = g.skipDotFoldersSaved;  // 点开头文件夹过滤：取消即回退
                 g.topEnabled = g.topEnabledSaved;    // top 命令开关：取消即回退
@@ -5466,6 +6206,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_DESTROY:
             g.hSettings = nullptr;
             sWipeArmed = false;
+            sLearnWipeArmed = false;
             return 0;
     }
     return DefWindowProcW(h, msg, wp, lp);
@@ -5490,7 +6231,7 @@ static void OpenSettings() {
     }
     HMONITOR mon = MonitorFromWindow(g.hwnd, MONITOR_DEFAULTTONEAREST);
     UpdateScale(mon);  // 窗口与控件尺寸按当前屏幕比例创建
-    int W = S(600), H = S(490);
+    int W = S(600), H = S(540);  // 高度含 10 个左侧 Tab（自学习页按钮贴底需要多一行空间）
     MONITORINFO mi{};
     mi.cbSize = sizeof(mi);
     GetMonitorInfoW(mon, &mi);
@@ -5558,6 +6299,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_DESTROY:
             KillTimer(hwnd, kTimerBlink);
             SaveClickWeightsNow();  // 退出前把未写盘的点击权重落盘（含「仅退出时写入」模式）
+            SaveLearnedNow();       // 自学习数据同样落盘
             TrayRemove();
             if (g.hSettings) DestroyWindow(g.hSettings);
             if (g.hTrayIcon) {
@@ -5675,6 +6417,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             } else if (wParam == kTimerWeightSave) {
                 KillTimer(hwnd, kTimerWeightSave);
                 SaveClickWeightsNow();  // 延迟合并写盘到期：一次写出全部权重
+                SaveLearnedNow();       // 自学习数据同步落盘
             } else if (wParam == kTimerBlink) {
                 g.caretOn = !g.caretOn;
                 RECT r{0, 0, S(kBaseW), S(kBaseInputH)};
@@ -6529,6 +7272,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     LoadGroupRules();
     LoadExcludePaths();  // 排除路径（设置可编辑），作用于 Everything + 程序搜索结果
     LoadClickWeights();  // 点击权重数据（%APPDATA%\Flowtary\weights.dat）
+    LoadLearned();       // f/d 自学习数据（learned.dat + learned\*.lnk 双向同步）
     EnableDarkMenus();  // 按主题深浅强制弹出菜单（托盘/右键） 绘制
 
     // 初始化拼音库

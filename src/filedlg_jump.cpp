@@ -11,6 +11,7 @@
 // 失败一律静默：不弹窗、不阻塞，仅记录日志。
 //
 #include "filedlg_jump.h"
+#include "version.h"
 
 #include <shlobj.h>
 #include <shobjidl.h>
@@ -164,18 +165,96 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd,
     }
 }
 
+// ---------------- 版本化钩子副本 ----------------
+// 全局钩子（SetWindowsHookEx 的 hMod 传 0）会把 DLL 映射进几乎所有 GUI 进程，
+// 因此安装目录里的 filedlg_hook64.dll 在退出前删不掉/覆盖后会残留旧文件。
+// 解法：真正加载的是 %LOCALAPPDATA%\Flowtary\hooks\filedlg_hook64_<版本>.dll，
+// 安装目录只作为拷贝源、永不被 LoadLibrary，部署时随便覆盖；旧版本副本在每次
+// 启动时尽力清理（仍被占用的留到下次）。
+static BOOL ExeDir(WCHAR* out, size_t cch) {
+    if (!GetModuleFileNameW(nullptr, out, (DWORD)cch)) return FALSE;
+    WCHAR* slash = wcsrchr(out, L'\\');
+    if (!slash) return FALSE;
+    *slash = 0;
+    return TRUE;
+}
+
+// 把 exe 目录的 dllName 拷成版本化副本，返回副本完整路径（失败则回退返回 exe 目录原路径）
+static std::wstring VersionedHookCopy(const WCHAR* dllName) {
+    WCHAR exeDir[MAX_PATH], appdata[MAX_PATH];
+    std::wstring src;
+    if (ExeDir(exeDir, _countof(exeDir))) {
+        src = exeDir;
+        src += L"\\";
+        src += dllName;
+    }
+    if (src.empty() || GetFileAttributesW(src.c_str()) == INVALID_FILE_ATTRIBUTES)
+        return src;  // 没有源文件，交回给调用方（保持旧行为）
+
+    WCHAR stem[MAX_PATH], ext[16];
+    lstrcpynW(stem, dllName, _countof(stem));
+    WCHAR* dot = wcsrchr(stem, L'.');
+    if (dot) { lstrcpynW(ext, dot, _countof(ext)); *dot = 0; }
+    else ext[0] = 0;
+
+    std::wstring dstDir;
+    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, appdata))) {
+        dstDir = appdata;
+        dstDir += L"\\Flowtary\\hooks";
+        if (SHCreateDirectoryExW(nullptr, dstDir.c_str(), nullptr) != ERROR_SUCCESS
+            && GetFileAttributesW(dstDir.c_str()) == INVALID_FILE_ATTRIBUTES)
+            return src;
+        dstDir += L"\\";
+    } else {
+        return src;
+    }
+
+    std::wstring dst = dstDir + stem + L"_" FT_VER_DOT + ext;
+
+    // 已存在且与源一致（大小 + 修改时间）则复用，避免每次启动重写
+    WIN32_FILE_ATTRIBUTE_DATA s{}, d{};
+    if (GetFileAttributesExW(src.c_str(), GetFileExInfoStandard, &s) &&
+        GetFileAttributesExW(dst.c_str(), GetFileExInfoStandard, &d) &&
+        s.nFileSizeLow == d.nFileSizeLow && s.nFileSizeHigh == d.nFileSizeHigh &&
+        s.ftLastWriteTime.dwHighDateTime == d.ftLastWriteTime.dwHighDateTime &&
+        s.ftLastWriteTime.dwLowDateTime == d.ftLastWriteTime.dwLowDateTime)
+        return dst;
+
+    if (CopyFileW(src.c_str(), dst.c_str(), FALSE)) return dst;
+    Log(L"hook copy failed %s -> %s (%lu)", src.c_str(), dst.c_str(), GetLastError());
+    return src;  // 兜底：仍从安装目录加载，功能不中断
+}
+
+// 清理非当前版本的钩子副本（删除失败忽略，下次启动再试）
+static void SweepOldHookCopies() {
+    WCHAR appdata[MAX_PATH];
+    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, appdata))) return;
+    std::wstring dir = appdata;
+    dir += L"\\Flowtary\\hooks\\";
+    WIN32_FIND_DATAW fd;
+    std::wstring pat = dir + L"filedlg_hook*.dll";
+    HANDLE h = FindFirstFileW(pat.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (wcsstr(fd.cFileName, L"_" FT_VER_DOT L".") == nullptr) {
+            std::wstring full = dir + fd.cFileName;
+            if (!DeleteFileW(full.c_str()))
+                Log(L"sweep: still locked %s", fd.cFileName);
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
 // ---------------- CBT 钩子 DLL 安装（64 位由本进程直接安装）----------------
 // 64 位 CBT 钩子直接在本进程安装（LoadLibrary 64 位 DLL）。
 // 32 位钩子由 agent32.exe 负责（64 位进程无法加载 32 位 DLL）。
 typedef LRESULT (CALLBACK* CBTProcType)(int, WPARAM, LPARAM);
 static BOOL InstallHook64() {
-    WCHAR dir[MAX_PATH];
-    if (!GetModuleFileNameW(nullptr, dir, _countof(dir))) return FALSE;
-    // 取本 exe 所在目录
-    WCHAR* slash = wcsrchr(dir, L'\\');
-    if (slash) lstrcpyW(slash + 1, L"filedlg_hook64.dll");
-    g_hMod64 = LoadLibraryW(dir);
-    if (!g_hMod64) { Log(L"LoadLibrary filedlg_hook64.dll failed %lu", GetLastError()); return FALSE; }
+    std::wstring dll = VersionedHookCopy(L"filedlg_hook64.dll");
+    if (dll.empty()) { Log(L"filedlg_hook64.dll not found"); return FALSE; }
+    g_hMod64 = LoadLibraryW(dll.c_str());
+    if (!g_hMod64) { Log(L"LoadLibrary %s failed %lu", dll.c_str(), GetLastError()); return FALSE; }
     CBTProcType cbtProc = (CBTProcType)GetProcAddress(g_hMod64, "CbtProc");
     CBTProcType msgProc = (CBTProcType)GetProcAddress(g_hMod64, "GetMsgProc");
     if (!cbtProc || !msgProc) { Log(L"GetProcAddress CbtProc/GetMsgProc failed"); return FALSE; }
@@ -192,13 +271,18 @@ static BOOL InstallHook64() {
 
 static BOOL StartAgent32() {
     WCHAR dir[MAX_PATH];
-    if (!GetModuleFileNameW(nullptr, dir, _countof(dir))) return FALSE;
-    WCHAR* slash = wcsrchr(dir, L'\\');
-    if (!slash) return FALSE;
-    lstrcpyW(slash + 1, L"filedlg_agent32.exe");
+    if (!ExeDir(dir, _countof(dir))) return FALSE;
+    std::wstring agent = dir;
+    agent += L"\\filedlg_agent32.exe";
+    // 让 32 位助手加载版本化副本，避免安装目录的 filedlg_hook32.dll 被锁
+    std::wstring hook32 = VersionedHookCopy(L"filedlg_hook32.dll");
+    std::wstring cmd = L"\"";
+    cmd += agent;
+    cmd += L"\"";
+    if (!hook32.empty()) { cmd += L" \""; cmd += hook32; cmd += L"\""; }
     STARTUPINFOW si{}; si.cb = sizeof(si);
     si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
-    if (!CreateProcessW(dir, nullptr, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &g_agent32)) {
+    if (!CreateProcessW(agent.c_str(), (LPWSTR)cmd.c_str(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &g_agent32)) {
         Log(L"CreateProcess filedlg_agent32.exe failed %lu", GetLastError());
         return FALSE;
     }
@@ -219,6 +303,7 @@ BOOL fdj_init(HWND hostWnd) {
     if (!g_weCreate || !g_weForeground)
         Log(L"SetWinEventHook partial failure (create=%p fg=%p)", (void*)g_weCreate, (void*)g_weForeground);
 
+    SweepOldHookCopies();
     InstallHook64();
     StartAgent32();
     Log(L"fdj_init done (enabled=%d)", fdj_enabled());
