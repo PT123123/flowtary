@@ -465,6 +465,7 @@ struct App {
 
     std::wstring evQuery;      // 待发往 Everything 的完整查询串（含 file:/folder:）
     std::wstring evFallbackQuery;  // 路径级兜底查询：主查询（按名字）零结果时自动追发一次；发出即清空
+    bool evFallbackPending = false;  // 兜底查询已排期、等待 WM_APP_EV_FALLBACK 发送
     std::wstring evSentQuery;  // 上一次实际发出的查询串（回复到达时核对仍处于同一阶段）
     DWORD expectReply = 0;     // 期待的结果消息 dwData
     DWORD serial = 0;
@@ -528,6 +529,7 @@ constexpr int kWeightSaveDelayMs = 3000;   // 延迟合并写盘的等待时间
 constexpr int WM_APP_TRAY = WM_APP + 1;
 constexpr int WM_APP_PROGRAMS_READY = WM_APP + 2;  // 工作线程扫描完成，回主线程接管结果
 constexpr int WM_APP_QUIT = WM_APP + 3;  // 新版本接管：通知旧实例退出
+constexpr int WM_APP_EV_FALLBACK = WM_APP + 4;  // Everything 路径级兜底查询：延迟到消息循环外发（见下）
 constexpr int IDM_SETTINGS = 2001;
 constexpr int IDM_EXIT = 2002;
 constexpr int IDM_REFRESH = 2003;   // 托盘菜单：刷新应用缓存
@@ -1549,15 +1551,19 @@ static void HandleEverythingReply(const COPYDATASTRUCT* cds) {
         g.items.push_back(std::move(r));
         ++kept;
     }
-    // 主查询（关键词匹配名字）零结果：自动追发一次「路径级」查询——
+    // 主查询（关键词匹配名字）零结果：排期一次「路径级」兜底查询——
     // 关键词改匹配整条路径（含所在目录），如 d aw-qtui software 命中 C:\software\aw-qtui。
-    // 条件：兜底串未发过、且发出去的仍是本次主查询（用户中途改输入则作废）。
+    // 注意：本函数运行在 WM_COPYDATA 回调里，Everything 的 IPC 线程可能仍阻塞在
+    // 发给我们这条消息的 SendMessage 上；此处绝不能再同步 SendMessageTimeout 回去
+    // （重入会让 Everything 超时不应答，被误判成「IPC 未连接」）——只置标志 + PostMessage，
+    // 由消息循环里的 WM_APP_EV_FALLBACK 真正把查询发出去。
     if (g.items.empty() && !g.evFallbackQuery.empty() && !g.startingUp &&
         g.evSentQuery == g.evQuery) {
         g.evQuery = g.evFallbackQuery;
         g.evFallbackQuery.clear();
-        ExecuteEverythingQuery();
-        if (g.items.empty()) AddHint(L"正在搜索…");  // IPC 断开时上面已换成回退行
+        g.evFallbackPending = true;
+        PostMessageW(g.hwnd, WM_APP_EV_FALLBACK, 0, 0);
+        AddHint(L"正在搜索…");
         g.sel = 0;
         LayoutAndRepaint();
         return;
@@ -1937,6 +1943,7 @@ static void Refresh() {
             }
         } else if (tok == L"d" || tok == L"f") {
             g.mode = Mode::Everything;
+            g.evFallbackPending = false;  // 新输入作废旧的兜底排期（已投递的 WM_APP 会因标志为 false 直接返回）
             if (rest.empty()) {
                 g.evFallbackQuery.clear();
                 AddHint(tok == L"f" ? L"输入关键词搜索文件" : L"输入关键词搜索文件夹");
@@ -5716,6 +5723,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             const COPYDATASTRUCT* cds = (const COPYDATASTRUCT*)lParam;
             if (cds && cds->dwData >= ev::kReplyBase) HandleEverythingReply(cds);
             return TRUE;
+        }
+
+        case WM_APP_EV_FALLBACK: {
+            // 路径级兜底查询：必须在 WM_COPYDATA 回调之外（消息循环层）发出，
+            // 否则与 Everything 的 IPC 线程互相阻塞 → 超时 → 假「IPC 未连接」。
+            if (!g.evFallbackPending) return 0;
+            g.evFallbackPending = false;
+            if (g.mode == Mode::Everything) ExecuteEverythingQuery();
+            return 0;
         }
 
         case WM_APP_PROGRAMS_READY: {
