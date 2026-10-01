@@ -2,7 +2,7 @@
 # Flowtary — Make 驱动的构建 / 发布入口（替代 build.bat / release.bat）
 #
 #   用法：
-#     make build      完整构建：x64（flowtary.exe / evtest.exe / filedlg_hook64.dll）
+#     make build      完整构建：x64（flowtary.exe / flowtary-settings.exe / evtest.exe / filedlg_hook64.dll）
 #                     + x86（filedlg_hook32.dll / filedlg_agent32.exe），全部汇到 build\
 #     make run        构建后启动 build\flowtary.exe（工作目录 build\，返回终端）
 #     make release    版本自增（tools\version_bump.ps1）+ 完整构建 + 输出到 dist\
@@ -45,7 +45,7 @@ build:
 	@call $(VCVARS32) >nul 2>&1 && $(CMAKE) --build "$(BUILD32)" --config $(CONFIG)
 	@copy /y "$(BUILD32)\filedlg_hook32.dll" "$(BUILD)\" >nul
 	@copy /y "$(BUILD32)\filedlg_agent32.exe" "$(BUILD)\" >nul
-	@echo [ok] build\flowtary.exe / build\evtest.exe
+	@echo [ok] build\flowtary.exe / build\flowtary-settings.exe / build\evtest.exe
 	@echo [ok] build\filedlg_hook64.dll / build\filedlg_hook32.dll / build\filedlg_agent32.exe
 
 # ---------------- 运行（增量构建后启动主程序） ----------------

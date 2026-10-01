@@ -21,6 +21,11 @@ if ($line -and $line.Line -match '"([^"]+)"') { $ver = $Matches[1] }
 New-Item -ItemType Directory -Force -Path $Dist | Out-Null
 
 Copy-Item (Join-Path $src 'flowtary.exe')       (Join-Path $Dist "flowtary-$ver.exe") -Force
+if (Test-Path (Join-Path $src 'flowtary-settings.exe')) {
+    Copy-Item (Join-Path $src 'flowtary-settings.exe') (Join-Path $Dist 'flowtary-settings.exe') -Force
+} else {
+    Write-Warning 'flowtary-settings.exe missing - run tools\build-fltk.bat then make build'
+}
 Copy-Item (Join-Path $src 'filedlg_hook64.dll') (Join-Path $Dist 'filedlg_hook64.dll') -Force
 Copy-Item (Join-Path $src 'filedlg_hook32.dll') (Join-Path $Dist 'filedlg_hook32.dll') -Force
 Copy-Item (Join-Path $src 'filedlg_agent32.exe')(Join-Path $Dist 'filedlg_agent32.exe') -Force

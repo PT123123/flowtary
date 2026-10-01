@@ -1,0 +1,34 @@
+// Flowtary 设置程序（sidecar）资源：版本号与图标，字段统一取自 version.h。
+#include <winver.h>
+#include "version.h"
+
+101 ICON "flowtary.ico"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    FT_VER_COMMA
+ PRODUCTVERSION FT_VER_COMMA
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+ FILEFLAGS      0x0L
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_APP
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName",      FT_COMPANY
+            VALUE "FileDescription",  "Flowtary 设置"
+            VALUE "FileVersion",      FT_VER_DOT
+            VALUE "InternalName",     "flowtary-settings"
+            VALUE "LegalCopyright",   FT_COPYRIGHT
+            VALUE "OriginalFilename", "flowtary-settings.exe"
+            VALUE "ProductName",      FT_PRODUCT_NAME
+            VALUE "ProductVersion",   FT_VER_DOT
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0804, 1200
+    END
+END

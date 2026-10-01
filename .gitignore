@@ -15,10 +15,22 @@ phaseA_build.log
 phaseB_build.log
 phaseE_build.log
 phaseE_build2.log
-phaseX_build.log# Build outputs (VS generator)
+phaseX_build.log
+
+# Build outputs (VS generator)
 build_vs/
 
 # Editor tooling
 .zcode/
 # Runtime logs
 logs/
+
+# 第三方源码/构建目录（体积大，按需本地获取，不入库）
+vendor/fltk-src.tar.gz
+vendor/fltk-1.4.5/
+vendor/fltk-build/
+vendor/fltk-install/
+vendor/slint-cpp-1.18.1/
+vendor/UltraFastFileSearch/
+tools/build-fltk.log
+build-fltk.log

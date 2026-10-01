@@ -118,6 +118,24 @@ if(CPP_PINYIN_INCLUDE_DIR)
   include_directories(${CPP_PINYIN_INCLUDE_DIR})
 endif()
 
+# =====================================================================
+# FLTK（设置窗 sidecar 的 UI 库）
+#   静态库由 tools/build-fltk.bat 预编译到 vendor/fltk-install（/MT，与本项目一致）。
+#   未构建时只跳过 flowtary-settings 目标，主程序不受影响。
+# =====================================================================
+set(FLTK_PREFIX "${CMAKE_SOURCE_DIR}/vendor/fltk-install")
+set(FLTK_FOUND FALSE)
+if(FLOWTARY_ARCH STREQUAL "x64" AND EXISTS "${FLTK_PREFIX}/CMake/FLTKConfig.cmake")
+  find_package(FLTK CONFIG QUIET PATHS "${FLTK_PREFIX}/CMake" NO_DEFAULT_PATH)
+  if(TARGET fltk::fltk)
+    set(FLTK_FOUND TRUE)
+    message(STATUS "FLTK: ${FLTK_PREFIX}")
+  endif()
+endif()
+if(NOT FLTK_FOUND)
+  message(STATUS "FLTK 未就绪：flowtary-settings.exe 不会构建（请先运行 tools\\build-fltk.bat）")
+endif()
+
 if(FLOWTARY_ARCH STREQUAL "x86")
   # ================= 32 位子构建 =================
   add_library(filedlg_hook32 SHARED src/hookdlg.cpp)
@@ -137,6 +155,7 @@ else()
   add_executable(flowtary WIN32
     src/main.cpp
     src/filedlg_jump.cpp
+    src/settings_model.cpp
     src/flowtary.rc
     src/flowtary.ico)
   set_source_files_properties(src/flowtary.ico PROPERTIES HEADER_FILE_ONLY TRUE)
@@ -173,4 +192,15 @@ else()
     OUTPUT_NAME filedlg_hook64
     PREFIX "")
   target_link_libraries(filedlg_hook64 PRIVATE ole32 uuid shell32 shlwapi user32)
+
+  if(TARGET fltk::fltk)
+    # 独立进程的设置窗（FLTK 静态链接，无额外 DLL 依赖）
+    add_executable(flowtary-settings WIN32
+      src/settings_main.cpp
+      src/settings_model.cpp
+      src/settings.rc)
+    set_target_properties(flowtary-settings PROPERTIES OUTPUT_NAME flowtary-settings)
+    target_link_libraries(flowtary-settings PRIVATE
+      fltk::fltk fltk::images comctl32 ws2_32 gdiplus user32 gdi32 shell32 ole32 advapi32 dwmapi)
+  endif()
 endif()
