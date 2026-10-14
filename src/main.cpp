@@ -414,7 +414,7 @@ static void ClearLearned();
 static std::wstring LearnedDirPath();
 static void TrayBalloon(const std::wstring& title, const std::wstring& msg);
 static HWND TopTargetWindow();  // top 命令的目标窗口（唤醒前的前台窗口）
-static void ShowTopToast(HWND target, const std::wstring& text);  // top 命令轻量 toast
+static void ShowTopToast(HWND target, const std::wstring& text);  // 屏幕居中半透明 toast（打开提示/top 命令共用）
 
 // 行 → 可触发序号（Hint 行不算）：返回第几个可执行项（用于分配数字徽章），-1=不可触发
 static int HotkeySeq(int itemIdx) {
@@ -4612,16 +4612,147 @@ static void ShowNotice(const std::wstring& title, const std::wstring& body,
     }
 }
 
-// ---------------- top 命令轻量 toast ----------------
-// 在目标窗口（顶部居中）位置显示一个快速淡入淡出、自动消失的小弹窗。
-// 相比系统托盘通知：非阻塞（不开嵌套消息循环）、无按钮、不抢焦点、停留期间不跑定时器，更省资源。
+// ---------------- 屏幕居中轻量 toast（半透明无边界药丸） ----------------
+// 打开成功 / top 置顶等场景共用：出现在目标窗口所在屏幕的正中间，
+// 半透明药丸 + 柔和外投影、无描边无边界；文字保持完全不透明。
+// 用 UpdateLayeredWindow 逐像素 alpha 合成（预乘 BGRA），
+// 淡入 120ms → 停留 1.3s → 淡出 150ms，按 16ms 定时器重建位图；
+// 非阻塞（不开嵌套消息循环）、WS_EX_NOACTIVATE 不抢焦点、点击穿透。
 struct TopToastData {
     std::wstring text;
-    int baseX = 0, baseY = 0;   // 初始位置（淡入上移用）
+    COLORREF fill = 0;          // 药丸填充色（跟随主题）
+    COLORREF textColor = 0;     // 文字色（跟随主题）
+    int fillA = 165;            // 药丸不透明度 0..255
+    int shadowA = 95;           // 投影（贴边）不透明度
+    int W = 0, H = 0;           // 位图/窗口尺寸（含投影留白，逻辑像素）
+    int pl = 0, pr = 0;         // 药丸左右边界（位图像素）
+    int cy = 0, r = 0;          // 药丸垂直中心与半径
+    int shadowR = 0;            // 投影外扩半径
+    int baseX = 0, baseY = 0;   // 窗口位置（屏幕坐标）
     DWORD t0 = 0;               // 淡入起始时间
     int phase = 0;              // 0=淡入, 1=停留, 2=淡出
     DWORD phaseT0 = 0;          // 当前阶段起始时间
 };
+
+// 像素中心到水平线段的距离（药丸 = 线段 + 半径的并集）
+static inline float ToastDistToSeg(float px, float py, float x0, float y0,
+                                   float x1, float y1) {
+    float dx = x1 - x0, dy = y1 - y0;
+    float len2 = dx * dx + dy * dy;
+    float t = len2 > 0 ? ((px - x0) * dx + (py - y0) * dy) / len2 : 0.f;
+    if (t < 0.f) t = 0.f; else if (t > 1.f) t = 1.f;
+    float ex = px - (x0 + t * dx), ey = py - (y0 + t * dy);
+    return sqrtf(ex * ex + ey * ey);
+}
+
+// 合成一帧：外投影 + 半透明药丸 + 不透明文字 → 32bpp 预乘 alpha 位图。
+// m = 整体不透明度倍率（淡入淡出）。文字掩膜由 GDI 抗锯齿绘制，灰度即覆盖率。
+static HBITMAP BuildToastFrame(const TopToastData& nd, HFONT font, float m) {
+    if (nd.W <= 0 || nd.H <= 0) return nullptr;
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = nd.W;
+    bi.bmiHeader.biHeight = -nd.H;   // top-down
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    void* bits = nullptr;
+    HBITMAP bmp = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!bmp || !bits) { if (bmp) DeleteObject(bmp); return nullptr; }
+    memset(bits, 0, (size_t)nd.W * nd.H * 4);
+
+    // 文字掩膜：黑底白字（GDI 抗锯齿），灰度 = 文字覆盖率
+    HBITMAP tmBmp = nullptr;
+    HDC tdc = CreateCompatibleDC(nullptr);
+    const BYTE* tb = nullptr;
+    if (tdc) {
+        void* tbits = nullptr;
+        tmBmp = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &tbits, nullptr, 0);
+        if (tmBmp && tbits) {
+            memset(tbits, 0, (size_t)nd.W * nd.H * 4);
+            SelectObject(tdc, tmBmp);
+            HBRUSH blk = CreateSolidBrush(RGB(0, 0, 0));
+            RECT full{0, 0, nd.W, nd.H};
+            FillRect(tdc, &full, blk);
+            DeleteObject(blk);
+            SetBkMode(tdc, TRANSPARENT);
+            SetTextColor(tdc, RGB(255, 255, 255));
+            SelectObject(tdc, font);
+            RECT tr{nd.pl + S(20), 0, nd.pr - S(20), nd.H};
+            DrawTextW(tdc, nd.text.c_str(), (int)nd.text.size(), &tr,
+                      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+            tb = (const BYTE*)tbits;
+        }
+    }
+
+    if (tb) {
+        BYTE* p = (BYTE*)bits;
+        float fr = (float)GetRValue(nd.fill), fg = (float)GetGValue(nd.fill), fb = (float)GetBValue(nd.fill);
+        float cr = (float)GetRValue(nd.textColor), cg = (float)GetGValue(nd.textColor), cb = (float)GetBValue(nd.textColor);
+        for (int y = 0; y < nd.H; ++y) {
+            for (int x = 0; x < nd.W; ++x) {
+                size_t i = (size_t)y * nd.W + x;
+                float tm = tb[i * 4] / 255.f;              // 文字覆盖率
+                float d = ToastDistToSeg(x + 0.5f, y + 0.5f, (float)nd.pl + nd.r,
+                                         (float)nd.cy, (float)nd.pr - nd.r, (float)nd.cy);
+                float cov = (float)nd.r + 0.5f - d;        // 药丸覆盖率（抗锯齿边缘）
+                if (cov < 0.f) cov = 0.f; else if (cov > 1.f) cov = 1.f;
+                // 药丸填充 + 外侧投影（二次衰减，只在药丸外）
+                float a = cov * (float)nd.fillA;
+                float sd = d - nd.r;
+                if (sd > 0.f && sd < (float)nd.shadowR) {
+                    float k = 1.f - sd / (float)nd.shadowR;
+                    float sh = k * k * (float)nd.shadowA;
+                    if (sh > a) a = sh;
+                }
+                // 颜色：文字处向文字色插值；药丸内用填充色；纯投影区黑色
+                float rr, gg, bb;
+                if (tm > 0.f) {
+                    rr = fr + (cr - fr) * tm;
+                    gg = fg + (cg - fg) * tm;
+                    bb = fb + (cb - fb) * tm;
+                } else if (cov > 0.f) {
+                    rr = fr; gg = fg; bb = fb;
+                } else {
+                    rr = gg = bb = 0.f;
+                }
+                float ta = tm * 255.f;                    // 文字保持完全不透明
+                if (ta > a) a = ta;
+                a *= m;
+                if (a < 1.f) continue;                    // 全透明像素不动（已清零）
+                if (a > 255.f) a = 255.f;
+                p[i * 4]     = (BYTE)(bb * a / 255.f);    // 预乘 BGRA
+                p[i * 4 + 1] = (BYTE)(gg * a / 255.f);
+                p[i * 4 + 2] = (BYTE)(rr * a / 255.f);
+                p[i * 4 + 3] = (BYTE)a;
+            }
+        }
+    }
+    if (tdc) DeleteDC(tdc);
+    if (tmBmp) DeleteObject(tmBmp);
+    return bmp;
+}
+
+// 把当前帧推送到分层窗口（位置不变，仅内容/透明度变化）
+static void ToastPushFrame(HWND h, const TopToastData& nd, HFONT font, float m) {
+    HBITMAP bmp = BuildToastFrame(nd, font, m);
+    if (!bmp) return;
+    HDC wdc = GetDC(h);
+    if (wdc) {
+        HDC mem = CreateCompatibleDC(wdc);
+        if (mem) {
+            HGDIOBJ old = SelectObject(mem, bmp);
+            POINT ptSrc{0, 0};
+            SIZE sz{nd.W, nd.H};
+            POINT ptDst{nd.baseX, nd.baseY};
+            BLENDFUNCTION bf{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+            UpdateLayeredWindow(h, wdc, &ptDst, &sz, mem, &ptSrc, 0, &bf, ULW_ALPHA);
+            SelectObject(mem, old);
+        }
+        DeleteDC(mem);
+    }
+    ReleaseDC(h, wdc);
+    DeleteObject(bmp);
+}
 
 static LRESULT CALLBACK TopToastProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
@@ -4630,34 +4761,11 @@ static LRESULT CALLBACK TopToastProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             TopToastData* self = nd ? new TopToastData(*nd) : new TopToastData();
             if (self) { self->t0 = GetTickCount(); self->phase = 0; }
             SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)self);
-            ApplyRoundCorners(h);
             SetTimer(h, 2, 16, nullptr);   // 淡入动画
             return 0;
         }
-        case WM_PAINT: {
-            PAINTSTRUCT ps;
-            HDC hdc = BeginPaint(h, &ps);
-            RECT rc; GetClientRect(h, &rc);
-            const Theme& t = *g.theme;
-            HBRUSH bg = CreateSolidBrush(t.bg);
-            FillRect(hdc, &rc, bg);
-            DeleteObject(bg);
-            RECT accent{0, 0, rc.right, S(3)};   // 顶部强调色条，呼应主题
-            HBRUSH ab = CreateSolidBrush(t.menuHi);
-            FillRect(hdc, &accent, ab);
-            DeleteObject(ab);
-            TopToastData* nd = (TopToastData*)GetWindowLongPtrW(h, GWLP_USERDATA);
-            if (nd) {
-                SetBkMode(hdc, TRANSPARENT);
-                SelectObject(hdc, g.fontPool[FontSlot(t.fontInput + 1)]);
-                SetTextColor(hdc, t.text);
-                RECT tr{S(14), 0, rc.right - S(14), rc.bottom};
-                DrawTextW(hdc, nd->text.c_str(), -1, &tr,
-                          DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-            }
-            EndPaint(h, &ps);
-            return 0;
-        }
+        case WM_NCHITTEST:                // 点击穿透：不挡下方窗口的操作
+            return HTTRANSPARENT;
         case WM_TIMER:
             if (wp == 1) {  // 停留结束 → 进入淡出
                 KillTimer(h, 1);
@@ -4666,30 +4774,28 @@ static LRESULT CALLBACK TopToastProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 SetTimer(h, 2, 16, nullptr);
                 return 0;
             }
-            if (wp == 2) {  // 淡入 / 淡出动画驱动
+            if (wp == 2) {  // 淡入 / 淡出：重建位图推送到分层窗口
                 TopToastData* nd = (TopToastData*)GetWindowLongPtrW(h, GWLP_USERDATA);
                 if (!nd) break;
                 DWORD now = GetTickCount();
-                BYTE target = (BYTE)((std::max)((int)(g.theme ? g.theme->alpha : 255), 240));
+                float m = 1.f;
                 if (nd->phase == 0) {
                     double p = (double)(now - nd->t0) / 120.0; if (p > 1) p = 1;
-                    double e = 1 - pow(1 - p, 3);              // ease-out cubic
-                    BYTE a = (BYTE)(target * e); if (a < 1) a = 1;
-                    SetLayeredWindowAttributes(h, 0, a, LWA_ALPHA);
-                    int off = (int)(S(6) * (1 - e));           // 从下方 6px 滑入
-                    SetWindowPos(h, nullptr, nd->baseX, nd->baseY + off, 0, 0,
-                                 SWP_NOZORDER | SWP_NOSIZE | SWP_NOACTIVATE);
+                    m = (float)(1 - pow(1 - p, 3));           // ease-out cubic
                     if (p >= 1) {
-                        KillTimer(h, 2);                       // 停留期间不跑动画定时器（省资源）
-                        nd->phase = 1; nd->phaseT0 = now;
-                        SetTimer(h, 1, 1300, nullptr);         // 停留 1.3s
+                        KillTimer(h, 2);                      // 停留期间不跑动画定时器（省资源）
+                        nd->phase = 1;
+                        SetTimer(h, 1, 1300, nullptr);        // 停留 1.3s
                     }
                 } else if (nd->phase == 2) {
                     double p = (double)(now - nd->phaseT0) / 150.0; if (p > 1) p = 1;
-                    BYTE a = (BYTE)(target * (1 - p));
-                    SetLayeredWindowAttributes(h, 0, a, LWA_ALPHA);
-                    if (p >= 1) DestroyWindow(h);
+                    m = (float)(1 - p);
+                    if (p >= 1) { DestroyWindow(h); return 0; }
+                } else {
+                    return 0;                                 // 停留期定时器已停，防御性返回
                 }
+                HFONT font = g.fontPool[FontSlot((g.theme ? g.theme->fontInput : 16) + 1)];
+                ToastPushFrame(h, *nd, font, m);
                 return 0;
             }
             break;
@@ -4702,7 +4808,7 @@ static LRESULT CALLBACK TopToastProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(h, msg, wp, lp);
 }
 
-// 在目标窗口顶部居中弹出轻量 toast（目标窗口为 null 时退回主屏居中），非阻塞、自动消失
+// 在目标窗口所在屏幕的正中央弹出半透明 toast（无目标时主屏居中），非阻塞、自动消失
 static void ShowTopToast(HWND target, const std::wstring& text) {
     static bool registered = false;
     if (!registered) {
@@ -4715,43 +4821,54 @@ static void ShowTopToast(HWND target, const std::wstring& text) {
         if (RegisterClassExW(&nc)) registered = true;
     }
     if (!g.theme) return;
-    // 按文本实测宽度决定弹窗尺寸（设上限防过宽）
+    // 按文本实测宽度决定尺寸（设上限防过宽）
+    HFONT font = g.fontPool[FontSlot(g.theme->fontInput + 1)];
     HDC dc = GetDC(nullptr);
-    HFONT oldFont = (HFONT)SelectObject(dc, g.fontPool[FontSlot(g.theme->fontInput + 1)]);
+    HGDIOBJ oldFont = (HFONT)SelectObject(dc, font);
     SIZE sz{};
     GetTextExtentPoint32W(dc, text.c_str(), (int)text.size(), &sz);
     SelectObject(dc, oldFont);
     ReleaseDC(nullptr, dc);
-    int W = sz.cx + S(28);
+
+    const int shadowR = S(10);
+    const int pillH = S(40);
+    int W = sz.cx + S(20) * 2 + shadowR * 2;
     int maxW = S(420);
     if (W > maxW) W = maxW;
-    if (W < S(80)) W = S(80);
-    int H = S(40);
+    if (W < S(120)) W = S(120);
+    int H = pillH + shadowR * 2;
 
-    // 定位：目标窗口顶部居中（贴近窗口位置）；无目标时退回主屏居中
-    int x = 0, y = 0;
-    RECT wr{};
-    if (target && IsWindow(target) && GetWindowRect(target, &wr)) {
-        x = wr.left + ((wr.right - wr.left) - W) / 2;
-        y = wr.top + S(8);
-    }
+    // 定位：目标窗口所在显示器的工件区正中央
     MONITORINFO mi{};
     mi.cbSize = sizeof(mi);
     HMONITOR mon = target ? MonitorFromWindow(target, MONITOR_DEFAULTTONEAREST)
                           : MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
-    if (GetMonitorInfoW(mon, &mi)) {
-        if (x < mi.rcWork.left) x = mi.rcWork.left;
-        if (x + W > mi.rcWork.right) x = mi.rcWork.right - W;
-        if (y < mi.rcWork.top) y = mi.rcWork.top;
-        if (y + H > mi.rcWork.bottom) y = mi.rcWork.bottom - H;
+    if (!GetMonitorInfoW(mon, &mi)) {
+        mi.rcWork.left = 0; mi.rcWork.top = 0;
+        mi.rcWork.right = GetSystemMetrics(SM_CXSCREEN);
+        mi.rcWork.bottom = GetSystemMetrics(SM_CYSCREEN);
     }
-    TopToastData nd{text, x, y};
-    HWND h = CreateWindowExW(WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TOOLWINDOW,
+    int x = mi.rcWork.left + ((mi.rcWork.right - mi.rcWork.left) - W) / 2;
+    int y = mi.rcWork.top + ((mi.rcWork.bottom - mi.rcWork.top) - H) / 2;
+
+    TopToastData nd{text};
+    nd.W = W; nd.H = H;
+    nd.shadowR = shadowR;
+    nd.pl = shadowR; nd.pr = W - shadowR;
+    nd.cy = H / 2;
+    nd.r = pillH / 2;
+    nd.baseX = x; nd.baseY = y;
+    // 填充色跟随主题：暗色用输入框底色，浅色用卡片底色；文字用主题主文字色
+    nd.fill = g.theme->dark ? g.theme->bgInput : g.theme->bgCard;
+    nd.textColor = g.theme->text;
+    nd.fillA = g.theme->dark ? 160 : 170;
+
+    HWND h = CreateWindowExW(WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                              L"FlowtaryTopToast", L"", WS_POPUP,
-                             x, y + S(6), W, H, nullptr, nullptr, g.inst, &nd);
+                             x, y, W, H, nullptr, nullptr, g.inst, &nd);
     if (!h) return;
-    SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);
-    ShowWindow(h, SW_SHOWNOACTIVATE);  // 不抢焦点、不进入任务栏/Alt-Tab
+    ToastPushFrame(h, nd, font, 0.f);   // 首帧全透明，由定时器淡入
+    ShowWindow(h, SW_SHOWNOACTIVATE);   // 不抢焦点、不进入任务栏/Alt-Tab
 }
 
 // ---------------- 单实例：区分「同版本重复启动」与「新版本替换启动」 ----------------
