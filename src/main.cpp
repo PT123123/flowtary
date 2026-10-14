@@ -311,6 +311,9 @@ struct App {
     DWORD serial = 0;
 
     std::vector<Program> programs;
+    // 文件/文件夹行图标缓存：路径（小写）→ 小图标。File/Folder 结果行（含自学习置顶项）
+    // 与程序行一样显示图标；首次经 shell 抽取后缓存，退出时统一销毁。
+    std::unordered_map<std::wstring, HICON> pathIcons;
     std::wstring everythingExe;
     std::wstring hotkeyName = L"Alt+Space";
     HHOOK hWakeHook = nullptr;     // 低级键盘钩子：让首选唤起组合优先于其他程序的 RegisterHotKey
@@ -1179,6 +1182,34 @@ static HICON GetProgramIcon(Program* p) {
     return p->icon;
 }
 
+// 取任意文件/文件夹的小图标（File/Folder 结果行用）：按路径缓存，首次经 shell 抽取。
+// 路径暂不可达（网络盘/刚移动）时退回 SHGFI_USEFILEATTRIBUTES，按扩展名/目录属性给关联图标。
+static HICON GetPathIcon(const std::wstring& path) {
+    if (path.empty()) return nullptr;
+    std::wstring key = ToLowerW(path);
+    auto it = g.pathIcons.find(key);
+    if (it != g.pathIcons.end()) return it->second;
+    // 缓存容量上限（很宽）：超出先整批销毁重建，防止长期运行无限增长
+    if (g.pathIcons.size() >= 1024) {
+        for (auto& kv : g.pathIcons)
+            if (kv.second) DestroyIcon(kv.second);
+        g.pathIcons.clear();
+    }
+    SHFILEINFOW sfi{};
+    HICON ic = nullptr;
+    if (SHGetFileInfoW(path.c_str(), 0, &sfi, sizeof(sfi), SHGFI_ICON | SHGFI_SMALLICON))
+        ic = sfi.hIcon;
+    if (!ic) {
+        DWORD attr = GetFileAttributesW(path.c_str());
+        attr = (attr == INVALID_FILE_ATTRIBUTES) ? 0 : (attr & FILE_ATTRIBUTE_DIRECTORY);
+        if (SHGetFileInfoW(path.c_str(), attr, &sfi, sizeof(sfi),
+                           SHGFI_ICON | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES))
+            ic = sfi.hIcon;
+    }
+    if (ic) g.pathIcons.emplace(std::move(key), ic);
+    return ic;
+}
+
 // ---------------- UI 布局 ----------------
 static void Layout() {
     RECT rc;
@@ -1972,11 +2003,32 @@ static ExecKind ResolveExecKind(bool ctrl, bool shift) {
     return ek;
 }
 
+// 打开成功后的提示文案（空串=不提示）：程序/文件/文件夹给「已打开 xx」，
+// 一键启动/关闭组给对应计数。窗口切换、top、命令行等没有「打开」语义的场景不提示。
+static std::wstring OpenedToastText(const Row& r) {
+    switch (r.kind) {
+        case Row::Prog:
+        case Row::File:
+        case Row::Folder:
+            return L"已打开 " + r.title;
+        case Row::Group:
+            if (!r.groupTargets.empty())
+                return r.groupKill ? L"已关闭 " + std::to_wstring(r.groupTargets.size()) + L" 个进程"
+                                   : L"已启动 " + std::to_wstring(r.groupTargets.size()) + L" 项";
+            return L"";
+        default:
+            return L"";
+    }
+}
+
 static void ExecuteSelected(ExecKind ek = ExecKind::Normal) {
     if (g.sel < 0 || g.sel >= (int)g.items.size()) return;
     RecordClickWeight(g.items[g.sel]);  // 点击/回车/快捷键选中即记权重（内部过滤非本地条目与不保存的前缀）
     if (ExecuteRow(g.items[g.sel], ek)) {
         RecordLearned(g.items[g.sel]);  // f/d 打开成功 → 记为自学习条目（含 .lnk 快捷方式）
+        // 打开成功的轻量提示：贴在启动器原位顶部，淡入淡出自动消失（不抢焦点、不阻塞）
+        std::wstring toast = OpenedToastText(g.items[g.sel]);
+        if (!toast.empty()) ShowTopToast(g.hwnd, toast);
         Hide();
     }
 }
@@ -2153,7 +2205,11 @@ static void ShowRowMenu(HWND hwnd) {
     switch (cmd) {
         case IDM_OPEN:
             RecordClickWeight(r);  // 右键打开同样记权重
-            if (ExecuteRow(r)) RecordLearned(r);  // 右键打开成功同样记自学习
+            if (ExecuteRow(r)) {
+                RecordLearned(r);  // 右键打开成功同样记自学习
+                std::wstring toast = OpenedToastText(r);
+                if (!toast.empty()) ShowTopToast(g.hwnd, toast);
+            }
             break;
         case IDM_OPENLOC:
             if (r.kind == Row::Folder) {
@@ -3453,6 +3509,13 @@ static void Paint(HDC hdc) {
         if (row.kind == Row::Prog && row.prog) {
             HICON ic = GetProgramIcon(row.prog);
             if (ic) DrawIconEx(mem, x, y + (rowH - S(16)) / 2, ic, S(16), S(16), 0, nullptr, DI_NORMAL);
+        } else if ((row.kind == Row::File || row.kind == Row::Folder ||
+                    row.kind == Row::Reveal) &&
+                   !row.action.empty()) {
+            // 文件/文件夹行（自学习置顶项、Everything 结果、粘贴路径直达项均属此类）：
+            // 按路径经 shell 取图标并缓存，与程序行保持同一直视对齐
+            HICON ic = GetPathIcon(row.action);
+            if (ic) DrawIconEx(mem, x, y + (rowH - S(16)) / 2, ic, S(16), S(16), 0, nullptr, DI_NORMAL);
         }
         x += S(16) + S(8);
 
@@ -3825,6 +3888,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 DestroyIcon(g.hTrayIcon);
                 g.hTrayIcon = nullptr;
             }
+            for (auto& kv : g.pathIcons) {
+                if (kv.second) DestroyIcon(kv.second);
+            }
+            g.pathIcons.clear();
             for (int i = 0; i < kFontMax - kFontMin + 1; ++i) {
                 if (g.fontPool[i]) { DeleteObject(g.fontPool[i]); g.fontPool[i] = nullptr; }
             }
