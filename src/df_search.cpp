@@ -503,6 +503,44 @@ std::mutex g_dirtyMu;
 std::condition_variable g_dirtyCv;
 std::set<size_t> g_dirty;
 
+// ---------------- 内存索引 delta（监听事件即时入库，查询时与池合并） ----------------
+// 池的增量粒度是「整根重扫」（大根 113s 级）：新文件从落盘到可拼音搜要等整根
+// 重建。监听线程把增/删/改名事件即时写进 delta 表，查询层与池合并——新条目
+// 秒级可搜；防抖后的整根重建照旧进行，换入时按根前缀折叠清表。
+struct MemDeltaEntry {
+    bool isDir = false;
+    std::wstring path;     // 真实大小写（展示）
+    std::wstring pinyin;   // 全拼小写；空 = 无拼音（纯 ASCII 名 / 未启用）
+};
+std::mutex g_memDeltaMu;
+std::unordered_map<std::wstring, MemDeltaEntry> g_memDeltaAdd;   // 键=小写反斜杠全路径
+std::unordered_set<std::wstring> g_memDeltaDel;
+
+// 整根重建换入后：该根前缀下的 delta 已折叠进池，清表（重建期间的新事件由
+// 监听继续入库、下轮收敛——与磁盘索引同一容忍窗口）
+void MemDeltaDropRoot(const std::wstring& root) {
+    std::wstring low = ToLower(root);
+    if (low.back() != L'\\') low += L'\\';
+    std::lock_guard<std::mutex> lk(g_memDeltaMu);
+    size_t dropped = 0;
+    for (auto it = g_memDeltaAdd.begin(); it != g_memDeltaAdd.end();) {
+        if (_wcsnicmp(it->first.c_str(), low.c_str(), low.size()) == 0) {
+            it = g_memDeltaAdd.erase(it);
+            ++dropped;
+        } else ++it;
+    }
+    for (auto it = g_memDeltaDel.begin(); it != g_memDeltaDel.end();) {
+        if (_wcsnicmp(it->c_str(), low.c_str(), low.size()) == 0)
+            it = g_memDeltaDel.erase(it);
+        else ++it;
+    }
+    if (GetEnvironmentVariableW(L"FT_DF_DEBUG", nullptr, 0) > 0) {
+        fwprintf(stderr, L"[memdelta] drop root=%hs add=%zu\n",
+                 WideToUtf8(root).c_str(), dropped);
+        fflush(stderr);
+    }
+}
+
 DWORD MemCap() {
     wchar_t env[16]{};
     if (GetEnvironmentVariableW(L"FT_DF_MEMINDEX_MAX", env, 16) > 0) {
@@ -862,6 +900,43 @@ struct MemWatchArg {
     size_t idx;
     std::wstring root;
 };
+// 监听事件 → delta 表。属性解析不持任何锁（个别路径 GetFileAttributesW 会挂死，
+// 挂死只拖住本监听线程）；入表短暂持锁。delta 超过 5 万条放弃增量（交给整根重建）。
+void MemDeltaIngest(const std::wstring& root, const char* buf, DWORD bytes) {
+    std::vector<std::pair<std::wstring, int>> resolved;   // path, isDir(-1=删除)
+    const FILE_NOTIFY_INFORMATION* fni = (const FILE_NOTIFY_INFORMATION*)buf;
+    for (;;) {
+        std::wstring rel(fni->FileName, fni->FileNameLength / sizeof(WCHAR));
+        if (!rel.empty()) {
+            std::wstring path = root + L"\\" + rel;
+            int isDir = -1;
+            if (fni->Action == FILE_ACTION_ADDED || fni->Action == FILE_ACTION_RENAMED_NEW_NAME) {
+                DWORD attr = GetFileAttributesW(path.c_str());   // 无锁：挂死只拖本线程
+                if (attr != INVALID_FILE_ATTRIBUTES)
+                    isDir = (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            }
+            resolved.push_back({std::move(path), isDir});
+        }
+        if (fni->NextEntryOffset == 0) break;
+        fni = (const FILE_NOTIFY_INFORMATION*)((const char*)fni + fni->NextEntryOffset);
+    }
+    std::lock_guard<std::mutex> lk(g_memDeltaMu);
+    if (g_memDeltaAdd.size() + g_memDeltaDel.size() > 50000) return;   // 洪峰：等整根重建
+    for (auto& kv : resolved) {
+        std::wstring key = ToLower(kv.first);
+        if (kv.second < 0) { g_memDeltaDel.insert(key); g_memDeltaAdd.erase(key); }
+        else {
+            size_t np = kv.first.find_last_of(L'\\');
+            MemDeltaEntry de;
+            de.isDir = kv.second != 0;
+            de.path = std::move(kv.first);
+            de.pinyin = MemNameToPinyin(de.path.c_str() + (np == std::wstring::npos ? 0 : np + 1));
+            g_memDeltaAdd[key] = std::move(de);
+            g_memDeltaDel.erase(key);
+        }
+    }
+}
+
 unsigned __stdcall MemWatchThread(void* p) {
     std::unique_ptr<MemWatchArg> arg((MemWatchArg*)p);
     const size_t idx = arg->idx;
@@ -885,7 +960,10 @@ unsigned __stdcall MemWatchThread(void* p) {
                                        FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME,
                                        &bytes, nullptr, nullptr))
                 break;
-            // 只要有事件就标脏（防抖由维护线程做）；缓冲区溢出同样整体标脏
+            // 增/删/改名事件即时入 delta（新条目秒级可搜）；缓冲区溢出时事件不全，
+            // 交给整根重建收敛
+            if (bytes > 0) MemDeltaIngest(root, buf, bytes);
+            // 无论事件是否可解析都标脏（防抖由维护线程做）；溢出同样整体标脏
             MemMarkDirty(idx);
         }
         CloseHandle(h);
@@ -933,7 +1011,10 @@ unsigned __stdcall MemMaintThread(void*) {
                 swapped = true;
             }
         }
-        if (swapped) MemIndexSave();   // 锁外落盘（快照式）
+        if (swapped) {
+            MemIndexSave();   // 锁外落盘（快照式）
+            MemDeltaDropRoot(g_memRootNames[idx]);   // 该根 delta 已折叠进池
+        }
         }
         if (!deferred.empty()) {
             std::lock_guard<std::mutex> lk(g_dirtyMu);
@@ -983,6 +1064,7 @@ unsigned __stdcall MemBuildThread(void*) {
                 if (i < g_memRoots.size()) g_memRoots[i] = std::move(part);
                 else g_memRoots.push_back(std::move(part));
             }
+            MemDeltaDropRoot(g_memRootNames[i]);   // 该根 delta 已折叠进池
         }
     MemIndexSave();   // 锁外落盘（快照式）
         dbg(L"build done, total:", total);
@@ -1043,6 +1125,8 @@ int MemIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD m
         wl.push_back(std::move(f));
     }
     std::lock_guard<std::mutex> lk(g_memMu);
+    bool hasDel = false;   // 查询窗口内被监听标记删除的池条目（快照，竞态下轮收敛）
+    { std::lock_guard<std::mutex> lk2(g_memDeltaMu); hasDel = !g_memDeltaDel.empty(); }
     for (const auto& rd : g_memRoots) {
         for (size_t k = 0; k < rd.offs.size(); ++k) {
             const wchar_t* path = rd.pool.c_str() + rd.offs[k];
@@ -1069,10 +1153,44 @@ int MemIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD m
             }
             if (!ok) continue;
             if (!q.excludes.empty() && ContainsAny(ToLower(path), q.excludes)) continue;
+            if (hasDel) {
+                std::lock_guard<std::mutex> lk2(g_memDeltaMu);
+                if (g_memDeltaDel.count(ToLower(std::wstring(path)))) continue;
+            }
             out.push_back({path, isDir});
             if (out.size() >= maxRows) break;
         }
         if (out.size() >= maxRows) break;
+    }
+    // delta 合并：监听线程即时入库的新增/改名条目（秒级可搜，整根重建换入后折叠），
+    // 匹配规则与池一致（名字 / 全拼子串 / 首字母子序列）
+    {
+        std::lock_guard<std::mutex> lk2(g_memDeltaMu);
+        for (const auto& kv : g_memDeltaAdd) {
+            if (out.size() >= (size_t)maxRows) break;
+            const MemDeltaEntry& de = kv.second;
+            if (q.isFile == de.isDir) continue;
+            size_t np = de.path.find_last_of(L'\\');
+            const wchar_t* name = de.path.c_str() + (np == std::wstring::npos ? 0 : np + 1);
+            bool ok = true;
+            if (pathMode) {
+                for (const auto& w : wl)
+                    if (!MemFindFolded(de.path.c_str(), w)) { ok = false; break; }
+            } else {
+                for (const auto& w : wl) {
+                    if (MemFindFolded(name, w)) continue;
+                    if (!de.pinyin.empty()) {
+                        if (MemFindFolded(de.pinyin.c_str(), w)) continue;
+                        if (w.size() >= 2 && MemIsSubsequence(de.pinyin.c_str(), w.c_str())) continue;
+                    }
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok) continue;
+            if (!q.excludes.empty() && ContainsAny(ToLower(de.path), q.excludes)) continue;
+            out.push_back({de.path, de.isDir});
+        }
     }
     if (GetEnvironmentVariableW(L"FT_DF_DEBUG", nullptr, 0) > 0) {
         fwprintf(stderr, L"[mems] mode=%s ms=%llu hits=%zu\n",

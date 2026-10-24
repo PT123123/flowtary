@@ -62,7 +62,8 @@ void CancelAll();
 // 范围仅 UserDirsRoots()（桌面/文档/下载/图片/音乐/视频）+ extraRoots（注册表
 // IndexDirs 配置的项目目录等）——不是全盘索引。
 // 用 fd 全列建库（秒级），常驻内存（条目上限 FT_DF_MEMINDEX_MAX，默认 300000）；
-// 目录变更经 ReadDirectoryChangesW 监听、防抖后按根增量重建。
+// 目录变更经 ReadDirectoryChangesW 监听：增/删/改名事件即时入 RAM delta 表
+// （查询时与池合并，新条目秒级可搜），防抖后按根增量重建折叠进池。
 // 建库期间 MemIndexReady()=false，调度链自动落到 fd/WS，就绪后自动接管。
 // 拼音：守护进程（--serve）内启用，汉字名字附存全拼，词条可按「名字 / 全拼子串 /
 // 首字母子序列（≥2字符）」命中；exe 同目录无 dict/ 时自动降级为纯名字匹配。
