@@ -196,16 +196,38 @@ else()
   target_link_libraries(evtest PRIVATE user32 shell32)
 
   # d/f 搜索后端冒烟工具（Windows Search OLE DB + fd），与 src/main.cpp 共用 df_search
+  # （df_search 内含拼音索引代码路径，需链接 cpp-pinyin；运行时无 dict/ 自动降级）
   add_executable(wsquery tools/wsquery.cpp src/df_search.cpp)
   set_target_properties(wsquery PROPERTIES OUTPUT_NAME wsquery)
   target_include_directories(wsquery PRIVATE src)
   target_link_libraries(wsquery PRIVATE ole32 shell32 uuid)
+  if(CPP_PINYIN_LIBRARY)
+    target_link_libraries(wsquery PRIVATE ${CPP_PINYIN_LIBRARY})
+  endif()
 
   # 搜索守护进程：内存/磁盘索引宿主 + TCP 查询服务（flowtary-search --serve）
   add_executable(flowtary-search tools/ft_search_main.cpp src/df_search.cpp)
   set_target_properties(flowtary-search PROPERTIES OUTPUT_NAME flowtary-search)
   target_include_directories(flowtary-search PRIVATE src)
   target_link_libraries(flowtary-search PRIVATE ole32 shell32 uuid ws2_32 user32)
+  if(CPP_PINYIN_LIBRARY)
+    target_link_libraries(flowtary-search PRIVATE ${CPP_PINYIN_LIBRARY})
+  endif()
+  # 拼音词典部署（守护进程与 flowtary.exe 同目录运行，共用同一份 dict/ 与 dll）
+  if(CPP_PINYIN_DLL)
+    add_custom_command(TARGET flowtary-search POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CPP_PINYIN_DLL}"
+        "$<TARGET_FILE_DIR:flowtary-search>/cpp-pinyin.dll"
+      COMMENT "Copying cpp-pinyin.dll to flowtary-search output directory")
+  endif()
+  if(CPP_PINYIN_DICT)
+    add_custom_command(TARGET flowtary-search POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
+        "${CPP_PINYIN_DICT}"
+        "$<TARGET_FILE_DIR:flowtary-search>/dict"
+      COMMENT "Copying cpp-pinyin dictionary to flowtary-search output directory")
+  endif()
 
   add_library(filedlg_hook64 SHARED src/hookdlg.cpp)
   set_target_properties(filedlg_hook64 PROPERTIES

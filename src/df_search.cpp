@@ -32,6 +32,11 @@
 #include <string>
 #include <vector>
 
+// cpp-pinyin 拼音引擎（内存索引拼音搜索；仅守护进程运行时启用，见 MemPinyinStart）
+#include <cpp-pinyin/Pinyin.h>
+#include <cpp-pinyin/ManTone.h>
+#include <cpp-pinyin/G2pglobal.h>
+
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "shell32.lib")
@@ -430,10 +435,61 @@ void CancelAll() {
 // åç§»/åå­åç§»/æ¯å¦ç®å½ââæ¯ vector<wstring> çä¸åä»¥ä¸åå­ï¼æ éä¸²åéå¼éï¼ã
 // å¢éæ´æ° = æ´æ ¹æ¿æ¢ï¼fd éåè¯¥æ ¹åæ´ä½ swapï¼ï¼æ éè·¨æ ¹æªå¨ä¸æ ã
 
+// ---------------- 拼音索引（仅守护进程启用：SearchDaemonServe 调 MemPinyinStart） ----------------
+// 每条目名字转全拼（小写）存入拼音池；查询时词条可命中「名字 / 全拼子串 / 首字母子序列」。
+// 主程序自带一份 Pinyin 实例，这里只在守护进程内启用，避免 UI 进程重复加载词典；
+// exe 同目录无 dict/（或转换失败）时保持空指针，功能静默降级为纯名字匹配。
+std::unique_ptr<Pinyin::Pinyin> g_py;
+std::mutex g_pyMu;   // 建库线程与维护线程可能并发转换
+
+void MemPinyinStart() {
+    if (g_py) return;
+    WCHAR exePath[MAX_PATH]{};
+    if (!GetModuleFileNameW(nullptr, exePath, MAX_PATH)) return;
+    std::wstring dir(exePath);
+    size_t p = dir.find_last_of(L"\\/");
+    if (p == std::wstring::npos) return;
+    std::wstring dict = dir.substr(0, p + 1) + L"dict";
+    if (GetFileAttributesW(dict.c_str()) == INVALID_FILE_ATTRIBUTES) return;
+    Pinyin::setDictionaryPath(dict);
+    g_py = std::make_unique<Pinyin::Pinyin>();
+}
+
+// 名字 → 全拼（小写）。未启用或名字不含汉字时返回空（调用方不存，查询回退名字匹配）。
+std::wstring MemNameToPinyin(const wchar_t* name) {
+    if (!g_py || !name || !*name) return L"";
+    bool hasHan = false;
+    for (const wchar_t* p = name; *p; ++p)
+        if (*p >= 0x4E00 && *p <= 0x9FFF) { hasHan = true; break; }
+    if (!hasHan) return L"";
+    std::lock_guard<std::mutex> lk(g_pyMu);
+    auto res = g_py->hanziToPinyin(WideToUtf8(name), Pinyin::ManTone::Style::NORMAL,
+                                   Pinyin::Error::Default, false, false, false);
+    std::string py;
+    for (const auto& r : res) {
+        if (!r.error && !r.pinyin.empty()) py += r.pinyin;
+        else if (!r.hanzi.empty()) py += r.hanzi;
+    }
+    if (py.empty()) return L"";
+    return ToLower(Utf8ToWide(py));
+}
+
+// q 是否为 s 的子序列（首字母匹配：wxltjl ⊆ weixinliaotianjilu）；空 q 视为不匹配
+bool MemIsSubsequence(const wchar_t* s, const wchar_t* q) {
+    if (!*q) return false;
+    while (*s) {
+        if (*s == *q && !*++q) return true;   // q 消耗尽即命中
+        ++s;
+    }
+    return false;
+}
+
 struct MemRootData {
     std::wstring pool;               // è·¯å¾æ± ï¼é¡ºåºæ¼æ¥ï¼æ¯æ¡èªå¸¦ \0ï¼
     std::vector<uint32_t> offs;      // æ¯æ¡ç®è·¯å¾å¨ pool ä¸­çèµ·å§ä¸æ 
     std::vector<uint32_t> nameFlags; // æ¯æ¡ç®ï¼ä½ 31 ä½ = æä»¶ååç§»ï¼æé«ä½ = isDir
+    std::wstring pyPool;             // 拼音池（每条目自带 \0；首字符恒为 \0 = 「无拼音」哨兵位）
+    std::vector<uint32_t> pyOffs;    // 与 offs 对齐；0 = 无拼音（纯 ASCII 名字不存，查询回退名字匹配）
     size_t size() const { return offs.size(); }
 };
 
@@ -487,7 +543,8 @@ void AppendPruneArgs(std::wstring& args, bool includeDot) {
     for (const wchar_t* p : prunes) args += L" -E " + QuoteArg(p);
 }
 
-void MemPoolAdd(MemRootData& rd, const std::wstring& path, bool isDir) {
+// 基础入池：仅路径池；拼音位补 0（对齐）。加载缓存用（拼音随缓存附带，不重转）。
+void MemPoolAddRaw(MemRootData& rd, const std::wstring& path, bool isDir) {
     const uint32_t off = (uint32_t)rd.pool.size();
     rd.pool.append(path);
     rd.pool.push_back(L'\0');
@@ -495,6 +552,27 @@ void MemPoolAdd(MemRootData& rd, const std::wstring& path, bool isDir) {
     nameOff = nameOff == std::wstring::npos ? 0 : nameOff + 1;
     rd.offs.push_back(off);
     rd.nameFlags.push_back((uint32_t)nameOff | (isDir ? 0x80000000u : 0u));
+    rd.pyOffs.push_back(0);
+}
+
+// 给最近入池的条目附拼音（py 非空才占池；与名字同形的不存——查询回退名字匹配已覆盖）
+void MemPoolAttachPinyin(MemRootData& rd, const std::wstring& py) {
+    if (py.empty() || rd.pyOffs.empty()) return;
+    if (rd.pyPool.empty()) rd.pyPool.push_back(L'\0');   // 0 号哨兵
+    rd.pyOffs.back() = (uint32_t)rd.pyPool.size();
+    rd.pyPool.append(py);
+    rd.pyPool.push_back(L'\0');
+}
+
+// 建库路径：入池 + 汉字名字转拼音（仅守护进程启用时生效）
+void MemPoolAdd(MemRootData& rd, const std::wstring& path, bool isDir) {
+    MemPoolAddRaw(rd, path, isDir);
+    if (!g_py) return;
+    size_t nameOff = path.find_last_of(L'\\');
+    const wchar_t* name = path.c_str() + (nameOff == std::wstring::npos ? 0 : nameOff + 1);
+    std::wstring py = MemNameToPinyin(name);
+    if (!py.empty() && _wcsicmp(py.c_str(), name) != 0)
+        MemPoolAttachPinyin(rd, py);
 }
 
 // ç´¢å¼ç¼å­è½çï¼UTF-8 ææ¬ï¼é¦è¡çæ¬æ è®°ï¼R\tæ ¹ç®å½ ä¸ºåèæ è®°ï¼D/F\tpath ä¸ºæ¡ç®ï¼ã
@@ -510,7 +588,26 @@ std::wstring MemCachePath() {
     return dir + L"\\memindex.dat";
 }
 // æ g_memMu è°ç¨ãåååæä»¶ï¼1MB ç¼å²ï¼ââä¸æ´ä¸²æ¼æ¥ï¼é¿å 20MBÃ2 çå å³°å¼é©»ç
-void MemIndexSaveLocked() {
+std::mutex g_memSaveMu;
+// 缓存落盘：锁内仅做快照（pool 是单个 wstring，拷贝≈一次 memcpy，~5ms），
+// 序列化+写盘在锁外——此前整段 41MB 落盘都持 g_memMu，根重建完成时查询被卡 50-150ms。
+// 可不持 g_memMu 调用；g_memSaveMu 串行化并发写（维护线程与建库线程可能同时保存）。
+void MemIndexSave() {
+    std::vector<MemRootData> snap;
+    std::vector<std::wstring> names;
+    {
+        std::lock_guard<std::mutex> lk(g_memMu);
+        names = g_memRootNames;
+        snap.reserve(g_memRoots.size());
+        for (const auto& rd : g_memRoots) {
+            MemRootData c;
+            c.pool = rd.pool;
+            c.offs = rd.offs;
+            c.nameFlags = rd.nameFlags;
+            snap.push_back(std::move(c));
+        }
+    }
+    std::lock_guard<std::mutex> savelk(g_memSaveMu);
     std::wstring path = MemCachePath();
     if (path.empty()) return;
     std::wstring tmp = path + L".tmp";
@@ -526,19 +623,24 @@ void MemIndexSaveLocked() {
         }
         return true;
     };
-    bool ok = writeAll("FTMEMINDEX3\n", 12);   // æ ¼å¼çæ¬æ è®°ï¼è§å/å­å¨åæ´æ¶æ§ç¼å­èªå¨å¤±æ
+    bool ok = writeAll("FTMEMINDEX4\n", 12);   // 格式版本标记：规则/存储变更时旧缓存自动失效
     std::string chunk;
     chunk.reserve(1024 * 1024);
-    for (size_t i = 0; ok && i < g_memRoots.size() && i < g_memRootNames.size(); ++i) {
+    for (size_t i = 0; ok && i < snap.size() && i < names.size(); ++i) {
         chunk += "R\t";
-        chunk += WideToUtf8(g_memRootNames[i]);
+        chunk += WideToUtf8(names[i]);
         chunk += "\n";
-        const MemRootData& rd = g_memRoots[i];
+        const MemRootData& rd = snap[i];
         for (size_t k = 0; ok && k < rd.offs.size(); ++k) {
-            const wchar_t* path = rd.pool.c_str() + rd.offs[k];
+            const wchar_t* path2 = rd.pool.c_str() + rd.offs[k];
             chunk += (rd.nameFlags[k] & 0x80000000u) ? "D\t" : "F\t";
-            chunk += WideToUtf8(path);
+            chunk += WideToUtf8(path2);
             chunk += "\n";
+            if (k < rd.pyOffs.size() && rd.pyOffs[k] != 0) {   // 附拼音行（仅汉字名字条目）
+                chunk += "P\t";
+                chunk += WideToUtf8(rd.pyPool.c_str() + rd.pyOffs[k]);
+                chunk += "\n";
+            }
             if (chunk.size() >= 1024 * 1024) {
                 ok = writeAll(chunk.data(), (DWORD)chunk.size());
                 chunk.clear();
@@ -580,22 +682,36 @@ bool MemIndexLoadLocked() {
         return true;
     };
     std::string line;
-    while (nextLine(line)) {
+    bool has = nextLine(line);
+    while (has) {
+        bool consumed = true;   // 本行已处理完，循环尾再读下一行
         if (!versionOk) {
-            versionOk = line == "FTMEMINDEX3";   // çæ¬ä¸ç¬¦ï¼æ§è§åç¼å­ï¼â å¼ç¨éå»º
+            versionOk = line == "FTMEMINDEX4";   // 版本不符（旧格式缓存）→ 弃用重建
             if (!versionOk) break;
-            continue;
-        }
-        if (line.size() < 2) continue;
-        if (line[0] == 'R' && line[1] == '\t') {
+        } else if (line.size() < 2) {
+            ;
+        } else if (line[0] == 'R' && line[1] == '\t') {
             curRoot = ToLower(Utf8ToWide(line.substr(2)));
-            continue;
+        } else {
+            const bool isDir = line[0] == 'D';
+            if (line[1] != '\t' || curRoot.empty()) {
+                ;
+            } else {
+                std::wstring path = Utf8ToWide(line.substr(2));
+                if (path.size() >= 2) {
+                    MemRootData& rd = byRoot[curRoot];
+                    MemPoolAddRaw(rd, path, isDir);
+                    has = nextLine(line);   // 预读：可能是该条目的拼音行
+                    consumed = false;
+                    if (has && line.size() >= 2 && line[0] == 'P' && line[1] == '\t') {
+                        std::wstring py = Utf8ToWide(line.substr(2));
+                        if (!py.empty()) MemPoolAttachPinyin(rd, py);
+                        has = nextLine(line);
+                    }
+                }
+            }
         }
-        const bool isDir = line[0] == 'D';
-        if (line[1] != '\t' || curRoot.empty()) continue;
-        std::wstring path = Utf8ToWide(line.substr(2));
-        if (path.size() < 2) continue;
-        MemPoolAdd(byRoot[curRoot], path, isDir);
+        if (consumed) has = nextLine(line);
     }
     if (byRoot.empty()) return false;
     size_t total = 0;
@@ -795,16 +911,18 @@ unsigned __stdcall MemMaintThread(void*) {
             if (idx >= g_memRootNames.size()) continue;
             MemRootData part;
             MemListRootFd(fdExe, g_memRootNames[idx], MemCap(), part);   // ä¸æéï¼å¯è¾¾åéçº§ï¼
-            {
-                std::lock_guard<std::mutex> lk(g_memMu);
-                if (idx < g_memRoots.size()) {
-                    part.pool.shrink_to_fit();
-                    part.offs.shrink_to_fit();
-                    part.nameFlags.shrink_to_fit();
-                    g_memRoots[idx] = std::move(part);
-                    MemIndexSaveLocked();
-                }
+        bool swapped = false;
+        {
+            std::lock_guard<std::mutex> lk(g_memMu);
+            if (idx < g_memRoots.size()) {
+                part.pool.shrink_to_fit();
+                part.offs.shrink_to_fit();
+                part.nameFlags.shrink_to_fit();
+                g_memRoots[idx] = std::move(part);
+                swapped = true;
             }
+        }
+        if (swapped) MemIndexSave();   // 锁外落盘（快照式）
         }
         if (!deferred.empty()) {
             std::lock_guard<std::mutex> lk(g_dirtyMu);
@@ -855,10 +973,7 @@ unsigned __stdcall MemBuildThread(void*) {
                 else g_memRoots.push_back(std::move(part));
             }
         }
-        {
-            std::lock_guard<std::mutex> lk(g_memMu);
-            MemIndexSaveLocked();
-        }
+    MemIndexSave();   // 锁外落盘（快照式）
         dbg(L"build done, total:", total);
     }
     g_memReady = true;
@@ -907,6 +1022,7 @@ size_t MemIndexSize() {
 int MemIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD maxRows) {
     out.clear();
     if (!g_memReady.load()) return -1;
+    const ULONGLONG t0 = GetTickCount64();
     std::vector<std::wstring> wl;
     wl.reserve(q.words.size());
     for (const auto& w : q.words) wl.push_back(ToLower(w));
@@ -916,15 +1032,24 @@ int MemIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD m
             const wchar_t* path = rd.pool.c_str() + rd.offs[k];
             const uint32_t nf = rd.nameFlags[k];
             const bool isDir = (nf & 0x80000000u) != 0;
-            if (q.isFile == isDir) continue;   // f ææä»¶å¤¹ / d åªè¦æä»¶å¤¹
+            if (q.isFile == isDir) continue;   // f 排文件夹 / d 只要文件夹
             const wchar_t* name = path + (nf & 0x7FFFFFFFu);
+            const wchar_t* py = (k < rd.pyOffs.size() && !rd.pyPool.empty())
+                                    ? rd.pyPool.c_str() + rd.pyOffs[k] : nullptr;
             bool ok = true;
             if (pathMode) {
                 for (const auto& w : wl)
                     if (!MemCaselessFind(path, w.c_str())) { ok = false; break; }
             } else {
-                for (const auto& w : wl)
-                    if (!MemCaselessFind(name, w.c_str())) { ok = false; break; }
+                for (const auto& w : wl) {
+                    if (MemCaselessFind(name, w.c_str())) continue;
+                    if (py && *py) {   // 拼音匹配：全拼子串 或 首字母子序列（≥2 字符防噪声）
+                        if (MemCaselessFind(py, w.c_str())) continue;
+                        if (w.size() >= 2 && MemIsSubsequence(py, w.c_str())) continue;
+                    }
+                    ok = false;
+                    break;
+                }
             }
             if (!ok) continue;
             if (!q.excludes.empty() && ContainsAny(ToLower(path), q.excludes)) continue;
@@ -932,6 +1057,12 @@ int MemIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD m
             if (out.size() >= maxRows) break;
         }
         if (out.size() >= maxRows) break;
+    }
+    if (GetEnvironmentVariableW(L"FT_DF_DEBUG", nullptr, 0) > 0) {
+        fwprintf(stderr, L"[mems] mode=%s ms=%llu hits=%zu\n",
+                 pathMode ? L"path" : L"name",
+                 (unsigned long long)(GetTickCount64() - t0), out.size());
+        fflush(stderr);
     }
     return (int)out.size();
 }
@@ -1575,6 +1706,9 @@ int DiskIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD 
         if (GetLongPathNameW(f.first.c_str(), longBuf, MAX_PATH * 2) > 0) f.first = longBuf;
         for (auto& c : f.first)
             if (c == L'/') c = L'\\';   // blob 存 fd 风格正斜杠：与其他层统一为反斜杠（UI 拆 title/sub、跨层去重都依赖）
+        if (f.first.size() >= 2 && f.first[1] == L':' &&
+            f.first[0] >= L'a' && f.first[0] <= L'z')
+            f.first[0] -= L'a' - L'A';   // fd 输出小写盘符：归一为大写，与其他层一致
         out.push_back({std::move(f.first), f.second});
     }
     // å»ºåºåæ°å¢æ¡ç®ï¼RAM deltaï¼ï¼æ°éå°ï¼å®½å­ç¬¦çº¿æ§è¿æ»¤
@@ -1823,8 +1957,8 @@ int Serve(const std::vector<std::wstring>& extraRoots) {
 
 // å®æ¤è¿ç¨æå¡ä¸»å¾ªç¯å¥å£ï¼flowtary-search --serve è¿ç¨è°ç¨ï¼
 int SearchDaemonServe(const std::vector<std::wstring>& extraRoots) {
+    MemPinyinStart();   // 毫秒层拼音索引（exe 同目录无 dict/ 时静默降级为纯名字匹配）
     return dfdaemon::Serve(extraRoots);
-
 }
 
 // 客户端：确保守护进程在线（不在线拉起同目录 flowtary-search.exe --serve 并等 ~1s）。
