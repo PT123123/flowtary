@@ -239,6 +239,8 @@ struct App {
     // 路径中任一层名以 '.' 开头（目录 .git / .vscode，或文件 .gitignore）即过滤该行。
     bool skipDotFolders = true;
     int dfBackend = 0;          // d/f 搜索后端：0=新方案（内置索引） 1=Everything 旧链路（设置「常规」页）
+    int indexMemReady = -1;     // 守护进程索引状态（-1=未知 0=建库中 1=就绪），托盘提示与 d/f 提示行用
+    int indexDiskReady = -1;
     bool fdjEnabled = true;    // 文件对话框跳转总开关（默认开；UI 在设置「常规」Tab，不再放托盘菜单）
     bool topEnabled = true;    // top 命令开关（默认开：空格+top 回车置顶/取消置顶当前窗口）
     bool cmdEnabled = true;    // cmd 命令开关（默认开：空格+cmd 执行 Shell 命令，原 "> 命令"）
@@ -371,6 +373,7 @@ constexpr UINT_PTR kTimerBalloon = 3;
 constexpr UINT_PTR kTimerWeightSave = 4;   // 点击权重延迟合并写盘
 constexpr UINT_PTR kTimerTween = 5;        // 补间动画（与光标闪烁 kTimerBlink 区分，互不干扰）
 constexpr UINT_PTR kTimerHotkeyRetry = 6;  // 唤起快捷键被占用时定时重试回收
+constexpr UINT_PTR kTimerIndexStat = 7;    // 索引建库状态轮询（托盘提示/d/f 提示行用，仅新方案）
 constexpr int kDebounceMs = 120;
 constexpr int kWeightSaveDelayMs = 3000;   // 延迟合并写盘的等待时间
 constexpr int WM_APP_TRAY = WM_APP + 1;
@@ -1652,10 +1655,18 @@ static void RenderDfResults() {
     RerankDfByWeight();
     // f/d 自学习置顶（与 Everything 展示路径同一套：摘出与结果重复的学习行后插到最前）
     PrependLearnedRows(g.evTermKey);
-    if (g.items.empty())
-        AddHint((g.dfWsDone && g.dfFdDone && g.dfMemDone && g.dfDiskDone)
-                    ? (g.startingUp ? L"正在启动中…" : L"无结果")
-                    : L"正在搜索…");
+    // 守护进程索引建库中：结果行尾部挂一条状态提示（完成后自动消失）
+    bool indexBuilding = g.dfBackend == 0 && (g.indexMemReady == 0 || g.indexDiskReady == 0);
+    if (g.items.empty()) {
+        if (indexBuilding)
+            AddHint(L"索引建库中…完成后 d/f 全盘毫秒级（当前由 fd 兜底，结果偏少属正常）");
+        else if (g.dfWsDone && g.dfFdDone && g.dfMemDone)
+            AddHint(g.startingUp ? L"正在启动中…" : L"无结果");
+        else
+            AddHint(L"正在搜索…");
+    } else if (indexBuilding) {
+        AddHint(L"索引建库中…完成后 d/f 全盘毫秒级");
+    }
     g.sel = 0;
     LayoutAndRepaint();
 }
@@ -2751,6 +2762,9 @@ static std::wstring TrayTipText() {
     std::wstring tip = g.startingUp ? L"Flowtary — 正在启动中…"
                                     : (g.hotkeyWake ? (L"Flowtary — " + g.hotkeyName + L" 唤出")
                                                     : L"Flowtary — 左键点击唤出");
+    // 索引建库中：托盘提示常驻可见（完成即自动消失，无需用户查询）
+    if (g.dfBackend == 0 && (g.indexMemReady == 0 || g.indexDiskReady == 0))
+        tip += L"（索引建库中…）";
     std::wstring ver;
     for (const char* p = FT_VER_DOT; *p; ++p) ver += (wchar_t)(unsigned char)*p;
     return tip + L" v" + ver;
@@ -4168,6 +4182,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             UINT blink = GetCaretBlinkTime();
             if (blink == 0 || blink == INFINITE) blink = 530;
             SetTimer(hwnd, kTimerBlink, blink, nullptr);
+            if (g.dfBackend == 0) SetTimer(hwnd, kTimerIndexStat, 10000, nullptr);   // 索引建库状态轮询
             return 0;
         }
         case WM_DESTROY:
@@ -4316,6 +4331,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 Shell_NotifyIconW(NIM_MODIFY, &g.nid);
             } else if (wParam == kTimerTween) {
                 TickTweens();
+            } else if (wParam == kTimerIndexStat) {
+                // 索引建库状态轮询：托盘提示与 d/f 提示行的数据源（仅新方案）
+                int mr = -1, ms = 0, dr = -1, drs = 0;
+                if (df::SearchDaemonStat(mr, ms, dr, drs)) {
+                    if (mr != g.indexMemReady || dr != g.indexDiskReady) {
+                        g.indexMemReady = mr;
+                        g.indexDiskReady = dr;
+                        TrayUpdateTip();
+                    }
+                }
             } else if (wParam == kTimerHotkeyRetry) {
                 // 唤起快捷键被占用后的自动恢复：优先抢注首选组合 Alt+Space
                 if (!g.hotkeyWake || g.wakeIndex == 0) {

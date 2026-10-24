@@ -1,10 +1,10 @@
 // ============================================================
-// df_search.cpp — d/f 搜索后端实现（不建全盘索引）
-//   ① Windows Search：纯 OLE DB 消费者（零 ATL、零第三方依赖）。
-//      COM 每线程初始化一次且不反初始化；provider/会话进程级缓存，
-//      常驻工作线程上后续查询毫秒级。
-//   ② fd：单 exe 子进程，stdout 逐行解析；在途进程注册进 g_fdActive，
-//      CancelAll() 统一终止，保证同时最多一个 fd 在遍历。
+// df_search.cpp â d/f æç´¢åç«¯å®ç°ï¼ä¸å»ºå¨çç´¢å¼ï¼
+//   â  Windows Searchï¼çº¯ OLE DB æ¶è´¹èï¼é¶ ATLãé¶ç¬¬ä¸æ¹ä¾èµï¼ã
+//      COM æ¯çº¿ç¨åå§åä¸æ¬¡ä¸ä¸ååå§åï¼provider/ä¼è¯è¿ç¨çº§ç¼å­ï¼
+//      å¸¸é©»å·¥ä½çº¿ç¨ä¸åç»­æ¥è¯¢æ¯«ç§çº§ã
+//   â¡ fdï¼å exe å­è¿ç¨ï¼stdout éè¡è§£æï¼å¨éè¿ç¨æ³¨åè¿ g_fdActiveï¼
+//      CancelAll() ç»ä¸ç»æ­¢ï¼ä¿è¯åæ¶æå¤ä¸ä¸ª fd å¨éåã
 // ============================================================
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -14,7 +14,7 @@
 #include <shlobj.h>
 
 #define DBINITCONSTANTS
-#include <initguid.h>   // 让 oledb.h 的 DEFINE_GUID 在本编译单元实例化（仅此处引入）
+#include <initguid.h>   // è®© oledb.h ç DEFINE_GUID å¨æ¬ç¼è¯ååå®ä¾åï¼ä»æ­¤å¤å¼å¥ï¼
 #include <oledb.h>
 #include <oledberr.h>
 
@@ -39,18 +39,18 @@
 namespace df {
 namespace {
 
-constexpr DWORD kWsProbeRows = 1;    // 可用性探测：拿到 1 行即可
-constexpr DWORD kWsFetchRows = 400;  // 真实查询抓取上限（过滤/排序后只展示前 10）
-constexpr size_t kFdMaxRows = 400;   // fd 同款抓取上限，读满即终止 fd
+constexpr DWORD kWsProbeRows = 1;    // å¯ç¨æ§æ¢æµï¼æ¿å° 1 è¡å³å¯
+constexpr DWORD kWsFetchRows = 400;  // çå®æ¥è¯¢æåä¸éï¼è¿æ»¤/æåºååªå±ç¤ºå 10ï¼
+constexpr size_t kFdMaxRows = 400;   // fd åæ¬¾æåä¸éï¼è¯»æ»¡å³ç»æ­¢ fd
 
-// ---------------- 通用小工具 ----------------
+// ---------------- éç¨å°å·¥å· ----------------
 std::wstring ToLower(std::wstring s) {
     if (!s.empty()) CharLowerBuffW(s.data(), (DWORD)s.size());
     return s;
 }
 
-// SQL 字符串字面量转义：单引号翻倍。%/_ 保留原样——文件名里出现通配符的概率
-// 远小于转义写错的风险，最坏也只是匹配面稍宽。
+// SQL å­ç¬¦ä¸²å­é¢éè½¬ä¹ï¼åå¼å·ç¿»åã%/_ ä¿çåæ ·ââæä»¶åéåºç°ééç¬¦çæ¦ç
+// è¿å°äºè½¬ä¹åéçé£é©ï¼æåä¹åªæ¯å¹éé¢ç¨å®½ã
 std::wstring SqlEscape(const std::wstring& w) {
     std::wstring o;
     o.reserve(w.size() + 8);
@@ -67,8 +67,8 @@ bool ContainsAny(const std::wstring& lower, const std::vector<std::wstring>& ter
     return false;
 }
 
-// Windows 命令行参数加引号：收尾引号前的连续反斜杠翻倍，否则 "C:\" 的 \"
-// 会把收尾引号转义成字面量（C:\ 被解析成 C:"）——alt-search 分支踩过的同一个坑。
+// Windows å½ä»¤è¡åæ°å å¼å·ï¼æ¶å°¾å¼å·åçè¿ç»­åææ ç¿»åï¼å¦å "C:\" ç \"
+// ä¼ææ¶å°¾å¼å·è½¬ä¹æå­é¢éï¼C:\ è¢«è§£ææ C:"ï¼ââalt-search åæ¯è¸©è¿çåä¸ä¸ªåã
 std::wstring QuoteArg(const std::wstring& s) {
     std::wstring o;
     o.reserve(s.size() + 8);
@@ -101,7 +101,7 @@ std::wstring Utf8ToWide(const std::string& u) {
     return s;
 }
 
-// COM 接口守卫：析构 Release，错误路径不泄漏
+// COM æ¥å£å®å«ï¼ææ Releaseï¼éè¯¯è·¯å¾ä¸æ³æ¼
 template <class T>
 struct CI {
     T* p = nullptr;
@@ -112,8 +112,8 @@ struct CI {
 
 // ---------------- Windows Search ----------------
 
-// System.ItemUrl（"file:C:/Users/a/b.txt"）→ Windows 路径（含 %XX 解码）。
-// file:///C:/ 剥三斜；file://server/share 是 UNC，保留双斜。
+// System.ItemUrlï¼"file:C:/Users/a/b.txt"ï¼â Windows è·¯å¾ï¼å« %XX è§£ç ï¼ã
+// file:///C:/ å¥ä¸æï¼file://server/share æ¯ UNCï¼ä¿çåæã
 std::wstring ItemUrlToPath(const wchar_t* u) {
     if (!u || !*u) return L"";
     std::wstring s = u;
@@ -139,21 +139,21 @@ std::wstring ItemUrlToPath(const wchar_t* u) {
     return o;
 }
 
-// COM 每线程只初始化一次、永不主动反初始化：CoUninitialize 会把 MTA 引用计数
-// 减到 0 并拆掉整个公寓，缓存里的 provider/会话指针随之失效（第二次查询即崩）。
-// 调用方线程均为长命线程（flowtary 常驻 WS 工作线程 / wsquery 主线程），安全。
-// fd 路径也需要它：SHGetFolderPathW 解析用户目录要 COM。
+// COM æ¯çº¿ç¨åªåå§åä¸æ¬¡ãæ°¸ä¸ä¸»å¨ååå§åï¼CoUninitialize ä¼æ MTA å¼ç¨è®¡æ°
+// åå° 0 å¹¶æææ´ä¸ªå¬å¯ï¼ç¼å­éç provider/ä¼è¯æééä¹å¤±æï¼ç¬¬äºæ¬¡æ¥è¯¢å³å´©ï¼ã
+// è°ç¨æ¹çº¿ç¨åä¸ºé¿å½çº¿ç¨ï¼flowtary å¸¸é©» WS å·¥ä½çº¿ç¨ / wsquery ä¸»çº¿ç¨ï¼ï¼å®å¨ã
+// fd è·¯å¾ä¹éè¦å®ï¼SHGetFolderPathW è§£æç¨æ·ç®å½è¦ COMã
 void EnsureThreadCom() {
     static thread_local bool t_comInit = false;
     if (!t_comInit) {
         HRESULT hrInit = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         if (SUCCEEDED(hrInit)) t_comInit = true;
-        // RPC_E_CHANGED_MODE：线程已是 STA——照常走（缓存调用线程不会是 STA 线程）
+        // RPC_E_CHANGED_MODEï¼çº¿ç¨å·²æ¯ STAââç§å¸¸èµ°ï¼ç¼å­è°ç¨çº¿ç¨ä¸ä¼æ¯ STA çº¿ç¨ï¼
     }
 }
 
-// 进程级会话缓存：provider 初始化 + 命令工厂只建一次，后续查询毫秒级。
-// 流程树上可能有两个调用线程（主程序常驻 WS 工作线程 / wsquery 主线程），互斥保护。
+// è¿ç¨çº§ä¼è¯ç¼å­ï¼provider åå§å + å½ä»¤å·¥ååªå»ºä¸æ¬¡ï¼åç»­æ¥è¯¢æ¯«ç§çº§ã
+// æµç¨æ ä¸å¯è½æä¸¤ä¸ªè°ç¨çº¿ç¨ï¼ä¸»ç¨åºå¸¸é©» WS å·¥ä½çº¿ç¨ / wsquery ä¸»çº¿ç¨ï¼ï¼äºæ¥ä¿æ¤ã
 struct WsCache {
     std::mutex mu;
     IDBInitialize* init = nullptr;
@@ -174,7 +174,7 @@ void WsStep(std::wstring* diag, const wchar_t* stage, HRESULT hr) {
     }
 }
 
-// 建会话（调用方已持锁）。返回 false 时 *hrOut 为首个失败点。
+// å»ºä¼è¯ï¼è°ç¨æ¹å·²æéï¼ãè¿å false æ¶ *hrOut ä¸ºé¦ä¸ªå¤±è´¥ç¹ã
 bool WsBuildSession(std::wstring* diag, HRESULT* hrOut) {
     CLSID clsid;
     HRESULT hr = CLSIDFromProgID(L"Search.CollatorDSO", &clsid);
@@ -184,7 +184,7 @@ bool WsBuildSession(std::wstring* diag, HRESULT* hrOut) {
                           (void**)&g_wsCache.init);
     WsStep(diag, L"CREATE", hr);
     if (FAILED(hr)) { *hrOut = hr; return false; }
-    // EXTENDED PROPERTIES="Application:Windows"（官方连接串同款）→ DBPROP_INIT_PROVIDERSTRING
+    // EXTENDED PROPERTIES="Application:Windows"ï¼å®æ¹è¿æ¥ä¸²åæ¬¾ï¼â DBPROP_INIT_PROVIDERSTRING
     DBPROP prop{};
     prop.dwPropertyID = DBPROP_INIT_PROVIDERSTRING;
     prop.vValue.vt = VT_BSTR;
@@ -214,16 +214,16 @@ bool WsBuildSession(std::wstring* diag, HRESULT* hrOut) {
     return true;
 }
 
-// 统一查询入口。maxRows 限制抓取行数（探测用 1，真实查询 400）。
-// 文件/文件夹判别放在客户端（System.ItemType == "Folder"）而非 SQL 的
-// <> 'Folder'：无扩展名文件的 ItemType 可能为 NULL，三值逻辑会漏行。
-// diag 非空时逐步记录失败点与 HRESULT（冒烟工具 wsquery --check 用）。
+// ç»ä¸æ¥è¯¢å¥å£ãmaxRows éå¶æåè¡æ°ï¼æ¢æµç¨ 1ï¼çå®æ¥è¯¢ 400ï¼ã
+// æä»¶/æä»¶å¤¹å¤å«æ¾å¨å®¢æ·ç«¯ï¼System.ItemType == "Folder"ï¼èé SQL ç
+// <> 'Folder'ï¼æ æ©å±åæä»¶ç ItemType å¯è½ä¸º NULLï¼ä¸å¼é»è¾ä¼æ¼è¡ã
+// diag éç©ºæ¶éæ­¥è®°å½å¤±è´¥ç¹ä¸ HRESULTï¼åçå·¥å· wsquery --check ç¨ï¼ã
 int WsQueryImpl(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD maxRows,
                 std::wstring* diag) {
     out.clear();
     if (q.words.empty() && q.excludes.empty()) return 0;
 
-    // ---- 组 SQL：逐词 AND（名字必含；路径模式放宽到 ItemUrl 整条路径）----
+    // ---- ç» SQLï¼éè¯ ANDï¼åå­å¿å«ï¼è·¯å¾æ¨¡å¼æ¾å®½å° ItemUrl æ´æ¡è·¯å¾ï¼----
     std::wstring where;
     for (const auto& w : q.words) {
         std::wstring like = L" LIKE '%" + SqlEscape(w) + L"%'";
@@ -232,22 +232,22 @@ int WsQueryImpl(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD maxR
         c += L")";
         where += where.empty() ? c : L" AND " + c;
     }
-    if (where.empty()) where = L"System.FileName LIKE '%'";  // 只有排除词：全量再排除
+    if (where.empty()) where = L"System.FileName LIKE '%'";  // åªææé¤è¯ï¼å¨éåæé¤
     for (const auto& e : q.excludes) {
         if (e.empty()) continue;
         std::wstring notlike = L" NOT LIKE '%" + SqlEscape(e) + L"%'";
         where += L" AND System.FileName" + notlike;
         if (pathMode) where += L" AND System.ItemUrl" + notlike;
     }
-    // 官方示例均为裸标识符，不加双引号
+    // å®æ¹ç¤ºä¾åä¸ºè£¸æ è¯ç¬¦ï¼ä¸å åå¼å·
     const std::wstring sql = L"SELECT System.ItemUrl, System.FileName, System.ItemType"
                              L" FROM SystemIndex WHERE " + where;
 
-    // COM 每线程只初始化一次、永不主动反初始化（见 EnsureThreadCom 注释）
+    // COM æ¯çº¿ç¨åªåå§åä¸æ¬¡ãæ°¸ä¸ä¸»å¨ååå§åï¼è§ EnsureThreadCom æ³¨éï¼
     EnsureThreadCom();
     int result = -1;
-    for (int attempt = 0; attempt < 2; ++attempt) {  // 会话失效（服务刚重启等）：重建后重试一次
-        // 会话缓存：provider/会话只建一次；查询失败重建一次再试（服务重启等情况）
+    for (int attempt = 0; attempt < 2; ++attempt) {  // ä¼è¯å¤±æï¼æå¡åéå¯ç­ï¼ï¼éå»ºåéè¯ä¸æ¬¡
+        // ä¼è¯ç¼å­ï¼provider/ä¼è¯åªå»ºä¸æ¬¡ï¼æ¥è¯¢å¤±è´¥éå»ºä¸æ¬¡åè¯ï¼æå¡éå¯ç­æåµï¼
         std::unique_lock<std::mutex> lk(g_wsCache.mu);
         HRESULT hr = S_OK;
         HRESULT buildHr = S_OK;
@@ -255,7 +255,7 @@ int WsQueryImpl(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD maxR
         CI<ICommandText> cmd;
         hr = g_wsCache.cmdFactory->CreateCommand(nullptr, IID_ICommandText, (IUnknown**)&cmd.p);
         WsStep(diag, L"CMD", hr);
-        if (FAILED(hr)) { g_wsCache.reset(); continue; }   // 重建会话再走一遍
+        if (FAILED(hr)) { g_wsCache.reset(); continue; }   // éå»ºä¼è¯åèµ°ä¸é
         hr = cmd->SetCommandText(DBGUID_DBSQL, sql.c_str());
         WsStep(diag, L"SETTEXT", hr);
         if (FAILED(hr)) break;
@@ -265,14 +265,14 @@ int WsQueryImpl(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD maxR
         hr = cmd->Execute(nullptr, IID_IRowset, nullptr, &affected, &rsUnk.p);
         WsStep(diag, L"EXEC", hr);
         if (FAILED(hr)) {
-            if (!diag) { g_wsCache.reset(); continue; }    // 静默重试一次（服务可能刚重启）
+            if (!diag) { g_wsCache.reset(); continue; }    // éé»éè¯ä¸æ¬¡ï¼æå¡å¯è½åéå¯ï¼
             break;
         }
         CI<IRowset> rs;
         if (FAILED(rsUnk->QueryInterface(IID_IRowset, (void**)&rs.p))) { WsStep(diag, L"RS", E_FAIL); break; }
         lk.unlock();
 
-        // 列 ordinal 按名定位
+        // å ordinal æåå®ä½
         CI<IColumnsInfo> ci;
         if (FAILED(rsUnk->QueryInterface(IID_IColumnsInfo, (void**)&ci.p))) { WsStep(diag, L"CI", E_FAIL); break; }
         DBORDINAL cCols = 0;
@@ -293,11 +293,11 @@ int WsQueryImpl(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD maxR
         CoTaskMemFree(namesBuf);
         if (!ordUrl || !ordName || !ordType) { WsStep(diag, L"ORD", E_FAIL); break; }
 
-        // 行缓冲：Search provider 的列值是 BYREF 宽字符串（服务端分配 wchar_t*，
-        // ReleaseRows 前有效），绑定必须 DBTYPE_WSTR|DBTYPE_BYREF + cbMaxLen=0，
-        // 固定长度 WSTR 拷贝会报 DB_E_BADBINDINFO。
-        // 布局（字节）：url ptr[0,8) st[8,12) pad[12,16) | name ptr[16,24) st[24,28) pad
-        //              | type ptr[32,40) st[40,44) → 共 48
+        // è¡ç¼å²ï¼Search provider çåå¼æ¯ BYREF å®½å­ç¬¦ä¸²ï¼æå¡ç«¯åé wchar_t*ï¼
+        // ReleaseRows åææï¼ï¼ç»å®å¿é¡» DBTYPE_WSTR|DBTYPE_BYREF + cbMaxLen=0ï¼
+        // åºå®é¿åº¦ WSTR æ·è´ä¼æ¥ DB_E_BADBINDINFOã
+        // å¸å±ï¼å­èï¼ï¼url ptr[0,8) st[8,12) pad[12,16) | name ptr[16,24) st[24,28) pad
+        //              | type ptr[32,40) st[40,44) â å± 48
         enum { OFF_URL = 0, OFF_URL_ST = 8, OFF_NAME = 16, OFF_NAME_ST = 24,
                OFF_TYPE = 32, OFF_TYPE_ST = 40, ROW_BUF = 48 };
         DBBINDING b[3]{};
@@ -323,14 +323,14 @@ int WsQueryImpl(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD maxR
         if (FAILED(hr)) break;
 
         unsigned char rowBuf[ROW_BUF];
-        HROW* prow = nullptr;   // GetNextRows 出参：服务端填行句柄数组
+        HROW* prow = nullptr;   // GetNextRows åºåï¼æå¡ç«¯å¡«è¡å¥ææ°ç»
         result = 0;
         for (;;) {
             DBCOUNTITEM got = 0;
             if (FAILED(rs->GetNextRows(DB_NULL_HCHAPTER, 0, 64, &got, &prow)) || got == 0) break;
             for (DBCOUNTITEM i = 0; i < got; ++i) {
                 if (FAILED(rs->GetData(prow[i], hacc, rowBuf))) continue;
-                // BYREF 绑定：值位是 wchar_t* 指针，ReleaseRows 前必须取走
+                // BYREF ç»å®ï¼å¼ä½æ¯ wchar_t* æéï¼ReleaseRows åå¿é¡»åèµ°
                 const wchar_t* url = *(wchar_t* const*)(rowBuf + OFF_URL);
                 const wchar_t* name = *(wchar_t* const*)(rowBuf + OFF_NAME);
                 const wchar_t* type = *(wchar_t* const*)(rowBuf + OFF_TYPE);
@@ -342,11 +342,11 @@ int WsQueryImpl(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD maxR
                 if (!colOk(OFF_NAME_ST)) name = L"";
                 if (!colOk(OFF_TYPE_ST)) type = L"";
                 bool isFolder = _wcsicmp(type, L"Folder") == 0;
-                if (q.isFile == isFolder) continue;  // f 排文件夹 / d 只要文件夹
+                if (q.isFile == isFolder) continue;  // f ææä»¶å¤¹ / d åªè¦æä»¶å¤¹
                 std::wstring path = ItemUrlToPath(url);
                 if (path.empty()) path = name ? name : L"";
                 if (path.empty()) continue;
-                if (ContainsAny(ToLower(path), q.excludes)) continue;  // 客户端再兜一道
+                if (ContainsAny(ToLower(path), q.excludes)) continue;  // å®¢æ·ç«¯ååä¸é
                 out.push_back({path, isFolder});
                 if (out.size() >= maxRows) break;
             }
@@ -355,7 +355,7 @@ int WsQueryImpl(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD maxR
         }
         if (hacc) acc->ReleaseAccessor(hacc, nullptr);
         result = (int)out.size();
-        break;   // 成功：不再重试
+        break;   // æåï¼ä¸åéè¯
     }
 
     return result;
@@ -364,13 +364,13 @@ int WsQueryImpl(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD maxR
 // ---------------- fd ----------------
 
 std::mutex g_fdMutex;
-std::vector<HANDLE> g_fdActive;  // 在途 fd 进程句柄（CancelAll 终止；属主线程回收+注销）
+std::vector<HANDLE> g_fdActive;  // å¨é fd è¿ç¨å¥æï¼CancelAll ç»æ­¢ï¼å±ä¸»çº¿ç¨åæ¶+æ³¨éï¼
 
 }  // namespace
 
 bool WindowsSearchAvailable() {
-    // 探针要求真有行：索引为空（从未建过/被清空）的机器上按不可用处理，
-    // 调用方据此跳过 WS 后端（本机 fd 单后端），避免每条查询空跑一个线程
+    // æ¢éè¦æ±çæè¡ï¼ç´¢å¼ä¸ºç©ºï¼ä»æªå»ºè¿/è¢«æ¸ç©ºï¼çæºå¨ä¸æä¸å¯ç¨å¤çï¼
+    // è°ç¨æ¹æ®æ­¤è·³è¿ WS åç«¯ï¼æ¬æº fd ååç«¯ï¼ï¼é¿åæ¯æ¡æ¥è¯¢ç©ºè·ä¸ä¸ªçº¿ç¨
     Query q{};
     q.words.push_back(L"a");
     std::vector<Hit> tmp;
@@ -391,8 +391,8 @@ int WindowsSearchQuery(const Query& q, bool pathMode, std::vector<Hit>& out) {
 }
 
 std::wstring FindFdExe() {
-    // 遍历器 fd.exe（sharkdp/fd 10.5.0 原名，MIT/Apache-2.0）：守护进程的建库/兜底趟
-    // 与 flowtary 的 fd 层都用它；只在遍历瞬间存在，任务管理器平时看不到
+    // éåå¨ fd.exeï¼sharkdp/fd 10.5.0 ååï¼MIT/Apache-2.0ï¼ï¼å®æ¤è¿ç¨çå»ºåº/ååºè¶
+    // ä¸ flowtary ç fd å±é½ç¨å®ï¼åªå¨éåç¬é´å­å¨ï¼ä»»å¡ç®¡çå¨å¹³æ¶çä¸å°
     auto tryLocate = [](const wchar_t* name, std::wstring& out) -> bool {
         WCHAR self[MAX_PATH]{};
         if (GetModuleFileNameW(nullptr, self, MAX_PATH)) {
@@ -422,24 +422,24 @@ void CancelAll() {
         std::lock_guard<std::mutex> lk(g_fdMutex);
         hs.swap(g_fdActive);
     }
-    for (HANDLE h : hs) TerminateProcess(h, 0);  // 已退出的进程上失败无害；回收仍由属主线程做
+    for (HANDLE h : hs) TerminateProcess(h, 0);  // å·²éåºçè¿ç¨ä¸å¤±è´¥æ å®³ï¼åæ¶ä»ç±å±ä¸»çº¿ç¨å
 }
 
-// ---------------- 内存索引（用户常用目录，毫秒级子串搜索） ----------------
-// 存储为「每根一个路径池 + 偏移表」：路径连续存放（各自 \0 结尾），条目只记
-// 偏移/名字偏移/是否目录——比 vector<wstring> 省一半以上内存（无逐串分配开销）。
-// 增量更新 = 整根替换（fd 重列该根后整体 swap），无需跨根挪动下标。
+// ---------------- åå­ç´¢å¼ï¼ç¨æ·å¸¸ç¨ç®å½ï¼æ¯«ç§çº§å­ä¸²æç´¢ï¼ ----------------
+// å­å¨ä¸ºãæ¯æ ¹ä¸ä¸ªè·¯å¾æ±  + åç§»è¡¨ãï¼è·¯å¾è¿ç»­å­æ¾ï¼åèª \0 ç»å°¾ï¼ï¼æ¡ç®åªè®°
+// åç§»/åå­åç§»/æ¯å¦ç®å½ââæ¯ vector<wstring> çä¸åä»¥ä¸åå­ï¼æ éä¸²åéå¼éï¼ã
+// å¢éæ´æ° = æ´æ ¹æ¿æ¢ï¼fd éåè¯¥æ ¹åæ´ä½ swapï¼ï¼æ éè·¨æ ¹æªå¨ä¸æ ã
 
 struct MemRootData {
-    std::wstring pool;               // 路径池（顺序拼接，每条自带 \0）
-    std::vector<uint32_t> offs;      // 每条目路径在 pool 中的起始下标
-    std::vector<uint32_t> nameFlags; // 每条目：低 31 位 = 文件名偏移，最高位 = isDir
+    std::wstring pool;               // è·¯å¾æ± ï¼é¡ºåºæ¼æ¥ï¼æ¯æ¡èªå¸¦ \0ï¼
+    std::vector<uint32_t> offs;      // æ¯æ¡ç®è·¯å¾å¨ pool ä¸­çèµ·å§ä¸æ 
+    std::vector<uint32_t> nameFlags; // æ¯æ¡ç®ï¼ä½ 31 ä½ = æä»¶ååç§»ï¼æé«ä½ = isDir
     size_t size() const { return offs.size(); }
 };
 
 std::mutex g_memMu;
-std::vector<MemRootData> g_memRoots;        // 与 g_memRootNames 下标一一对应
-std::vector<std::wstring> g_memRootNames;   // 根目录列表（UserDirsRoots）
+std::vector<MemRootData> g_memRoots;        // ä¸ g_memRootNames ä¸æ ä¸ä¸å¯¹åº
+std::vector<std::wstring> g_memRootNames;   // æ ¹ç®å½åè¡¨ï¼UserDirsRootsï¼
 std::atomic<bool> g_memReady{false};
 std::atomic<bool> g_memStarted{false};
 std::atomic<bool> g_memQuit{false};
@@ -456,7 +456,7 @@ DWORD MemCap() {
     return 300000;
 }
 
-// 大小写不敏感子串查找（朴素算法；16 万条短名 ≈ 每查询几毫秒，无需 SIMD）
+// å¤§å°åä¸ææå­ä¸²æ¥æ¾ï¼æ´ç´ ç®æ³ï¼16 ä¸æ¡ç­å â æ¯æ¥è¯¢å æ¯«ç§ï¼æ é SIMDï¼
 const wchar_t* MemCaselessFind(const wchar_t* hay, const wchar_t* needle) {
     if (!*needle) return hay;
     for (; *hay; ++hay) {
@@ -469,13 +469,13 @@ const wchar_t* MemCaselessFind(const wchar_t* hay, const wchar_t* needle) {
     return nullptr;
 }
 
-// 默认剪枝集（-E 透传给 fd，fd 对目录剪枝=整棵子树不进遍历）：
-//  - 点开头（.git/.vscode/.cache/临时点文件）——仅内存索引启用（fd 搜索层由
-//    客户端按 skipDotFolders 开关过滤，保持开关语义）
-//  - 回收站/系统卷标目录（$RECYCLE.BIN、System Volume Information、RECYCLER）
-//  - 临时目录与临时/备份文件（tmp、temp、*.tmp、*.temp、~$*、*~、*.swp）
-//  - node_modules、__pycache__
-// 与设置「排除路径」默认集同向：这些条目展示层本来就被过滤，剪掉纯省内存和遍历时间。
+// é»è®¤åªæéï¼-E éä¼ ç» fdï¼fd å¯¹ç®å½åªæ=æ´æ£µå­æ ä¸è¿éåï¼ï¼
+//  - ç¹å¼å¤´ï¼.git/.vscode/.cache/ä¸´æ¶ç¹æä»¶ï¼ââä»åå­ç´¢å¼å¯ç¨ï¼fd æç´¢å±ç±
+//    å®¢æ·ç«¯æ skipDotFolders å¼å³è¿æ»¤ï¼ä¿æå¼å³è¯­ä¹ï¼
+//  - åæ¶ç«/ç³»ç»å·æ ç®å½ï¼$RECYCLE.BINãSystem Volume InformationãRECYCLERï¼
+//  - ä¸´æ¶ç®å½ä¸ä¸´æ¶/å¤ä»½æä»¶ï¼tmpãtempã*.tmpã*.tempã~$*ã*~ã*.swpï¼
+//  - node_modulesã__pycache__
+// ä¸è®¾ç½®ãæé¤è·¯å¾ãé»è®¤éååï¼è¿äºæ¡ç®å±ç¤ºå±æ¬æ¥å°±è¢«è¿æ»¤ï¼åªæçº¯çåå­åéåæ¶é´ã
 void AppendPruneArgs(std::wstring& args, bool includeDot) {
     const wchar_t* const prunes[] = {
         L"node_modules", L"__pycache__",
@@ -497,9 +497,9 @@ void MemPoolAdd(MemRootData& rd, const std::wstring& path, bool isDir) {
     rd.nameFlags.push_back((uint32_t)nameOff | (isDir ? 0x80000000u : 0u));
 }
 
-// 索引缓存落盘（UTF-8 文本：首行版本标记，R\t根目录 为分节标记，D/F\tpath 为条目）。
-// 作用：重启时毫秒级加载立即可用（可能略旧，后台全量重建后覆盖），
-// 100s 级的建库成本只在首次运行（或剪枝规则变更后）支付。
+// ç´¢å¼ç¼å­è½çï¼UTF-8 ææ¬ï¼é¦è¡çæ¬æ è®°ï¼R\tæ ¹ç®å½ ä¸ºåèæ è®°ï¼D/F\tpath ä¸ºæ¡ç®ï¼ã
+// ä½ç¨ï¼éå¯æ¶æ¯«ç§çº§å è½½ç«å³å¯ç¨ï¼å¯è½ç¥æ§ï¼åå°å¨ééå»ºåè¦çï¼ï¼
+// 100s çº§çå»ºåºææ¬åªå¨é¦æ¬¡è¿è¡ï¼æåªæè§ååæ´åï¼æ¯ä»ã
 std::wstring MemCachePath() {
     EnsureThreadCom();
     wchar_t p[MAX_PATH]{};
@@ -509,7 +509,7 @@ std::wstring MemCachePath() {
     CreateDirectoryW(dir.c_str(), nullptr);
     return dir + L"\\memindex.dat";
 }
-// 持 g_memMu 调用。分块写文件（1MB 缓冲）——不整串拼接，避免 20MB×2 的堆峰值驻留
+// æ g_memMu è°ç¨ãåååæä»¶ï¼1MB ç¼å²ï¼ââä¸æ´ä¸²æ¼æ¥ï¼é¿å 20MBÃ2 çå å³°å¼é©»ç
 void MemIndexSaveLocked() {
     std::wstring path = MemCachePath();
     if (path.empty()) return;
@@ -526,7 +526,7 @@ void MemIndexSaveLocked() {
         }
         return true;
     };
-    bool ok = writeAll("FTMEMINDEX3\n", 12);   // 格式版本标记：规则/存储变更时旧缓存自动失效
+    bool ok = writeAll("FTMEMINDEX3\n", 12);   // æ ¼å¼çæ¬æ è®°ï¼è§å/å­å¨åæ´æ¶æ§ç¼å­èªå¨å¤±æ
     std::string chunk;
     chunk.reserve(1024 * 1024);
     for (size_t i = 0; ok && i < g_memRoots.size() && i < g_memRootNames.size(); ++i) {
@@ -553,7 +553,7 @@ void MemIndexSaveLocked() {
     if (ok) MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
     else DeleteFileW(tmp.c_str());
 }
-// 持 g_memMu 调用；成功时按 g_memRootNames 对齐填充 g_memRoots（缓存多出的根丢弃）
+// æ g_memMu è°ç¨ï¼æåæ¶æ g_memRootNames å¯¹é½å¡«å g_memRootsï¼ç¼å­å¤åºçæ ¹ä¸¢å¼ï¼
 bool MemIndexLoadLocked() {
     std::wstring path = MemCachePath();
     if (path.empty()) return false;
@@ -567,7 +567,7 @@ bool MemIndexLoadLocked() {
     ReadFile(h, data.data(), size, &rd, nullptr);
     CloseHandle(h);
 
-    std::unordered_map<std::wstring, MemRootData> byRoot;   // 小写根 → 条目
+    std::unordered_map<std::wstring, MemRootData> byRoot;   // å°åæ ¹ â æ¡ç®
     size_t pos = 0;
     bool versionOk = false;
     std::wstring curRoot;
@@ -582,7 +582,7 @@ bool MemIndexLoadLocked() {
     std::string line;
     while (nextLine(line)) {
         if (!versionOk) {
-            versionOk = line == "FTMEMINDEX3";   // 版本不符（旧规则缓存）→ 弃用重建
+            versionOk = line == "FTMEMINDEX3";   // çæ¬ä¸ç¬¦ï¼æ§è§åç¼å­ï¼â å¼ç¨éå»º
             if (!versionOk) break;
             continue;
         }
@@ -606,7 +606,7 @@ bool MemIndexLoadLocked() {
     if (total == 0) return false;
     g_memRoots.clear();
     g_memRoots.reserve(g_memRootNames.size());
-    for (const auto& name : g_memRootNames) {   // 按当前根顺序对齐
+    for (const auto& name : g_memRootNames) {   // æå½åæ ¹é¡ºåºå¯¹é½
         auto it = byRoot.find(ToLower(name));
         if (it != byRoot.end()) g_memRoots.push_back(std::move(it->second));
         else g_memRoots.push_back(MemRootData{});
@@ -614,10 +614,10 @@ bool MemIndexLoadLocked() {
     return true;
 }
 
-// fd 全列一个根（模式 . 匹配任意非空名）。剪枝见 AppendPruneArgs；
-// 不带 -I（尊重 .gitignore，build/dist 等未忽略产物仍入索引）。
-// fd 子进程运行并按行收集原始输出（UTF-8、正斜杠）。两趟式建库的公共底座：
-// 不在解析循环里调 GetFileAttributesW——个别特殊文件名会让它挂死（Defender 环境）。
+// fd å¨åä¸ä¸ªæ ¹ï¼æ¨¡å¼ . å¹éä»»æéç©ºåï¼ãåªæè§ AppendPruneArgsï¼
+// ä¸å¸¦ -Iï¼å°é .gitignoreï¼build/dist ç­æªå¿½ç¥äº§ç©ä»å¥ç´¢å¼ï¼ã
+// fd å­è¿ç¨è¿è¡å¹¶æè¡æ¶éåå§è¾åºï¼UTF-8ãæ­£ææ ï¼ãä¸¤è¶å¼å»ºåºçå¬å±åºåº§ï¼
+// ä¸å¨è§£æå¾ªç¯éè° GetFileAttributesWââä¸ªå«ç¹æ®æä»¶åä¼è®©å®ææ­»ï¼Defender ç¯å¢ï¼ã
 bool FdCaptureLines(const std::wstring& fdExe, const std::wstring& args, DWORD deadlineMs,
                     std::vector<std::string>& lines) {
     lines.clear();
@@ -634,19 +634,19 @@ bool FdCaptureLines(const std::wstring& fdExe, const std::wstring& args, DWORD d
     si.hStdOutput = wr;
     si.hStdError = nul;
     PROCESS_INFORMATION pi{};
-    std::wstring mutableCmd = cmd;   // CreateProcessW 会改写命令行缓冲：必须传可写副本（const 参数的 data() 只读，强转会崩）
+    std::wstring mutableCmd = cmd;   // CreateProcessW ä¼æ¹åå½ä»¤è¡ç¼å²ï¼å¿é¡»ä¼ å¯åå¯æ¬ï¼const åæ°ç data() åªè¯»ï¼å¼ºè½¬ä¼å´©ï¼
     BOOL ok = CreateProcessW(fdExe.c_str(), mutableCmd.data(), nullptr, nullptr, TRUE,
                              CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
     CloseHandle(wr);
     if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
     if (!ok) { CloseHandle(hrd); return false; }
     CloseHandle(pi.hThread);
-    SetPriorityClass(pi.hProcess, BELOW_NORMAL_PRIORITY_CLASS);   // 略低于前台：IDLE 会被等待中的普通优先级线程饿死（实测 3.7s 手动 vs 10min 超时）
+    SetPriorityClass(pi.hProcess, BELOW_NORMAL_PRIORITY_CLASS);   // ç¥ä½äºåå°ï¼IDLE ä¼è¢«ç­å¾ä¸­çæ®éä¼åçº§çº¿ç¨é¥¿æ­»ï¼å®æµ 3.7s æå¨ vs 10min è¶æ¶ï¼
 
     char buf[262144];
     std::string acc;
     const ULONGLONG start = GetTickCount64();
-    for (;;) {   // PeekNamedPipe 轮询 + 兜底超时（空闲优先级走完全盘可达分钟级）
+    for (;;) {   // PeekNamedPipe è½®è¯¢ + ååºè¶æ¶ï¼ç©ºé²ä¼åçº§èµ°å®å¨çå¯è¾¾åéçº§ï¼
         DWORD avail = 0;
         if (!PeekNamedPipe(hrd, nullptr, 0, nullptr, &avail, nullptr)) break;
         if (avail > 0) {
@@ -678,12 +678,12 @@ bool FdCaptureLines(const std::wstring& fdExe, const std::wstring& args, DWORD d
     return true;
 }
 
-// fd 两趟全列一个根（先目录后文件），条目进池。剪枝见 AppendPruneArgs；
-// 不带 -I（尊重 .gitignore，build/dist 等未忽略产物仍入索引）。
+// fd ä¸¤è¶å¨åä¸ä¸ªæ ¹ï¼åç®å½åæä»¶ï¼ï¼æ¡ç®è¿æ± ãåªæè§ AppendPruneArgsï¼
+// ä¸å¸¦ -Iï¼å°é .gitignoreï¼build/dist ç­æªå¿½ç¥äº§ç©ä»å¥ç´¢å¼ï¼ã
 bool MemListRootFd(const std::wstring& fdExe, const std::wstring& root, size_t cap,
                    MemRootData& rd) {
     rd = MemRootData{};
-    // 注意顺序：-E 剪枝必须在「-- 根」之前（-- 之后的参数都是位置参数，不再是选项）
+    // æ³¨æé¡ºåºï¼-E åªæå¿é¡»å¨ã-- æ ¹ãä¹åï¼-- ä¹åçåæ°é½æ¯ä½ç½®åæ°ï¼ä¸åæ¯éé¡¹ï¼
     for (int pass = 0; pass < 2; ++pass) {
         std::wstring args = L" -a -H --max-results " + std::to_wstring(cap);
         AppendPruneArgs(args, /*includeDot=*/true);
@@ -710,8 +710,8 @@ void MemMarkDirty(size_t idx) {
     g_dirtyCv.notify_one();
 }
 
-// 每个用户目录一个监听线程：阻塞在 ReadDirectoryChangesW 上（内核等待，零 CPU），
-// 任何名字变更（增/删/改名）都把该根标脏，由维护线程防抖后增量重建
+// æ¯ä¸ªç¨æ·ç®å½ä¸ä¸ªçå¬çº¿ç¨ï¼é»å¡å¨ ReadDirectoryChangesW ä¸ï¼åæ ¸ç­å¾ï¼é¶ CPUï¼ï¼
+// ä»»ä½åå­åæ´ï¼å¢/å /æ¹åï¼é½æè¯¥æ ¹æ èï¼ç±ç»´æ¤çº¿ç¨é²æåå¢ééå»º
 struct MemWatchArg {
     size_t idx;
     std::wstring root;
@@ -725,7 +725,7 @@ unsigned __stdcall MemWatchThread(void* p) {
         HANDLE h = CreateFileW(root.c_str(), FILE_LIST_DIRECTORY,
                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-        if (h == INVALID_HANDLE_VALUE) {   // 目录暂不可见（U 盘等）：等待重试
+        if (h == INVALID_HANDLE_VALUE) {   // ç®å½æä¸å¯è§ï¼U çç­ï¼ï¼ç­å¾éè¯
             Sleep(5000);
             continue;
         }
@@ -737,19 +737,19 @@ unsigned __stdcall MemWatchThread(void* p) {
                                        FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME,
                                        &bytes, nullptr, nullptr))
                 break;
-            // 只要有事件就标脏（防抖由维护线程做）；缓冲区溢出同样整体标脏
+            // åªè¦æäºä»¶å°±æ èï¼é²æç±ç»´æ¤çº¿ç¨åï¼ï¼ç¼å²åºæº¢åºåæ ·æ´ä½æ è
             MemMarkDirty(idx);
             break;
         }
         CloseHandle(h);
         if (g_memQuit) break;
-        Sleep(200);   // 目录句柄失效（重命名/移动）后稍等重挂
+        Sleep(200);   // ç®å½å¥æå¤±æï¼éå½å/ç§»å¨ï¼åç¨ç­éæ
     }
     return 0;
 }
 
-// 维护线程：防抖 1.5s 后按根整根重建（fd 重列该根 → 整根 swap，无下标挪动）。
-// 重扫一根可达分钟级（Defender），30s 内不重复扫同一根（脏标记留到下轮）。
+// ç»´æ¤çº¿ç¨ï¼é²æ 1.5s åææ ¹æ´æ ¹éå»ºï¼fd éåè¯¥æ ¹ â æ´æ ¹ swapï¼æ ä¸æ æªå¨ï¼ã
+// éæ«ä¸æ ¹å¯è¾¾åéçº§ï¼Defenderï¼ï¼30s åä¸éå¤æ«åä¸æ ¹ï¼èæ è®°çå°ä¸è½®ï¼ã
 unsigned __stdcall MemMaintThread(void*) {
     std::wstring fdExe = FindFdExe();
     std::unordered_map<size_t, ULONGLONG> lastWalk;
@@ -768,13 +768,13 @@ unsigned __stdcall MemMaintThread(void*) {
         for (size_t idx : dirty) {
             auto it = lastWalk.find(idx);
             if (it != lastWalk.end() && now - it->second < 30000) {
-                deferred.insert(idx);   // 刚扫过：推迟，避免目录高频变更时反复全扫
+                deferred.insert(idx);   // åæ«è¿ï¼æ¨è¿ï¼é¿åç®å½é«é¢åæ´æ¶åå¤å¨æ«
                 continue;
             }
             lastWalk[idx] = now;
             if (idx >= g_memRootNames.size()) continue;
             MemRootData part;
-            MemListRootFd(fdExe, g_memRootNames[idx], MemCap(), part);   // 不持锁（可达分钟级）
+            MemListRootFd(fdExe, g_memRootNames[idx], MemCap(), part);   // ä¸æéï¼å¯è¾¾åéçº§ï¼
             {
                 std::lock_guard<std::mutex> lk(g_memMu);
                 if (idx < g_memRoots.size()) {
@@ -788,18 +788,18 @@ unsigned __stdcall MemMaintThread(void*) {
         }
         if (!deferred.empty()) {
             std::lock_guard<std::mutex> lk(g_dirtyMu);
-            g_dirty.insert(deferred.begin(), deferred.end());   // 等冷却期过再扫（wait 谓词会自查）
+            g_dirty.insert(deferred.begin(), deferred.end());   // ç­å·å´æè¿åæ«ï¼wait è°è¯ä¼èªæ¥ï¼
         }
     }
     return 0;
 }
 
-// 建库线程：先加载磁盘缓存（重启即毫秒级可用），后台逐根重建——每根扫完立即换入
-// （不同时持有两份全量池，峰值内存 ≈ 全量池 + 单根）
+// å»ºåºçº¿ç¨ï¼åå è½½ç£çç¼å­ï¼éå¯å³æ¯«ç§çº§å¯ç¨ï¼ï¼åå°éæ ¹éå»ºââæ¯æ ¹æ«å®ç«å³æ¢å¥
+// ï¼ä¸åæ¶ææä¸¤ä»½å¨éæ± ï¼å³°å¼åå­ â å¨éæ±  + åæ ¹ï¼
 unsigned __stdcall MemBuildThread(void*) {
     {
         std::lock_guard<std::mutex> lk(g_memMu);
-        if (MemIndexLoadLocked()) g_memReady = true;   // 缓存可能略旧：先用，逐根刷新
+        if (MemIndexLoadLocked()) g_memReady = true;   // ç¼å­å¯è½ç¥æ§ï¼åç¨ï¼éæ ¹å·æ°
     }
     std::wstring fdExe = FindFdExe();
     size_t total = 0;
@@ -832,11 +832,11 @@ void MemIndexStart(const std::vector<std::wstring>& extraRoots) {
     bool expect = false;
     if (!g_memStarted.compare_exchange_strong(expect, true)) return;
     if (GetEnvironmentVariableW(L"FT_DF_MEMINDEX_OFF", nullptr, 0) > 0) {
-        g_memReady = true;   // 显式关闭：索引恒空，调度链直接走 fd/WS
+        g_memReady = true;   // æ¾å¼å³é­ï¼ç´¢å¼æç©ºï¼è°åº¦é¾ç´æ¥èµ° fd/WS
         return;
     }
     g_memRootNames = UserDirsRoots();
-    for (const auto& extra : extraRoots) {   // 注册表 IndexDirs 配置的项目目录等
+    for (const auto& extra : extraRoots) {   // æ³¨åè¡¨ IndexDirs éç½®çé¡¹ç®ç®å½ç­
         if (extra.size() < 3 || extra[1] != L':') continue;
         wchar_t driveRoot[4] = { extra[0], L':', L'\\', L'\0' };
         if (GetDriveTypeW(driveRoot) != DRIVE_FIXED) continue;
@@ -874,7 +874,7 @@ int MemIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD m
             const wchar_t* path = rd.pool.c_str() + rd.offs[k];
             const uint32_t nf = rd.nameFlags[k];
             const bool isDir = (nf & 0x80000000u) != 0;
-            if (q.isFile == isDir) continue;   // f 排文件夹 / d 只要文件夹
+            if (q.isFile == isDir) continue;   // f ææä»¶å¤¹ / d åªè¦æä»¶å¤¹
             const wchar_t* name = path + (nf & 0x7FFFFFFFu);
             bool ok = true;
             if (pathMode) {
@@ -890,8 +890,8 @@ int MemIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD m
             if (out.size() >= maxRows) break;
         }
         if (out.size() >= maxRows) break;
-    }
     return (int)out.size();
+}  // namespace
 }
 DWORD DefaultFdDeadlineMs() {
     wchar_t env[16]{};
@@ -899,17 +899,17 @@ DWORD DefaultFdDeadlineMs() {
         DWORD v = (DWORD)_wtoi(env);
         if (v || env[0] == L'0') return v;
     }
-    return 8000;  // 默认 8s 预算（超时后调用方跳过路径兜底，最坏 ≤8s）
+    return 8000;  // é»è®¤ 8s é¢ç®ï¼è¶æ¶åè°ç¨æ¹è·³è¿è·¯å¾ååºï¼æå â¤8sï¼
 }
 
-// 用户常用目录根（桌面/文档/下载/图片/音乐/视频）
+// ç¨æ·å¸¸ç¨ç®å½æ ¹ï¼æ¡é¢/ææ¡£/ä¸è½½/å¾ç/é³ä¹/è§é¢ï¼
 std::vector<std::wstring> UserDirsRoots() {
     EnsureThreadCom();
     std::vector<std::wstring> roots;
     auto addRoot = [&](const std::wstring& r) {
         if (r.size() < 3 || r[1] != L':') return;
-        // GetDriveTypeW 对非根路径行为不可靠（实测返回 DRIVE_REMOVABLE），
-        // 必须先截出 "C:\" 盘根再判类型
+        // GetDriveTypeW å¯¹éæ ¹è·¯å¾è¡ä¸ºä¸å¯é ï¼å®æµè¿å DRIVE_REMOVABLEï¼ï¼
+        // å¿é¡»åæªåº "C:\" çæ ¹åå¤ç±»å
         wchar_t driveRoot[4] = { r[0], L':', L'\\', L'\0' };
         if (GetDriveTypeW(driveRoot) != DRIVE_FIXED) return;
         for (const auto& e : roots)
@@ -919,17 +919,25 @@ std::vector<std::wstring> UserDirsRoots() {
     const int csidls[] = {
         CSIDL_DESKTOPDIRECTORY, CSIDL_PERSONAL, CSIDL_MYPICTURES,
         CSIDL_MYMUSIC, CSIDL_MYVIDEO,
-        0x000C,  // CSIDL_DOWNLOADS（老 SDK 无宏，值固定）
+        0x000C,  // CSIDL_DOWNLOADSï¼è SDK æ å®ï¼å¼åºå®ï¼
+        CSIDL_PROGRAM_FILES, CSIDL_PROGRAM_FILESX86,   // å¸¸è§å®è£ç®å½ä¹è¿æ¯«ç§å±
     };
     for (int csidl : csidls) {
         wchar_t p[MAX_PATH]{};
         if (SUCCEEDED(SHGetFolderPathW(nullptr, csidl, nullptr, SHGFP_TYPE_CURRENT, p)))
             addRoot(p);
     }
+    {   // ç¨æ·çº§å®è£ç®å½ï¼VS Code / Discord ç­è£å¨ %LOCALAPPDATA%\Programsï¼
+        wchar_t la[MAX_PATH]{};
+        if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, la))) {
+            std::wstring progs = std::wstring(la) + L"\\Programs";
+            if (GetFileAttributesW(progs.c_str()) != INVALID_FILE_ATTRIBUTES) addRoot(progs);
+        }
+    }
     return roots;
 }
 
-// 全部固定盘根
+// å¨é¨åºå®çæ ¹
 std::vector<std::wstring> DriveRoots() {
     std::vector<std::wstring> roots;
     DWORD drives = GetLogicalDrives();
@@ -947,11 +955,11 @@ int FdQuery(const std::wstring& fdExe, const Query& q, bool pathMode, bool skipH
             const std::vector<std::wstring>& rootsOverride) {
     out.clear();
     if (timedOut) *timedOut = false;
-    EnsureThreadCom();   // SHGetFolderPathW 解析用户目录需要 COM
-    // 搜索根：默认 = 用户常用目录（桌面/文档/下载/图片/音乐/视频）前置 + 全部固定盘。
-    // fd 的共享遍历队列没有根优先级，大根会把小根的结果淹没到几十秒之后——
-    // 需要严格保证常用区域先出结果时，调用方应分阶段调用
-    //（rootsOverride=UserDirsRoots() 先行，再用 DriveRoots() 补全盘）。
+    EnsureThreadCom();   // SHGetFolderPathW è§£æç¨æ·ç®å½éè¦ COM
+    // æç´¢æ ¹ï¼é»è®¤ = ç¨æ·å¸¸ç¨ç®å½ï¼æ¡é¢/ææ¡£/ä¸è½½/å¾ç/é³ä¹/è§é¢ï¼åç½® + å¨é¨åºå®çã
+    // fd çå±äº«éåéåæ²¡ææ ¹ä¼åçº§ï¼å¤§æ ¹ä¼æå°æ ¹çç»ææ·¹æ²¡å°å åç§ä¹åââ
+    // éè¦ä¸¥æ ¼ä¿è¯å¸¸ç¨åºåååºç»ææ¶ï¼è°ç¨æ¹åºåé¶æ®µè°ç¨
+    //ï¼rootsOverride=UserDirsRoots() åè¡ï¼åç¨ DriveRoots() è¡¥å¨çï¼ã
     std::vector<std::wstring> roots = rootsOverride;
     if (roots.empty()) {
         roots = UserDirsRoots();
@@ -964,17 +972,17 @@ int FdQuery(const std::wstring& fdExe, const Query& q, bool pathMode, bool skipH
     }
     if (roots.empty()) return 0;
 
-    // -a 绝对路径；-F 固定字符串（词里的正则元字符不炸）；-i 不分大小写；
-    // -I 不理会 .gitignore/.ignore（build/dist 这类被 ignore 的目录也要能搜到，
-    //    点开头过滤交给主程序客户端过滤，与 Everything 结果同规则）；
-    // -t f/-t d 类型过滤；-p 路径级兜底；--max-results 命中即收工；
-    // 多词 AND：首个词为位置模式，其余逐个 --and（fd 10 的裸位置多模式是 OR）；
-    // 「--」之后全部是搜索根。
+    // -a ç»å¯¹è·¯å¾ï¼-F åºå®å­ç¬¦ä¸²ï¼è¯éçæ­£ååå­ç¬¦ä¸ç¸ï¼ï¼-i ä¸åå¤§å°åï¼
+    // -I ä¸çä¼ .gitignore/.ignoreï¼build/dist è¿ç±»è¢« ignore çç®å½ä¹è¦è½æå°ï¼
+    //    ç¹å¼å¤´è¿æ»¤äº¤ç»ä¸»ç¨åºå®¢æ·ç«¯è¿æ»¤ï¼ä¸ Everything ç»æåè§åï¼ï¼
+    // -t f/-t d ç±»åè¿æ»¤ï¼-p è·¯å¾çº§ååºï¼--max-results å½ä¸­å³æ¶å·¥ï¼
+    // å¤è¯ ANDï¼é¦ä¸ªè¯ä¸ºä½ç½®æ¨¡å¼ï¼å¶ä½éä¸ª --andï¼fd 10 çè£¸ä½ç½®å¤æ¨¡å¼æ¯ ORï¼ï¼
+    // ã--ãä¹åå¨é¨æ¯æç´¢æ ¹ã
     std::wstring args = L" -a -F -i -I --max-results 400";
     if (!skipHidden) args += L" -H";
     if (pathMode) args += L" -p";
     args += q.isFile ? L" -t f" : L" -t d";
-    AppendPruneArgs(args, /*includeDot=*/false);   // 回收站/系统/临时目录剪枝：提速全盘遍历
+    AppendPruneArgs(args, /*includeDot=*/false);   // åæ¶ç«/ç³»ç»/ä¸´æ¶ç®å½åªæï¼æéå¨çéå
     for (size_t i = 0; i < q.words.size(); ++i) {
         if (i > 0) args += L" --and";
         args += L" " + QuoteArg(q.words[i]);
@@ -985,23 +993,37 @@ int FdQuery(const std::wstring& fdExe, const Query& q, bool pathMode, bool skipH
 
     SECURITY_ATTRIBUTES sa{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
     HANDLE rd = nullptr, wr = nullptr;
-    if (!CreatePipe(&rd, &wr, &sa, 0)) return -1;   // 两端均可继承（sa.bInheritHandle=TRUE）
+    if (!CreatePipe(&rd, &wr, &sa, 0)) return -1;   // ä¸¤ç«¯åå¯ç»§æ¿ï¼sa.bInheritHandle=TRUEï¼
     HANDLE nul = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
                              &sa, OPEN_EXISTING, 0, nullptr);
     STARTUPINFOW si{};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdInput = nul;
-    si.hStdOutput = wr;   // 子进程拿走可继承写端；父进程在 CreateProcess 后关闭
+    si.hStdOutput = wr;   // å­è¿ç¨æ¿èµ°å¯ç»§æ¿åç«¯ï¼ç¶è¿ç¨å¨ CreateProcess åå³é­
     si.hStdError = nul;
     PROCESS_INFORMATION pi{};
     BOOL ok = CreateProcessW(fdExe.c_str(), cmd.data(), nullptr, nullptr, TRUE,
                              CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
-    CloseHandle(wr);      // 自身不留写端：fd 退出后管道 EOF 可判定
+    CloseHandle(wr);      // èªèº«ä¸çåç«¯ï¼fd éåºåç®¡é EOF å¯å¤å®
     if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
     if (!ok) {
         CloseHandle(rd);
         return -1;
+    }
+    // Jobï¼KILL_ON_JOB_CLOSEââå®¿ä¸»ï¼å®æ¤è¿ç¨/flowtary/wsqueryï¼éåºæè¢«ææ¶ï¼
+    // æªå®æç fd éåä¸å¹¶ç»æ­¢ï¼æç»å­¤å¿ walker æ¢å ç£ç I/Oï¼å®æµ 6 ä¸ªå­¤å¿å¹¶åï¼
+    {
+        static HANDLE s_walkerJob = nullptr;   // è¿ç¨çº§åä¾ï¼éè¿ç¨å­æ´»
+        if (!s_walkerJob) {
+            s_walkerJob = CreateJobObjectW(nullptr, nullptr);
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION jli{};
+            jli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if (s_walkerJob)
+                SetInformationJobObject(s_walkerJob, JobObjectExtendedLimitInformation,
+                                        &jli, sizeof(jli));
+        }
+        if (s_walkerJob) AssignProcessToJobObject(s_walkerJob, pi.hProcess);
     }
     CloseHandle(pi.hThread);
     {
@@ -1011,10 +1033,10 @@ int FdQuery(const std::wstring& fdExe, const Query& q, bool pathMode, bool skipH
 
     char buf[16384];
     std::string acc;
-    // 轮询读取（PeekNamedPipe + 短等待）：fd 全盘遍历在本机实测可达 100s+（Defender
-    // 实时扫描拖慢每层目录枚举），等不了也不该等——超过预算就终止 fd，保留已读到的
-    // 部分结果（新一轮查询/隐藏窗口会 CancelAll，不会残留）。onBatch 非空时按批次
-    // 增量投递（≥50 条或每 400ms 一批），界面流式上屏不用等预算跑完。
+    // è½®è¯¢è¯»åï¼PeekNamedPipe + ç­ç­å¾ï¼ï¼fd å¨çéåå¨æ¬æºå®æµå¯è¾¾ 100s+ï¼Defender
+    // å®æ¶æ«æææ¢æ¯å±ç®å½æä¸¾ï¼ï¼ç­ä¸äºä¹ä¸è¯¥ç­ââè¶è¿é¢ç®å°±ç»æ­¢ fdï¼ä¿çå·²è¯»å°ç
+    // é¨åç»æï¼æ°ä¸è½®æ¥è¯¢/éèçªå£ä¼ CancelAllï¼ä¸ä¼æ®çï¼ãonBatch éç©ºæ¶ææ¹æ¬¡
+    // å¢éæéï¼â¥50 æ¡ææ¯ 400ms ä¸æ¹ï¼ï¼çé¢æµå¼ä¸å±ä¸ç¨ç­é¢ç®è·å®ã
     const ULONGLONG start = GetTickCount64();
     size_t flushed = 0;
     ULONGLONG lastFlush = 0;
@@ -1027,7 +1049,7 @@ int FdQuery(const std::wstring& fdExe, const Query& q, bool pathMode, bool skipH
     };
     for (;;) {
         DWORD avail = 0;
-        if (!PeekNamedPipe(rd, nullptr, 0, nullptr, &avail, nullptr)) break;  // 管道断开 = fd 已退出
+        if (!PeekNamedPipe(rd, nullptr, 0, nullptr, &avail, nullptr)) break;  // ç®¡éæ­å¼ = fd å·²éåº
         if (avail > 0) {
             DWORD want = avail > sizeof(buf) ? (DWORD)sizeof(buf) : avail;
             DWORD nread = 0;
@@ -1042,7 +1064,7 @@ int FdQuery(const std::wstring& fdExe, const Query& q, bool pathMode, bool skipH
                 std::wstring path = Utf8ToWide(line);
                 for (auto& c : path)
                     if (c == L'/') c = L'\\';
-                if (path.size() > 3 && path.back() == L'\\') path.pop_back();  // 统一去尾分隔符（盘根除外）
+                if (path.size() > 3 && path.back() == L'\\') path.pop_back();  // ç»ä¸å»å°¾åéç¬¦ï¼çæ ¹é¤å¤ï¼
                 if (path.empty()) continue;
                 if (ContainsAny(ToLower(path), q.excludes)) continue;
                 out.push_back({path, !q.isFile});
@@ -1054,18 +1076,18 @@ int FdQuery(const std::wstring& fdExe, const Query& q, bool pathMode, bool skipH
             continue;
         }
         if (WaitForSingleObject(pi.hProcess, 100) == WAIT_OBJECT_0) {
-            // fd 已退出：把尾部残留读完（可能尚有一包未到）
+            // fd å·²éåºï¼æå°¾é¨æ®çè¯»å®ï¼å¯è½å°æä¸åæªå°ï¼
             if (!PeekNamedPipe(rd, nullptr, 0, nullptr, &avail, nullptr) || avail == 0) break;
         } else if (deadlineMs && GetTickCount64() - start >= deadlineMs) {
             if (timedOut) *timedOut = true;
-            break;  // 超时：交由下方统一终止 fd，部分结果照常返回
+            break;  // è¶æ¶ï¼äº¤ç±ä¸æ¹ç»ä¸ç»æ­¢ fdï¼é¨åç»æç§å¸¸è¿å
         }
     }
     flush();
 
-    TerminateProcess(pi.hProcess, 0);  // 读满上限提前停时管道里可能还有数据；对已退出进程无害
+    TerminateProcess(pi.hProcess, 0);  // è¯»æ»¡ä¸éæååæ¶ç®¡ééå¯è½è¿ææ°æ®ï¼å¯¹å·²éåºè¿ç¨æ å®³
     WaitForSingleObject(pi.hProcess, 3000);
-    // FT_DF_DEBUG=1：向 stderr 打印命令行与退出码（冒烟诊断用，正常运行零输出）
+    // FT_DF_DEBUG=1ï¼å stderr æå°å½ä»¤è¡ä¸éåºç ï¼åçè¯æ­ç¨ï¼æ­£å¸¸è¿è¡é¶è¾åºï¼
     {
         wchar_t dbg[8]{};
         if (GetEnvironmentVariableW(L"FT_DF_DEBUG", dbg, 8) > 0) {
@@ -1086,26 +1108,26 @@ int FdQuery(const std::wstring& fdExe, const Query& q, bool pathMode, bool skipH
     return (int)out.size();
 }
 
-// ---------------- 磁盘索引（全盘覆盖，索引文件化 + mmap 扫描，进程私有内存近零） ----------------
-// fd 全盘遍历一次（空闲优先级，数百秒）→ 小写化 UTF-8 路径 blob（数百 MB 磁盘文件）
-// → MapViewOfFile 只读映射；查询 = 首字节 memchr 全 blob 扫描（页缓存暖态 20–40ms）。
-// blob 是文件映射页：可被系统按需换出，不计入进程私有内存（plocate 思路的简化版）。
-// 新鲜度：每盘根 ReadDirectoryChangesW → RAM 内小 delta 表（增/删），查询时合并；
-// delta 超 5 万条或缓存超 7 天自动后台重建（空闲优先级）。FT_DF_DISKINDEX_OFF=1 关闭。
+// ---------------- ç£çç´¢å¼ï¼å¨çè¦çï¼ç´¢å¼æä»¶å + mmap æ«æï¼è¿ç¨ç§æåå­è¿é¶ï¼ ----------------
+// fd å¨çéåä¸æ¬¡ï¼ç©ºé²ä¼åçº§ï¼æ°ç¾ç§ï¼â å°åå UTF-8 è·¯å¾ blobï¼æ°ç¾ MB ç£çæä»¶ï¼
+// â MapViewOfFile åªè¯»æ å°ï¼æ¥è¯¢ = é¦å­è memchr å¨ blob æ«æï¼é¡µç¼å­ææ 20â40msï¼ã
+// blob æ¯æä»¶æ å°é¡µï¼å¯è¢«ç³»ç»æéæ¢åºï¼ä¸è®¡å¥è¿ç¨ç§æåå­ï¼plocate æè·¯çç®åçï¼ã
+// æ°é²åº¦ï¼æ¯çæ ¹ ReadDirectoryChangesW â RAM åå° delta è¡¨ï¼å¢/å ï¼ï¼æ¥è¯¢æ¶åå¹¶ï¼
+// delta è¶ 5 ä¸æ¡æç¼å­è¶ 7 å¤©èªå¨åå°éå»ºï¼ç©ºé²ä¼åçº§ï¼ãFT_DF_DISKINDEX_OFF=1 å³é­ã
 
 HANDLE g_diFile = nullptr, g_diMap = nullptr;
-const unsigned char* g_diView = nullptr;   // 记录区起始（跳过头部）
-unsigned long long g_diSize = 0;           // 记录区字节数
-unsigned long long g_diDataOff = 0;        // 头部之后的记录区起始偏移
+const unsigned char* g_diView = nullptr;   // è®°å½åºèµ·å§ï¼è·³è¿å¤´é¨ï¼
+unsigned long long g_diSize = 0;           // è®°å½åºå­èæ°
+unsigned long long g_diDataOff = 0;        // å¤´é¨ä¹åçè®°å½åºèµ·å§åç§»
 unsigned long long g_diRecords = 0;
 std::atomic<bool> g_diReady{false};
-std::mutex g_diMu;                         // 保护 view/map 换入换出（搜索期间持有）
+std::mutex g_diMu;                         // ä¿æ¤ view/map æ¢å¥æ¢åºï¼æç´¢æé´ææï¼
 std::atomic<bool> g_diStarted{false};
 std::atomic<bool> g_diQuit{false};
 std::atomic<bool> g_diRebuilding{false};
 std::mutex g_ovMu;
-std::unordered_map<std::wstring, bool> g_ovAdd;   // 建库后新增：路径 → isDir
-std::unordered_set<std::wstring> g_ovDel;         // 建库后删除
+std::unordered_map<std::wstring, bool> g_ovAdd;   // å»ºåºåæ°å¢ï¼è·¯å¾ â isDir
+std::unordered_set<std::wstring> g_ovDel;         // å»ºåºåå é¤
 
 DWORD DiskCap() {
     wchar_t env[16]{};
@@ -1126,7 +1148,7 @@ std::wstring DiskCachePath() {
     return dir + L"\\diskindex.dat";
 }
 
-// blob 内路径已小写化（ASCII 折叠，非 ASCII 原样）——这里只做 ASCII 折叠
+// blob åè·¯å¾å·²å°ååï¼ASCII æå ï¼é ASCII åæ ·ï¼ââè¿éåªå ASCII æå 
 std::string Utf8LowerAscii(const std::string& s) {
     std::string o = s;
     for (auto& c : o)
@@ -1134,7 +1156,7 @@ std::string Utf8LowerAscii(const std::string& s) {
     return o;
 }
 
-// 朴素 + memchr 跳跃的字节子串查找（blob 已小写化，逐字节精确比较）
+// æ´ç´  + memchr è·³è·çå­èå­ä¸²æ¥æ¾ï¼blob å·²å°ååï¼éå­èç²¾ç¡®æ¯è¾ï¼
 bool MemContainsBytes(const unsigned char* hay, size_t hl, const char* nd, size_t nl) {
     if (nl == 0) return true;
     if (hl < nl) return false;
@@ -1144,7 +1166,7 @@ bool MemContainsBytes(const unsigned char* hay, size_t hl, const char* nd, size_
             if (i + 1 + nl - 1 > hl) return false;
             const unsigned char* f = (const unsigned char*)memchr(hay + i + 1, c0, hl - (i + 1) - (nl - 1) + 1);
             if (!f) return false;
-            i = (size_t)(f - hay) - 1;   // for ++i 后指向 f
+            i = (size_t)(f - hay) - 1;   // for ++i åæå f
             continue;
         }
         if (nl == 1 || memcmp(hay + i + 1, nd + 1, nl - 1) == 0) return true;
@@ -1152,7 +1174,7 @@ bool MemContainsBytes(const unsigned char* hay, size_t hl, const char* nd, size_
     return false;
 }
 
-// 映射已有索引文件（校验版本头 + 解析 COUNT），成功置 ready
+// æ å°å·²æç´¢å¼æä»¶ï¼æ ¡éªçæ¬å¤´ + è§£æ COUNTï¼ï¼æåç½® ready
 bool DiskMapExistingLocked() {
     auto dbg2 = [](const wchar_t* m, unsigned long long v) {
         if (GetEnvironmentVariableW(L"FT_DF_DEBUG", nullptr, 0) > 0) {
@@ -1198,7 +1220,7 @@ bool DiskMapExistingLocked() {
         g_diMap = g_diFile = nullptr;
         return false;
     }
-    // 头部："FTDISKIDX2\nCOUNT\t<10位数字>\n"
+    // å¤´é¨ï¼"FTDISKIDX2\nCOUNT\t<10ä½æ°å­>\n"
     if (memcmp(view, "FTDISKIDX2\n", 11) != 0 ||
         memcmp(view + 11, "COUNT\t", 6) != 0 ||
         view[11 + 6 + 10] != '\n') {
@@ -1211,7 +1233,7 @@ bool DiskMapExistingLocked() {
     }
     unsigned long long n = 0;
     for (int i = 0; i < 10; ++i) n = n * 10 + (unsigned long long)(view[11 + 6 + i] - '0');
-    if (n == 0) {   // 空索引（fd 失败等）：视为不可用，交由重建
+    if (n == 0) {   // ç©ºç´¢å¼ï¼fd å¤±è´¥ç­ï¼ï¼è§ä¸ºä¸å¯ç¨ï¼äº¤ç±éå»º
         dbg2(L"empty index:", 0);
         UnmapViewOfFile(view);
         CloseHandle(g_diMap);
@@ -1257,8 +1279,8 @@ unsigned __stdcall DiskBuildThread(void*) {
         if (!writeAll("FTDISKIDX2\nCOUNT\t0000000000\n", 29)) { CloseHandle(h); break; }
         dbg(L"header written:", 0);
 
-        // 两趟全列（先目录后文件）+ 统一剪枝（与内存索引同规则，junk 不进索引）；
-        // 解析期零 GetFileAttributes 调用（个别特殊文件名会挂死）
+        // ä¸¤è¶å¨åï¼åç®å½åæä»¶ï¼+ ç»ä¸åªæï¼ä¸åå­ç´¢å¼åè§åï¼junk ä¸è¿ç´¢å¼ï¼ï¼
+        // è§£ææé¶ GetFileAttributes è°ç¨ï¼ä¸ªå«ç¹æ®æä»¶åä¼ææ­»ï¼
         std::vector<std::wstring> diRoots = DriveRoots();
         {
             wchar_t renv[1024]{};
@@ -1280,7 +1302,7 @@ unsigned __stdcall DiskBuildThread(void*) {
         chunk.reserve(4 * 1024 * 1024);
         unsigned long long count = 0;
         bool okW = true;
-        for (int pass = 0; okW && pass < 2; ++pass) {   // 0=目录 1=文件
+        for (int pass = 0; okW && pass < 2; ++pass) {   // 0=ç®å½ 1=æä»¶
             for (const auto& root : diRoots) {
                 if (g_diQuit || count >= DiskCap()) break;
                 std::wstring args = L" -a -H --max-results " + std::to_wstring(DiskCap() - count);
@@ -1309,7 +1331,7 @@ unsigned __stdcall DiskBuildThread(void*) {
         }
         dbg(L"walk done, count:", count);
         if (okW && !chunk.empty()) writeAll(chunk.data(), (DWORD)chunk.size());
-        // 回写真实 COUNT（定宽 10 位）
+        // ååçå® COUNTï¼å®å®½ 10 ä½ï¼
         char cnt[11];
         snprintf(cnt, sizeof(cnt), "%010llu", count);
         LARGE_INTEGER off{};
@@ -1318,13 +1340,13 @@ unsigned __stdcall DiskBuildThread(void*) {
         DWORD written = 0;
         WriteFile(h, cnt, 10, &written, nullptr);
         FlushFileBuffers(h);
-        CloseHandle(h);   // 先关独占句柄：否则映射的读打开会 sharing violation
+        CloseHandle(h);   // åå³ç¬å å¥æï¼å¦åæ å°çè¯»æå¼ä¼ sharing violation
         if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
             dbg(L"rename failed:", GetLastError());
             break;
         }
         dbg(L"renamed:", count);
-        {   // 换映射 + 清 delta
+        {   // æ¢æ å° + æ¸ delta
             std::lock_guard<std::mutex> lk(g_diMu);
             DiskMapExistingLocked();
             std::lock_guard<std::mutex> lk2(g_ovMu);
@@ -1339,15 +1361,15 @@ unsigned __stdcall DiskBuildThread(void*) {
 
 void DiskMaybeStartRebuild() {
     bool expect = false;
-    if (g_diRebuilding.compare_exchange_strong(expect, true)) {   // 抢到启动权（线程结束时自清零）
+    if (g_diRebuilding.compare_exchange_strong(expect, true)) {   // æ¢å°å¯å¨æï¼çº¿ç¨ç»ææ¶èªæ¸é¶ï¼
         CloseHandle((HANDLE)_beginthreadex(nullptr, 0, DiskBuildThread, nullptr, 0, nullptr));
     }
 }
 
-// 每盘根一个监听线程：变更进 RAM delta 表（查询时与 blob 合并）
-// 每盘根一个监听线程：变更进 RAM delta 表（查询时与 blob 合并）。
-// 铁律：GetFileAttributesW（个别路径会挂死）绝不持锁调用、甚至不在事件循环里同步调用——
-// 解析出事件后先在本地无锁解析属性，再短暂持锁入表。挂死只影响该盘新鲜度，永不影响搜索。
+// æ¯çæ ¹ä¸ä¸ªçå¬çº¿ç¨ï¼åæ´è¿ RAM delta è¡¨ï¼æ¥è¯¢æ¶ä¸ blob åå¹¶ï¼
+// æ¯çæ ¹ä¸ä¸ªçå¬çº¿ç¨ï¼åæ´è¿ RAM delta è¡¨ï¼æ¥è¯¢æ¶ä¸ blob åå¹¶ï¼ã
+// éå¾ï¼GetFileAttributesWï¼ä¸ªå«è·¯å¾ä¼ææ­»ï¼ç»ä¸æéè°ç¨ãçè³ä¸å¨äºä»¶å¾ªç¯éåæ­¥è°ç¨ââ
+// è§£æåºäºä»¶ååå¨æ¬å°æ éè§£æå±æ§ï¼åç­ææéå¥è¡¨ãææ­»åªå½±åè¯¥çæ°é²åº¦ï¼æ°¸ä¸å½±åæç´¢ã
 unsigned __stdcall DiskWatchThread(void* p) {
     std::unique_ptr<std::wstring> rootHolder((std::wstring*)p);
     const std::wstring root = *rootHolder;
@@ -1365,16 +1387,16 @@ unsigned __stdcall DiskWatchThread(void* p) {
                                        FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME,
                                        &bytes, nullptr, nullptr))
                 break;
-            if (bytes == 0) break;   // 溢出：交给重建周期
-            // 先无锁解析事件（含属性），再短暂持锁入表
-            std::vector<std::pair<std::wstring, int>> resolved;   // path, isDir(-1=删除)
+            if (bytes == 0) break;   // æº¢åºï¼äº¤ç»éå»ºå¨æ
+            // åæ éè§£æäºä»¶ï¼å«å±æ§ï¼ï¼åç­ææéå¥è¡¨
+            std::vector<std::pair<std::wstring, int>> resolved;   // path, isDir(-1=å é¤)
             const FILE_NOTIFY_INFORMATION* fni = (const FILE_NOTIFY_INFORMATION*)buf;
             for (;;) {
                 std::wstring rel(fni->FileName, fni->FileNameLength / sizeof(WCHAR));
                 std::wstring path = root + L"\\" + rel;
                 int isDir = -1;
                 if (fni->Action == FILE_ACTION_ADDED || fni->Action == FILE_ACTION_RENAMED_NEW_NAME) {
-                    DWORD attr = GetFileAttributesW(path.c_str());   // 无锁：挂死只拖住本线程
+                    DWORD attr = GetFileAttributesW(path.c_str());   // æ éï¼ææ­»åªæä½æ¬çº¿ç¨
                     if (attr != INVALID_FILE_ATTRIBUTES)
                         isDir = (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
                 }
@@ -1383,7 +1405,7 @@ unsigned __stdcall DiskWatchThread(void* p) {
                 fni = (const FILE_NOTIFY_INFORMATION*)((const char*)fni + fni->NextEntryOffset);
             }
             {
-                std::lock_guard<std::mutex> lk(g_ovMu);   // 短暂持锁：纯内存插入
+                std::lock_guard<std::mutex> lk(g_ovMu);   // ç­ææéï¼çº¯åå­æå¥
                 for (auto& kv : resolved) {
                     if (kv.second < 0) { g_ovDel.insert(kv.first); g_ovAdd.erase(kv.first); }
                     else { g_ovAdd[kv.first] = kv.second != 0; g_ovDel.erase(kv.first); }
@@ -1391,7 +1413,7 @@ unsigned __stdcall DiskWatchThread(void* p) {
             }
             size_t ov = 0;
             { std::lock_guard<std::mutex> lk(g_ovMu); ov = g_ovAdd.size() + g_ovDel.size(); }
-            if (ov > 50000 && !g_diRebuilding) DiskMaybeStartRebuild();   // delta 太大：整体重建
+            if (ov > 50000 && !g_diRebuilding) DiskMaybeStartRebuild();   // delta å¤ªå¤§ï¼æ´ä½éå»º
             break;
         }
         CloseHandle(h);
@@ -1405,12 +1427,12 @@ void DiskIndexStart() {
     bool expect = false;
     if (!g_diStarted.compare_exchange_strong(expect, true)) return;
     if (GetEnvironmentVariableW(L"FT_DF_DISKINDEX_OFF", nullptr, 0) > 0) return;
-    {   // 映射已有索引；超过 7 天未更新的缓存直接视为不存在（后台重建）
+    {   // æ å°å·²æç´¢å¼ï¼è¶è¿ 7 å¤©æªæ´æ°çç¼å­ç´æ¥è§ä¸ºä¸å­å¨ï¼åå°éå»ºï¼
         std::lock_guard<std::mutex> lk(g_diMu);
         g_diReady = DiskMapExistingLocked();
         if (g_diReady) {
-            // 过期检查：文件时间（1601 纪元）对系统时间（同纪元）——
-            // 不能用 GetTickCount64（开机毫秒），否则永远判定为 150 天前
+            // è¿ææ£æ¥ï¼æä»¶æ¶é´ï¼1601 çºªåï¼å¯¹ç³»ç»æ¶é´ï¼åçºªåï¼ââ
+            // ä¸è½ç¨ GetTickCount64ï¼å¼æºæ¯«ç§ï¼ï¼å¦åæ°¸è¿å¤å®ä¸º 150 å¤©å
             std::wstring path = DiskCachePath();
             WIN32_FILE_ATTRIBUTE_DATA fa{};
             if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fa)) {
@@ -1420,7 +1442,7 @@ void DiskIndexStart() {
                 GetSystemTimeAsFileTime(&nowFt);
                 ULONGLONG now64 = ((ULONGLONG)nowFt.dwHighDateTime << 32) | nowFt.dwLowDateTime;
                 ULONGLONG ageMs = writeFt <= now64 ? (now64 - writeFt) / 10000 : 0;
-                if (ageMs > 7ULL * 24 * 3600 * 1000) g_diReady = false;   // 超 7 天：重建
+                if (ageMs > 7ULL * 24 * 3600 * 1000) g_diReady = false;   // è¶ 7 å¤©ï¼éå»º
             }
         }
     }
@@ -1435,9 +1457,10 @@ bool DiskIndexReady() { return g_diReady.load(); }
 
 size_t DiskIndexRecords() { return g_diReady ? g_diRecords : 0; }
 
-// 全 blob 首字节 memchr 扫描 + 行级 AND 校验；delta 表合并增删
+// å¨ blob é¦å­è memchr æ«æ + è¡çº§ AND æ ¡éªï¼delta è¡¨åå¹¶å¢å 
 int DiskIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD maxRows) {
     out.clear();
+    ULONGLONG t0 = GetTickCount64();
     auto dbg = [](const wchar_t* m, unsigned long long v) {
         if (GetEnvironmentVariableW(L"FT_DF_DEBUG", nullptr, 0) > 0) {
             wchar_t b[160]{};
@@ -1449,17 +1472,17 @@ int DiskIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD 
     dbg(L"enter, ready:", g_diReady.load() ? 1 : 0);
     if (!g_diReady.load()) return -1;
     if (q.words.empty()) return 0;
-    std::vector<std::string> wl;                       // 小写 UTF-8 词
-    std::vector<std::wstring> wlw;                     // 宽词（delta 表用）
+    std::vector<std::string> wl;                       // å°å UTF-8 è¯
+    std::vector<std::wstring> wlw;                     // å®½è¯ï¼delta è¡¨ç¨ï¼
     for (const auto& w : q.words) {
         std::string u = Utf8LowerAscii(WideToUtf8(w));
         wl.push_back(u);
         wlw.push_back(ToLower(w));
     }
-    std::vector<std::string> ex;                       // 排除词（小写 UTF-8）
+    std::vector<std::string> ex;                       // æé¤è¯ï¼å°å UTF-8ï¼
     for (const auto& e : q.excludes) ex.push_back(Utf8LowerAscii(WideToUtf8(e)));
 
-    std::unordered_set<std::string> seen;              // 去重（fd 对 junction 可能重复枚举）
+    std::unordered_set<std::string> seen;              // å»éï¼fd å¯¹ junction å¯è½éå¤æä¸¾ï¼
     std::lock_guard<std::mutex> lk(g_diMu);
     if (!g_diView) return -1;
     dbg(L"locked, size:", g_diSize);
@@ -1471,10 +1494,14 @@ int DiskIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD 
         if ((unsigned long long)(p - base) + w0.size() > total) break;
         p = (const unsigned char*)memchr(p, c0, (size_t)(total - (p - base)));
         if (!p) break;
-        // 行边界：命中点回退到上一行首、前进到行尾
+        // åå¨è¯ memcmp ç¡®è®¤å½ä¸­ï¼å»ä»·ï¼ï¼ååéè¡é¦ï¼åéæ¯æ¯å½ä¸­æè´µçæä½ââ
+        // é¦å­èå½ä¸­çæé«ï¼åç¡®è®¤å¯æåéæ¬¡æ°ä»æ°ç¾ä¸éå°å½ä¸­æ°ï¼
+        if ((unsigned long long)(total - (p - base)) < w0.size()) break;
+        if (memcmp(p, w0.data(), w0.size()) != 0) continue;
+        // è¡è¾¹çï¼å½ä¸­ç¹åéå°ä¸ä¸è¡é¦ãåè¿å°è¡å°¾
         const unsigned char* ls = p;
         while (ls > base && ls[-1] != '\n') --ls;
-        const unsigned char* le = p;
+        const unsigned char* le = p + w0.size();
         while (le < base + total && *le != '\n') ++le;
         const size_t recLen = (size_t)(le - ls);
         if (recLen < 2) continue;
@@ -1482,14 +1509,14 @@ int DiskIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD 
         if (q.isFile == isDir) continue;
         const unsigned char* rec = ls + 1;
         const size_t pathLen = recLen - 1;
-        // 名字模式：词必须落在最后一段（基名）内；路径模式：整条路径
+        // åå­æ¨¡å¼ï¼è¯å¿é¡»è½å¨æåä¸æ®µï¼åºåï¼åï¼è·¯å¾æ¨¡å¼ï¼æ´æ¡è·¯å¾
         const unsigned char* seg = rec;
         size_t segLen = pathLen;
         if (!pathMode) {
             for (size_t i = pathLen; i > 0; --i)
                 if (rec[i - 1] == '/') { seg = rec + i; segLen = pathLen - i; break; }
         }
-        if (!MemContainsBytes(seg, segLen, w0.data(), w0.size())) continue;   // 命中跨行/跨段等假阳性
+        if (!MemContainsBytes(seg, segLen, w0.data(), w0.size())) continue;   // å½ä¸­è·¨è¡/è·¨æ®µç­åé³æ§
         bool ok = true;
         for (size_t i = 1; i < wl.size(); ++i)
             if (!MemContainsBytes(seg, segLen, wl[i].data(), wl[i].size())) { ok = false; break; }
@@ -1499,17 +1526,17 @@ int DiskIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD 
         if (!ok) continue;
         if (!seen.insert(std::string((const char*)rec, pathLen)).second) continue;
         std::wstring path = Utf8ToWide(std::string((const char*)rec, pathLen));
-        {   // delta 合并：已删除跳过；已是新增条目则交给下方 additions 扫描，避免重复
+        {   // delta åå¹¶ï¼å·²å é¤è·³è¿ï¼å·²æ¯æ°å¢æ¡ç®åäº¤ç»ä¸æ¹ additions æ«æï¼é¿åéå¤
             std::lock_guard<std::mutex> lk2(g_ovMu);
             if (g_ovDel.count(path)) continue;
             if (g_ovAdd.count(path)) continue;
         }
-        // blob 存的是小写路径：还原真实大小写（文件存在；不存在时保留小写）
+        // blob å­çæ¯å°åè·¯å¾ï¼è¿åçå®å¤§å°åï¼æä»¶å­å¨ï¼ä¸å­å¨æ¶ä¿çå°åï¼
         wchar_t longBuf[MAX_PATH * 2]{};
         if (GetLongPathNameW(path.c_str(), longBuf, MAX_PATH * 2) > 0) path = longBuf;
         out.push_back({path, isDir});
     }
-    // 建库后新增条目（RAM delta）：数量小，宽字符线性过滤
+    // å»ºåºåæ°å¢æ¡ç®ï¼RAM deltaï¼ï¼æ°éå°ï¼å®½å­ç¬¦çº¿æ§è¿æ»¤
     std::lock_guard<std::mutex> lk2(g_ovMu);
     for (const auto& kv : g_ovAdd) {
         if (out.size() >= (size_t)maxRows) break;
@@ -1538,19 +1565,20 @@ int DiskIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD 
         if (!hit) continue;
         out.push_back({kv.first, kv.second});
     }
+    dbg(L"scan ms:", (unsigned long long)(GetTickCount64() - t0));
     return (int)out.size();
 }
 
 
-// ---------------- 搜索守护进程（内存/磁盘索引的宿主进程） ----------------
-// flowtary-search.exe --serve 常驻：持有内存索引池 + 磁盘 blob 映射 + 监听线程，
-// flowtary.exe 只做 TCP 客户端。索引内存全部记在守护进程名下（对比 Everything 一目了然）；
-// 守护进程崩溃/退出都不影响 flowtary（查询落 fd/WS 层，重拉守护进程秒级恢复）。
+// ---------------- æç´¢å®æ¤è¿ç¨ï¼åå­/ç£çç´¢å¼çå®¿ä¸»è¿ç¨ï¼ ----------------
+// flowtary-search.exe --serve å¸¸é©»ï¼ææåå­ç´¢å¼æ±  + ç£ç blob æ å° + çå¬çº¿ç¨ï¼
+// flowtary.exe åªå TCP å®¢æ·ç«¯ãç´¢å¼åå­å¨é¨è®°å¨å®æ¤è¿ç¨åä¸ï¼å¯¹æ¯ Everything ä¸ç®äºç¶ï¼ï¼
+// å®æ¤è¿ç¨å´©æº/éåºé½ä¸å½±å flowtaryï¼æ¥è¯¢è½ fd/WS å±ï¼éæå®æ¤è¿ç¨ç§çº§æ¢å¤ï¼ã
 
 namespace dfdaemon {
 
-constexpr u_long kDaemonPort = 47771;                     // FT_DF_DAEMON_PORT 可覆盖
-constexpr DWORD kDaemonIdleExitMs = 30ULL * 60 * 1000;    // 空闲 30 分钟自动退出（缓存已落盘）
+constexpr u_long kDaemonPort = 47771;                     // FT_DF_DAEMON_PORT å¯è¦ç
+constexpr DWORD kDaemonIdleExitMs = 30ULL * 60 * 1000;    // ç©ºé² 30 åéèªå¨éåºï¼ç¼å­å·²è½çï¼
 
 bool DaemonReadLine(SOCKET s, std::string& line) {
     line.clear();
@@ -1561,7 +1589,7 @@ bool DaemonReadLine(SOCKET s, std::string& line) {
         if (b == '\n') return true;
         if (b == '\r') continue;
         line += b;
-        if (line.size() > 4096) return false;   // 防御：单行异常超长
+        if (line.size() > 4096) return false;   // é²å¾¡ï¼åè¡å¼å¸¸è¶é¿
     }
 }
 
@@ -1582,7 +1610,7 @@ u_long DaemonPort() {
 
 }  // namespace
 
-// 单连接处理：读查询 → mem+disk 双搜合并去重 → 回 N/行/END
+// åè¿æ¥å¤çï¼è¯»æ¥è¯¢ â mem+disk åæåå¹¶å»é â å N/è¡/END
 void DaemonHandleConn(SOCKET s) {
     DWORD rcvTo = 5000;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rcvTo, sizeof(rcvTo));
@@ -1608,11 +1636,11 @@ void DaemonHandleConn(SOCKET s) {
 
     std::vector<Hit> hits;
     if (MemIndexSearch(q, false, hits, (DWORD)maxRows) == 0)
-        MemIndexSearch(q, true, hits, (DWORD)maxRows);           // 名字零命中 → 路径兜底
+        MemIndexSearch(q, true, hits, (DWORD)maxRows);           // åå­é¶å½ä¸­ â è·¯å¾ååº
     std::vector<Hit> diskHits;
     if (DiskIndexSearch(q, false, diskHits, (DWORD)maxRows) == 0)
         DiskIndexSearch(q, true, diskHits, (DWORD)maxRows);
-    // 合并去重（小写 UTF-8 键），mem 优先
+    // åå¹¶å»éï¼å°å UTF-8 é®ï¼ï¼mem ä¼å
     std::unordered_set<std::string> seen;
     std::vector<Hit> merged;
     for (Hit& h : hits) {
@@ -1654,14 +1682,29 @@ void DaemonStatsReply(SOCKET s) {
     DaemonWriteLine(s, "END");
 }
 
-// 服务主循环：select 60s 超时轮转（统计空闲），空闲 30 分钟自动退出
+// æå¡ä¸»å¾ªç¯ï¼select 60s è¶æ¶è½®è½¬ï¼ç»è®¡ç©ºé²ï¼ï¼ç©ºé² 30 åéèªå¨éåº
 int Serve(const std::vector<std::wstring>& extraRoots) {
     WSADATA wsa{};
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return 1;
     SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (ls == INVALID_SOCKET) { WSACleanup(); return 1; }
-    BOOL reuse = TRUE;
-    setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
+    // ç»å®åæ¢æµï¼ç«¯å£ä¸å·²æå®æ¤è¿ç¨å¨æå¡åç´æ¥éåºï¼ç¦æ­¢ SO_REUSEADDRââ
+    // ä¸¤ä¸ªå®æ¤è¿ç¨å±äº«ç«¯å£ä¼äºç¸æ¢è¿æ¥ï¼ç¶ææ¥è¯¢æå°å¡æ­»çæ§å®ä¾ä¸ï¼
+    {
+        SOCKET probe = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (probe != INVALID_SOCKET) {
+            sockaddr_in pa{};
+            pa.sin_family = AF_INET;
+            pa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            pa.sin_port = htons((u_short)DaemonPort());
+            if (connect(probe, (const sockaddr*)&pa, sizeof(pa)) == 0) {
+                closesocket(probe);
+                WSACleanup();
+                return 0;   // 已有守护进程在跑，不重复启动
+            }
+            closesocket(probe);
+        }
+    }
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -1683,7 +1726,7 @@ int Serve(const std::vector<std::wstring>& extraRoots) {
         timeval tv{60, 0};
         int r = select((int)ls + 1, &rs, nullptr, nullptr, &tv);
         if (r <= 0) {
-            if (GetTickCount64() - lastActive > kDaemonIdleExitMs) break;   // 空闲退出
+            if (GetTickCount64() - lastActive > kDaemonIdleExitMs) break;   // ç©ºé²éåº
             continue;
         }
         sockaddr_in cli{};
@@ -1702,16 +1745,16 @@ int Serve(const std::vector<std::wstring>& extraRoots) {
 }
 
 
-// 守护进程服务主循环入口（flowtary-search --serve 进程调用）
+// å®æ¤è¿ç¨æå¡ä¸»å¾ªç¯å¥å£ï¼flowtary-search --serve è¿ç¨è°ç¨ï¼
 int SearchDaemonServe(const std::vector<std::wstring>& extraRoots) {
     return dfdaemon::Serve(extraRoots);
 
 }
 
-// 客户端：确保守护进程在线（不在线拉起同目录 flowtary-search.exe --serve 并等 ~3s）
+// å®¢æ·ç«¯ï¼ç¡®ä¿å®æ¤è¿ç¨å¨çº¿ï¼ä¸å¨çº¿æèµ·åç®å½ flowtary-search.exe --serve å¹¶ç­ ~3sï¼
 void SearchDaemonStart() {
     int mr = 0, ms = 0, dr = 0, drs = 0;
-    if (SearchDaemonStat(mr, ms, dr, drs)) return;   // 已在线
+    if (SearchDaemonStat(mr, ms, dr, drs)) return;   // å·²å¨çº¿
     WCHAR self[MAX_PATH]{};
     if (!GetModuleFileNameW(nullptr, self, MAX_PATH)) return;
     std::wstring dir(self);
@@ -1727,13 +1770,13 @@ void SearchDaemonStart() {
         return;
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
-    for (int i = 0; i < 15; ++i) {   // 等 ~3s 就绪
+    for (int i = 0; i < 15; ++i) {   // ç­ ~3s å°±ç»ª
         Sleep(200);
         if (SearchDaemonStat(mr, ms, dr, drs)) return;
     }
 }
 
-// 客户端查询：连接 → 发协议 → 收结果。失败返回 false（调用方落 fd/WS 层）
+// å®¢æ·ç«¯æ¥è¯¢ï¼è¿æ¥ â ååè®® â æ¶ç»æãå¤±è´¥è¿å falseï¼è°ç¨æ¹è½ fd/WS å±ï¼
 bool SearchDaemonQuery(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD maxRows) {
     out.clear();
     WSADATA wsa{};
@@ -1742,7 +1785,7 @@ bool SearchDaemonQuery(const Query& q, bool pathMode, std::vector<Hit>& out, DWO
     do {
         SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (s == INVALID_SOCKET) break;
-        DWORD to = 3000;
+        DWORD to = 30000;   // å¨ blob æ«æå¯è½ 1-3sãå·é¡µé¦æ¬¡æ´ä¹ï¼30s ä½é
         setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to, sizeof(to));
         setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&to, sizeof(to));
         sockaddr_in addr{};
@@ -1765,7 +1808,7 @@ bool SearchDaemonQuery(const Query& q, bool pathMode, std::vector<Hit>& out, DWO
         if (!wok) { closesocket(s); break; }
 
         int n = 0;
-        {   // 读 "N count"
+        {   // è¯» "N count"
             std::string acc;
             bool lineOk = false;
             for (;;) {
@@ -1808,7 +1851,7 @@ bool SearchDaemonQuery(const Query& q, bool pathMode, std::vector<Hit>& out, DWO
     return ok;
 }
 
-// 客户端状态查询（wsquery --memstat/--diskstat 用）
+// å®¢æ·ç«¯ç¶ææ¥è¯¢ï¼wsquery --memstat/--diskstat ç¨ï¼
 bool SearchDaemonStat(int& memReady, int& memSize, int& diskReady, int& diskRecords) {
     memReady = memSize = diskReady = diskRecords = 0;
     WSADATA wsa{};
