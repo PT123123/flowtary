@@ -64,6 +64,7 @@ struct Preview {
     BOOL beautify;
     BOOL skipDotFolders;
     BOOL fdjEnabled;
+    int dfBackend;   // d/f 搜索后端：0=新方案（内置索引） 1=Everything 旧链路
 
     BOOL weightEnabled;
     int weightFlush;

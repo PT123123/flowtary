@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(Flowtary LANGUAGES C CXX RC)
+include(CTest)
 
 # =====================================================================
 # MSVC include 路径自动检测（必须在 add_subdirectory(vendor) 之前）
@@ -152,10 +153,17 @@ if(FLOWTARY_ARCH STREQUAL "x86")
 
 else()
   # ================= 64 位主构建 =================
+  if(BUILD_TESTING)
+    add_executable(file_url_path_test tests/file_url_path_test.cpp)
+    target_link_libraries(file_url_path_test PRIVATE shlwapi)
+    add_test(NAME file_url_path COMMAND file_url_path_test)
+  endif()
+
   add_executable(flowtary WIN32
     src/main.cpp
     src/filedlg_jump.cpp
     src/settings_model.cpp
+    src/df_search.cpp
     src/flowtary.rc
     src/flowtary.ico)
   set_source_files_properties(src/flowtary.ico PROPERTIES HEADER_FILE_ONLY TRUE)
@@ -186,6 +194,12 @@ else()
   add_executable(evtest tools/evtest.cpp)
   set_target_properties(evtest PROPERTIES OUTPUT_NAME evtest)
   target_link_libraries(evtest PRIVATE user32 shell32)
+
+  # d/f 搜索后端冒烟工具（Windows Search OLE DB + fd），与 src/main.cpp 共用 df_search
+  add_executable(wsquery tools/wsquery.cpp src/df_search.cpp)
+  set_target_properties(wsquery PROPERTIES OUTPUT_NAME wsquery)
+  target_include_directories(wsquery PRIVATE src)
+  target_link_libraries(wsquery PRIVATE ole32 shell32 uuid)
 
   add_library(filedlg_hook64 SHARED src/hookdlg.cpp)
   set_target_properties(filedlg_hook64 PROPERTIES

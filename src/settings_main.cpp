@@ -171,6 +171,7 @@ static ipc::Preview MakePreview() {
     p.beautify = g_s.beautify ? TRUE : FALSE;
     p.skipDotFolders = g_s.skipDotFolders ? TRUE : FALSE;
     p.fdjEnabled = g_s.fdjEnabled ? TRUE : FALSE;
+    p.dfBackend = g_s.dfBackend;
     p.weightEnabled = g_s.weightEnabled ? TRUE : FALSE;
     p.weightFlush = g_s.weightFlush;
     p.weightMaxEntries = g_s.weightMaxEntries;
@@ -790,7 +791,10 @@ static void BuildTabGeneral() {
     AddChoiceRow(p, 44, L"结果项快捷键：", ft::HotkeyModeOptions(), &g_s.hotkeyMode);
     AddChoiceRow(p, 78, L"唤醒位置：", ft::CenterWakeOptions(), &g_s.centerWake);
     AddCheck(p, 0, 116, kPW, L"文件对话框跳转（在文件对话框中直接定位文件夹）", &g_s.fdjEnabled);
-    AddHint(p, 0, 150, kPW, 34,
+    AddChoiceRow(p, 150, L"d/f 搜索后端：", ft::DfBackendOptions(), &g_s.dfBackend);
+    AddHint(p, 0, 184, kPW, 46,
+            L"d/f 搜索后端：新方案=内置索引+fd（不依赖 Everything，后台自动建索引）；"
+            L"Everything=旧链路（需 Everything 正在运行）。\n"
             L"唤起快捷键（Alt+Space）在托盘菜单里开关；结果项快捷键改动立即生效。");
     p->end();
 }

@@ -121,6 +121,7 @@ struct Settings {
     std::wstring excludeText;
     std::vector<std::wstring> excludePaths;
     bool skipDotFolders = true;
+    int dfBackend = 0;              // d/f 搜索后端：0=新方案（内置索引） 1=Everything 旧链路
     // 搜索权重
     bool weightEnabled = true;
     int weightFlush = 1;
@@ -173,6 +174,9 @@ inline std::vector<Option> LearnMaxOptions() {
 inline std::vector<Option> LearnExpireOptions() {
     return {{L"永不过期（长期保留）", 0}, {L"90 天未使用即清理", 90},
             {L"180 天未使用即清理", 180}, {L"365 天未使用即清理", 365}};
+}
+inline std::vector<Option> DfBackendOptions() {
+    return {{L"新方案（内置索引 + fd）", 0}, {L"Everything（旧链路，需 Everything 运行）", 1}};
 }
 inline std::vector<Option> ShellTypeOptions() {
     return {{L"命令提示符 (cmd)", 0}, {L"PowerShell", 1}, {L"Git Bash", 2}, {L"自定义…", 3}};

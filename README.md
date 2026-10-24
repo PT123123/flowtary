@@ -13,9 +13,9 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
 
 | 输入 | 行为 |
 | :--- | :--- |
-| `f {关键词}` | Everything 只搜本地**文件**（`file:` 修饰符），回车直接打开 |
-| `d {关键词}` | Everything 只搜本地**文件夹**（`folder:` 修饰符），回车在资源管理器打开 |
-| （`f`/`d` 兜底） | 按名字搜不到任何结果时，自动改按**整条路径**逐词再搜一次（`folder: path:词1 path:词2`），如 `d aw-qtui software` 命中 `C:\software\aw-qtui` |
+| `f {关键词}` | 只搜本地**文件**（多词 AND、子串匹配），回车直接打开 |
+| `d {关键词}` | 只搜**文件夹**，回车在资源管理器打开 |
+| （`f`/`d` 兜底） | 按名字搜不到任何结果时，自动改按**整条路径**逐词再搜一次，如 `d aw-qtui software` 命中 `C:\software\aw-qtui` |
 | （自学习） | 用 `f`/`d` 搜开（或普通搜索打开程序）并**成功打开**过的条目自动记忆（在 `%APPDATA%\Flowtary\learned` 生成 `.lnk` 快捷方式），下次搜同词/前缀词时无视 Everything/程序索引直接**置顶**，exe 优先、长期保留；参数见设置 `自学习` 页 |
 | （排除语法 `-关键词`） | 任意搜索输入里，**以 `-` 开头的词**表示「从结果中排除含该词的项目」，可与正向词混用：`chrome -portable`、`f 报告 -草稿`、`空格 w 浏览器 -无痕`。程序搜索按名称/路径/拼音过滤；`f`/`d` 翻成 Everything 原生 `!file:`/`!folder:` 索引侧排除；权重与自学习的记录 key 只取剥离排除词后的正向词 |
 | `bd {q}` | 百度 `https://www.baidu.com/#ie=UTF-8&wd={q}` |
@@ -224,12 +224,67 @@ build\evtest.exe     :: Everything IPC 协议冒烟测试工具（控制台）
 > 注意：全屏独占游戏（如 VALORANT + Vanguard）前台时，热键可能被反作弊拦截或无法抢占
 > 焦点，这是系统限制；切回正常桌面后即可正常使用。
 
-运行前提：使用 `d`/`f` 前缀需要 **Everything 1.4+ 正在后台运行**。若未运行，列表会给出
-降级项「在 Everything 中搜索：…」，回车则以 `everything.exe -search "file:xxx"` 方式
-打开 Everything 窗口完成搜索（`everything.exe` 依次在 Program Files、`%LOCALAPPDATA%`、
-exe 同目录及 PATH 中查找）。
+运行前提：`d`/`f` **不再依赖 Everything**。搜索走双后端并行（见下节）；
+两个后端都不可用时才回退旧 Everything IPC（需 Everything 1.4+ 正在后台运行，
+未运行则给出「在 Everything 中搜索」降级项，`everything.exe` 依次在 Program Files、
+`%LOCALAPPDATA%`、exe 同目录及 PATH 中查找）。
 
-## Everything IPC 协议说明（与原方案的差异更正）
+## d/f 搜索后端（不建全盘内存索引）
+
+防抖到期后**四层并行**，结果按全路径去重合并（先到先显示、流式上屏）：
+
+| 层 | 原理 | 覆盖 | 延迟 | 内存 |
+| :--- | :--- | :--- | :--- | :--- |
+| ① 内存索引 | fd 全列用户常用目录 + 注册表 `IndexDirs` 附加目录建库，常驻内存 + ReadDirectoryChangesW 增量维护；磁盘缓存 `%LOCALAPPDATA%\Flowtary\memindex.dat` 重启即用 | 常用目录内**毫秒级** | 查询 10–30ms | ~45MB（16.3 万条，`FT_DF_MEMINDEX_MAX` 限上限） |
+| ② 磁盘索引 | fd 全盘遍历一次（空闲优先级）→ 小写化 UTF-8 路径 blob（`%LOCALAPPDATA%\Flowtary\diskindex.dat`，数百 MB 磁盘文件）→ mmap 只读 + 首字节 memchr 全 blob 扫描 | **全盘** | 20–40ms（暖） | **进程私有 ~0**（文件映射页可被系统回收） |
+| ③ fd | 随包 `fd.exe`（同目录或 PATH）现场并行遍历，**不建任何索引** | 全部固定盘 | 亚秒~8s | 查询瞬时，空闲 0 |
+| ④ Windows Search | OLE DB 查系统索引 `SystemIndex`（覆盖范围 = 系统「索引选项」） | 索引范围内 | 0.8–1.2s 暖查询 | 0（服务系统已有） |
+
+- **建库/遍历剪枝**（fd `-E`，目录级剪枝=整棵子树不进遍历）：点开头、node_modules、
+  `__pycache__`、回收站（`$RECYCLE.BIN`/`RECYCLER`）、`System Volume Information`、
+  `tmp`/`temp` 目录、`*.tmp`/`*.temp`/`~$*`/`*~`/`*.swp` 临时备份文件——与默认显示过滤同向。
+  内存索引建库规则与默认显示过滤一致（Desktop+Documents 实测 16.3 万条 ≈ 45MB）。
+  首次建库 ~65s（后台，不阻塞②③），之后重启从缓存 0.5s 加载；
+  `FT_DF_MEMINDEX_MAX` 调上限、`FT_DF_MEMINDEX_OFF=1` 关闭。
+  附加目录写注册表 `HKCU\Software\Flowtary\IndexDirs`（REG_SZ，每行一个路径，`#` 注释）。
+- **磁盘索引**：与 Everything 同为全覆盖（含隐藏与 gitignore 产物，无剪枝）；
+  每盘根 ReadDirectoryChangesW → RAM 内 delta 表查询时合并，delta > 5 万条或缓存超 7 天
+  自动后台重建（IDLE 优先级不干扰前台）。`FT_DF_DISKINDEX_MAX` 限条目数（默认 8000000）、
+  `FT_DF_DISKINDEX_OFF=1` 关闭。
+- fd 三段预算（用户目录 2s → 全盘 → 路径兜底，总默认 8000ms，`FT_DF_FD_TIMEOUT_MS` 可调），
+  超时终止保留部分结果；多词 AND（`--and`）、固定字符串、不分大小写；`-I` 不理会 gitignore。
+- ④ 的会话进程级缓存（provider/命令工厂只建一次）；失败自动降级。
+- 全部不可用（无缓存无 fd 无 WSearch）时回退旧 Everything IPC 链路；
+  `FT_DF_DEBUG=1` 向 stderr 打印诊断。
+- 冒烟工具 `build\wsquery.exe`：`--check` 探测 / `--memstat`、`--diskstat` 索引状态 /
+  `[-d] [-p] [--fd|--mem|--disk] 词…` 直查。
+- **想让 Windows 自带搜索也变全盘**：设置 → 隐私和安全性 → 搜索 Windows →
+  「查找我的文件」改为**增强**（系统索引服务自己重建，内存由系统服务承担，与 flowtary 无关）。
+- **后端切换**：设置 → 常规 → 「d/f 搜索后端」下拉——`新方案（内置索引 + fd）`（默认）/
+  `Everything（旧链路）`。切到 Everything 时不再建任何索引（省 I/O），d/f 直接走
+  Everything IPC（需 Everything 正在运行）；切回新方案时索引层惰性启动。
+
+## 性能 benchmark（2026-10-24 本机实测）
+
+口径：Win11 · NVMe SSD · Defender 实时防护开启 · 用户目录（桌面+文档等）约 54 万原始条目
+（剪枝后 16.3 万入内存索引）· 全盘数百万文件。所有延迟为「回车后出结果」口径，含防抖 120ms。
+
+| 场景 | ① 内存索引 | ② 磁盘索引 | ③ fd 现查 | ④ Windows 搜索 | Everything（对照） |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| 桌面/常用目录搜索 | **10–30ms** | 16–93ms | 26s+（8s 预算内部分结果） | — | 毫秒级 |
+| 全盘任意词搜索 | 范围外 | **20–40ms**（暖） | ≤8s 部分结果 | 0.8–1.2s | 毫秒级 |
+| 常驻内存 | ~45MB | **≈0**（文件映射页） | 0（查询瞬时 ~31MB） | 0（系统服务） | 257–270MB |
+| 建库成本 | 常用目录 ~65s 后台；重启缓存 0.5s 加载 | 全盘一次（空闲优先级后台） | 无 | 系统自己重建 | 秒级 MFT |
+| 新鲜度 | 实时（目录监听） | 实时（盘根监听 delta）+7 天重建 | 实时（现查） | 秒级（系统索引器） | 实时（USN） |
+
+- flowtary 整体稳态私有内存 **54–72MB**（含 16.3 万条内存索引 + 程序缓存），对照
+  Everything 常驻 257–270MB；全盘索引本体放磁盘（数百 MB 文件）不占进程内存。
+- fd 现查全盘走完实测 100s+（Defender 拖累每次目录枚举），因此只作 ≤8s 预算的兜底层；
+  磁盘索引建库同受 Defender 影响（全盘一次约 0.5–1.5h，空闲优先级后台跑一次付清）。
+- Windows Search 的 0.8–1.2s 为暖查询（LIKE 前导通配线性扫描），prefix 场景可换
+  CONTAINS 提速（后续项）。
+
+## Everything IPC 协议说明（现仅作全部后端不可用时的回退路径）
 
 实现严格对照 voidtools 官方 SDK 头文件 `ipc/everything_ipc.h`（Everything 1.4.1）：
 
@@ -253,8 +308,10 @@ exe 同目录及 PATH 中查找）。
 ## 目录结构
 
 ```
-src/main.cpp         全部实现（Everything IPC / 网页指令 / 程序枚举匹配 / 拼音搜索 / 自绘 UI / 热键）
-tools/evtest.cpp     Everything IPC 协议测试工具
+src/main.cpp         全部实现（搜索后端调度 / 双后端结果合并 / 网页指令 / 程序枚举匹配 / 拼音搜索 / 自绘 UI / 热键）
+src/df_search.cpp/.h d/f 搜索后端：Windows Search（OLE DB 查 SystemIndex）+ fd（子进程现查），零第三方依赖
+tools/wsquery.cpp    d/f 后端冒烟工具（--check 探测 / 直查，与 evtest 同位）
+tools/evtest.cpp     Everything IPC 协议测试工具（现仅回退链路使用）
 vendor/ScreenCapture/  截图工具源码（git submodule，xland/ScreenCapture 2.4.25），构建产物 ScreenCapture.exe
 vendor/Ling/           GUI 框架源码（git submodule，xland/Ling），OCR 链依赖
 vendor/TinyOCR/        OCR 推理引擎源码（git submodule，xland/TinyOCR），基于 onnxruntime
@@ -290,6 +347,9 @@ OCR 链的依赖关系：`ImageReader` → `TinyOCR` + `Ling` → `yoga` + `Clip
 
 ## 已知限制
 
+- fd 现查受 deadline 截止（默认 5s）：全盘走不完时返回部分结果；要完整结果可设
+  `FT_DF_FD_TIMEOUT_MS=0`（走完全盘，本机实测约 100s+），或把常用目录加入系统索引范围
+  让 ① 后端秒出。后续可启用 altsearch-scoped 缓存层（指定目录常驻小索引）补齐速度
 - 全屏独占程序中热键仍可响应，但焦点抢占可能被系统限制
 - 程序索引在启动时构建，安装/卸载新程序需重启 flowtary 生效
 - UWP 应用不在搜索范围（按方案仅索引 .lnk 与一级 .exe）

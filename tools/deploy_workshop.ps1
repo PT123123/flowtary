@@ -72,6 +72,9 @@ Copy-Item (Join-Path $src 'filedlg_hook32.dll')  (Join-Path $dest 'filedlg_hook3
 Copy-Item (Join-Path $src 'filedlg_agent32.exe') (Join-Path $dest 'filedlg_agent32.exe') -Force
 Copy-Item (Join-Path $src 'ScreenCapture.exe')   (Join-Path $dest 'ScreenCapture.exe') -Force
 Copy-Item (Join-Path $src 'ImageReader.exe')     (Join-Path $dest 'ImageReader.exe') -Force
+if (Test-Path (Join-Path $src 'fd.exe')) {
+    Copy-Item (Join-Path $src 'fd.exe') (Join-Path $dest 'fd.exe') -Force  # d/f 搜索后端；缺失时 flowtary 自动回退
+}
 if (Test-Path (Join-Path $src 'dict')) {
     Copy-Item (Join-Path $src 'dict') (Join-Path $dest 'dict') -Recurse -Force
 }

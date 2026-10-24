@@ -14,6 +14,7 @@
 #include "themes.h"  // struct Theme / kThemes / ThemeTune（与设置 sidecar 共用）
 #include "settings_ipc.h"  // sidecar ↔ 主进程消息协议
 #include "settings_model.h"  // 设置项的唯一真源：注册表值名、编辑器语法、默认文本
+#include "df_search.h"  // d/f 搜索后端：Windows Search（OLE DB）+ fd（现查遍历），不建全盘索引
 #include <imm.h>
 #include <dwmapi.h>
 #include <uxtheme.h>
@@ -22,12 +23,16 @@
 #include <new>
 
 #include <algorithm>
+#include <condition_variable>
 #include <map>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cwctype>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -233,6 +238,7 @@ struct App {
     // 点开头过滤（默认开，UI 在设置「排除路径」Tab）：搜索文件/文件夹时，
     // 路径中任一层名以 '.' 开头（目录 .git / .vscode，或文件 .gitignore）即过滤该行。
     bool skipDotFolders = true;
+    int dfBackend = 0;          // d/f 搜索后端：0=新方案（内置索引） 1=Everything 旧链路（设置「常规」页）
     bool fdjEnabled = true;    // 文件对话框跳转总开关（默认开；UI 在设置「常规」Tab，不再放托盘菜单）
     bool topEnabled = true;    // top 命令开关（默认开：空格+top 回车置顶/取消置顶当前窗口）
     bool cmdEnabled = true;    // cmd 命令开关（默认开：空格+cmd 执行 Shell 命令，原 "> 命令"）
@@ -310,6 +316,16 @@ struct App {
     DWORD expectReply = 0;     // 期待的结果消息 dwData
     DWORD serial = 0;
 
+    // ---- d/f 双后端（Windows Search + fd，不建全盘索引；双后端全无时回退上面旧 IPC 链路）----
+    df::Query dfQuery;            // 当前 d/f 结构化查询（正向词表 + 排除词）
+    DWORD dfGen = 0;              // 查询代数：新查询 / 清空输入 / 隐藏窗口时 ++，旧回复按代数丢弃
+    int dfWsAvail = 0;            // Windows Search 可用性：0=未探测 1=可用 -1=不可用（首次查询时确定）
+    std::wstring dfFdExe;         // fd.exe 路径（首次 d/f 时探测一次，空=不存在）
+    bool dfFdLookedUp = false;
+    bool dfWsDone = false, dfFdDone = false, dfMemDone = true;  // 当前代各后端是否已回报（内存索引未就绪视为已完成）
+    bool dfDiskDone = true;     // 磁盘索引层回报状态（未就绪视为已完成）
+    std::vector<Row> dfBaseRows;  // 当前代已收到的后端结果（已过滤；fd 到达时与 WS 合并去重）
+
     std::vector<Program> programs;
     // 文件/文件夹行图标缓存：路径（小写）→ 小图标。File/Folder 结果行（含自学习置顶项）
     // 与程序行一样显示图标；首次经 shell 抽取后缓存，退出时统一销毁。
@@ -362,6 +378,7 @@ constexpr int WM_APP_PROGRAMS_READY = WM_APP + 2;  // 工作线程扫描完成�
 constexpr int WM_APP_QUIT = WM_APP + 3;  // 新版本接管：通知旧实例退出
 constexpr int WM_APP_EV_FALLBACK = WM_APP + 4;  // Everything 路径级兜底查询：延迟到消息循环外发（见下）
 constexpr int WM_APP_SETTINGS_GONE = WM_APP + 5;  // 设置窗 sidecar 进程结束（线程池回调 PostMessage 进来）
+constexpr int WM_APP_DF_READY = WM_APP + 6;  // d/f 双后端结果就绪：lParam = DfReply*（堆上，主线程接管后 delete）
 constexpr int IDM_SETTINGS = 2001;
 constexpr int IDM_EXIT = 2002;
 constexpr int IDM_REFRESH = 2003;   // 托盘菜单：刷新应用缓存
@@ -1106,6 +1123,33 @@ static ParsedQuery ParseExcludes(const std::wstring& q) {
     return r;
 }
 
+// d/f 结构化词表：与 BuildModifierQuery 相同的切词规则（空格分隔，"短语"整体一词），
+// 但去掉引号本身；排除词已由 ParseExcludes 剥离，不在此处理。
+// 供 df::Query.words 使用（Windows Search SQL / fd 命令行各按需转义）。
+static std::vector<std::wstring> SplitQueryWords(const std::wstring& q) {
+    std::vector<std::wstring> out;
+    size_t i = 0, n = q.size();
+    while (i < n) {
+        while (i < n && iswspace(q[i])) ++i;
+        if (i >= n) break;
+        if (q[i] == L'"') {
+            size_t j = q.find(L'"', i + 1);
+            if (j == std::wstring::npos) {
+                if (i + 1 < n) out.push_back(q.substr(i + 1));
+                break;
+            }
+            if (j > i + 1) out.push_back(q.substr(i + 1, j - i - 1));
+            i = j + 1;
+        } else {
+            size_t j = i;
+            while (j < n && !iswspace(q[j])) ++j;
+            out.push_back(q.substr(i, j - i));
+            i = j;
+        }
+    }
+    return out;
+}
+
 // textLower 已小写；命中任一排除词返回 true（子串包含，大小写不敏感）
 static bool HasExcludeTerm(const std::wstring& textLower) {
     for (const auto& e : g.excludes)
@@ -1265,6 +1309,8 @@ static void Show() {
     g.mode = Mode::None;
     g.expectReply = 0;
     g.evTermKey.clear();
+    df::CancelAll();     // 上次会话的在途 fd 不再需要；旧回复随代数递增作废
+    ++g.dfGen;
     g.caretOn = true;
     KillTimer(g.hwnd, kTimerDebounce);
     Layout();
@@ -1283,6 +1329,8 @@ static void Show() {
 static void Hide() {
     if (!IsWindowVisible(g.hwnd)) return;
     KillTimer(g.hwnd, kTimerDebounce);
+    df::CancelAll();     // 在途 fd 不再需要：终止并作废旧代回复
+    ++g.dfGen;
     g.dragging = false;
     g.selStart = g.selEnd = 0;
     // 若正在组词，先取消 IME 组合，避免残留未上屏状态
@@ -1419,6 +1467,252 @@ static void HandleEverythingReply(const COPYDATASTRUCT* cds) {
     if (g.items.empty()) AddHint(g.startingUp ? L"正在启动中…" : L"无结果");
     g.sel = 0;
     LayoutAndRepaint();
+}
+
+// ---------------- d/f 双后端：Windows Search + fd（不建全盘索引） ----------------
+// 调度（StartDfSearch，由防抖定时器触发）：同时拉起两个后端——
+//   ① Windows Search（毫秒级，覆盖系统索引范围）→ 先到先显示；
+//   ② fd（现查全部固定盘，亚秒~秒级）→ 到达后与 ① 的结果按全路径去重合并再刷新。
+// 每个后端按名字零命中时，各自在工作线程里自动追发一次「路径级」兜底查询
+// （对应旧 evFallbackQuery 逻辑），主线程不再排期二次查询。
+// 两者都不可用（无 WSearch 且无 fd.exe）时回退到上面的旧 Everything IPC 链路。
+// 新查询 / 清空输入 / 隐藏窗口都会 ++g.dfGen 并 CancelAll 在途 fd，旧回复按代数丢弃。
+// d/f 后端编号（DfReply.backend）：mem=用户目录内存索引（毫秒），disk=全盘磁盘索引
+// （mmap 扫描，20-40ms），ws=Windows Search，fd=现查兜底
+enum { BkMem = 0, BkWs = 1, BkFd = 2, BkDisk = 3 };
+
+struct DfReply {
+    DWORD gen;                    // 查询代数（与 g.dfGen 比对，过期即弃）
+    int backend;                  // BkMem / BkWs / BkFd
+    bool failed;                  // 后端本次不可用（COM/OLE DB 失败）
+    bool finalBatch;              // false=fd 流式中间批次（dfFdDone 保持 false），true=该后端已收尾
+    std::vector<df::Hit>* hits;   // 堆上结果，主线程接管后 delete
+};
+
+static void PostDfReply(DWORD gen, int backend, bool failed, bool finalBatch,
+                        std::vector<df::Hit>* hits) {
+    DfReply* r = new DfReply{gen, backend, failed, finalBatch, hits};
+    if (!PostMessageW(g.hwnd, WM_APP_DF_READY, 0, (LPARAM)r)) delete r;  // 窗口已亡：不泄漏
+}
+
+static void DfWsWorker(DWORD gen, df::Query q) {
+    auto* hits = new std::vector<df::Hit>();
+    int n = df::WindowsSearchQuery(q, false, *hits);
+    if (n < 0) { PostDfReply(gen, BkWs, true, true, hits); return; }   // 失败：空结果 + failed 标记
+    if (n == 0 && gen == g.dfGen)                                      // 按名字零结果 → 路径级兜底（换代即弃）
+        df::WindowsSearchQuery(q, true, *hits);
+    PostDfReply(gen, BkWs, false, true, hits);
+}
+
+// 内存索引worker：常驻条目上毫秒级子串查询；名字零结果再查一次路径模式（同样毫秒级）
+static void DfMemWorker(DWORD gen, df::Query q) {
+    auto* hits = new std::vector<df::Hit>();
+    df::MemIndexSearch(q, false, *hits, 200);
+    if (hits->empty() && gen == g.dfGen)
+        df::MemIndexSearch(q, true, *hits, 200);
+    PostDfReply(gen, BkMem, false, true, hits);
+}
+
+// 磁盘索引worker：全盘 blob mmap 扫描（暖态 20-40ms）；名字零结果再查一次路径模式
+static void DfDiskWorker(DWORD gen, df::Query q) {
+    auto* hits = new std::vector<df::Hit>();
+    df::DiskIndexSearch(q, false, *hits, 200);
+    if (hits->empty() && gen == g.dfGen)
+        df::DiskIndexSearch(q, true, *hits, 200);
+    PostDfReply(gen, BkDisk, false, true, hits);
+}
+
+static void DfFdWorker(DWORD gen, df::Query q, std::wstring fdExe, bool skipHidden, DWORD budget) {
+    auto* hits = new std::vector<df::Hit>();
+    // 流式：fd 每凑一批结果就增量投递（finalBatch=false），界面边扫边上屏。
+    // 预算三段共享（用户目录 → 全盘 → 路径兜底），保证总耗时不超过 budget。
+    auto sink = [gen](std::vector<df::Hit>&& batch) {
+        PostDfReply(gen, BkFd, false, false, new std::vector<df::Hit>(std::move(batch)));
+    };
+    const DWORD reserve = (std::min)(budget / 4, (DWORD)2000);   // 路径兜底保留
+    const DWORD nameBudget = budget - reserve;
+    const DWORD s1 = (std::min)(nameBudget, (DWORD)2000);        // 阶段1：用户常用目录
+    bool timedOut = false;
+    const ULONGLONG t0 = GetTickCount64();
+    int n = df::FdQuery(fdExe, q, false, skipHidden, *hits, s1, &timedOut, sink,
+                        df::UserDirsRoots());                    // 子树小，秒级必达
+    const ULONGLONG elapsed = GetTickCount64() - t0;
+    // 阶段2：全盘根用剩余名字预算（覆盖 C:\software、其他盘等非用户目录区域）
+    const DWORD left = nameBudget > elapsed ? nameBudget - (DWORD)elapsed : 0;
+    if (left > 0 && gen == g.dfGen)
+        n = (std::max)(n, df::FdQuery(fdExe, q, false, skipHidden, *hits, left, &timedOut,
+                                      sink, df::DriveRoots()));
+    if (n == 0 && !timedOut && gen == g.dfGen) {                 // 按名字零结果 → -p 路径兜底
+        const ULONGLONG elapsedAll = GetTickCount64() - t0;
+        const DWORD fb = budget > elapsedAll ? budget - (DWORD)elapsedAll : 0;
+        if (fb > 0) df::FdQuery(fdExe, q, true, skipHidden, *hits, fb, &timedOut, sink);
+    }
+    PostDfReply(gen, BkFd, false, true, hits);                   // 收尾（hits 为各阶段全量，合并去重兜底）
+}
+
+// 常驻 WS 工作线程（latest-wins）：df_search 里的 COM/索引会话只在首次查询时建一次，
+// 后续查询毫秒级——每条查询开新线程会反复重建会话（实测 ~0.8s 开销）。
+static std::mutex s_wsMu;
+static std::condition_variable s_wsCv;
+static DWORD s_wsJobGen = 0;
+static df::Query s_wsJob;
+static bool s_wsHasJob = false;
+static bool s_wsQuit = false;
+
+static unsigned __stdcall WsThreadProc(LPVOID) {
+    for (;;) {
+        df::Query q;
+        DWORD gen = 0;
+        {
+            std::unique_lock<std::mutex> lk(s_wsMu);
+            s_wsCv.wait(lk, [] { return s_wsHasJob || s_wsQuit; });
+            if (s_wsQuit) break;
+            gen = s_wsJobGen;
+            q = std::move(s_wsJob);
+            s_wsHasJob = false;
+        }
+        DfWsWorker(gen, q);   // 空闲时阻塞在条件变量上，不占 CPU
+    }
+    return 0;
+}
+
+static void WsEnqueue(DWORD gen, const df::Query& q) {
+    static bool started = false;   // StartDfSearch 仅主线程调用：懒启动无竞争
+    {
+        std::lock_guard<std::mutex> lk(s_wsMu);
+        s_wsJobGen = gen;
+        s_wsJob = q;
+        s_wsHasJob = true;
+        if (!started) {
+            started = true;
+            CloseHandle((HANDLE)_beginthreadex(nullptr, 0, WsThreadProc, nullptr, 0, nullptr));
+        }
+    }
+    s_wsCv.notify_one();
+}
+
+static void StartDfSearch() {
+    if (g.dfBackend == 1) {      // 设置「常规」页选了 Everything 旧链路：跳过内置索引层
+        ExecuteEverythingQuery();
+        return;
+    }
+    df::CancelAll();             // 上一代的 fd 若还在遍历：终止（保证同时最多一个 fd 在跑）
+    ++g.dfGen;
+    const DWORD gen = g.dfGen;
+    if (!g.dfFdLookedUp) { g.dfFdExe = df::FindFdExe(); g.dfFdLookedUp = true; }
+    // dfWsAvail：0=未定（乐观启用，由 WS 工作线程首次查询自证）/ -1=已确认不可用 / 1=正常
+    // 可用性探测不放在主线程（避免主线程碰 COM）；失败由 failed 回复在 handler 里落定
+    const bool wsOk = g.dfWsAvail >= 0;
+    const bool fdOk = !g.dfFdExe.empty();
+    g.dfMemDone = !df::MemIndexReady();
+    g.dfDiskDone = !df::DiskIndexReady();
+    g.dfWsDone = !wsOk;
+    g.dfFdDone = !fdOk;
+    g.dfBaseRows.clear();
+    if (!wsOk && !fdOk && g.dfMemDone && g.dfDiskDone) { ExecuteEverythingQuery(); return; }   // 全后端无：旧链路兜底
+    const df::Query q = g.dfQuery;
+    const DWORD budget = df::DefaultFdDeadlineMs();
+    if (!g.dfMemDone)                                            // 内存索引就绪：毫秒级先出结果
+        std::thread(DfMemWorker, gen, q).detach();
+    if (!g.dfDiskDone)                                           // 磁盘索引就绪：全盘覆盖
+        std::thread(DfDiskWorker, gen, q).detach();
+    if (wsOk) WsEnqueue(gen, q);
+    if (fdOk) std::thread(DfFdWorker, gen, q, g.dfFdExe, g.skipDotFolders, budget).detach();
+}
+
+// 点击加权重排（与 HandleEverythingReply 内同一套规则；含自适应前缀推荐）
+static void RerankDfByWeight() {
+    if (!g.weightEnabled || g.evTermKey.empty() || g.items.size() <= 1) return;
+    const std::wstring& tk = g.evTermKey;
+    std::unordered_map<std::wstring, int> hist;
+    CollectPrefixWeights(tk, hist);
+    auto rowW = [&](const Row& r) {
+        if (r.kind != Row::File && r.kind != Row::Folder) return 0;
+        int w = GetClickWeight(tk, r.action);
+        auto it = hist.find(r.action);
+        if (it != hist.end()) w += it->second;
+        return w;
+    };
+    std::stable_sort(g.items.begin(), g.items.end(),
+                     [&rowW](const Row& a, const Row& b) { return rowW(a) > rowW(b); });
+}
+
+static void RenderDfResults() {
+    g.items = g.dfBaseRows;
+    // 基础排序：逐词按文件名命中质量（精确 > 前缀 > 包含 > 仅路径）——
+    // 两个后端的原始顺序都是遍历序，不重排会让深层目录的包含命中压过浅层的精确命中。
+    // 权重重排随后再叠加（点过的条目最前）。
+    const std::vector<std::wstring>& words = g.dfQuery.words;
+    auto scoreOf = [&words](const Row& r) {
+        std::wstring name = ToLowerW(r.title);
+        std::wstring path = ToLowerW(r.action);
+        int s = 0;
+        for (const auto& w : words) {
+            std::wstring wl = ToLowerW(w);
+            if (name == wl) s += 8;
+            else if (name.size() >= wl.size() && name.compare(0, wl.size(), wl) == 0) s += 4;
+            else if (name.find(wl) != std::wstring::npos) s += 2;
+            else if (path.find(wl) != std::wstring::npos) s += 1;
+        }
+        return s;
+    };
+    if (!words.empty() && g.items.size() > 1)
+        std::stable_sort(g.items.begin(), g.items.end(),
+                         [&scoreOf](const Row& a, const Row& b) { return scoreOf(a) > scoreOf(b); });
+    RerankDfByWeight();
+    // f/d 自学习置顶（与 Everything 展示路径同一套：摘出与结果重复的学习行后插到最前）
+    PrependLearnedRows(g.evTermKey);
+    if (g.items.empty())
+        AddHint((g.dfWsDone && g.dfFdDone && g.dfMemDone && g.dfDiskDone)
+                    ? (g.startingUp ? L"正在启动中…" : L"无结果")
+                    : L"正在搜索…");
+    g.sel = 0;
+    LayoutAndRepaint();
+}
+
+static void HandleDfReply(DfReply* r) {
+    if (!r) return;
+    std::unique_ptr<DfReply> hold(r);
+    if (r->gen != g.dfGen || g.mode != Mode::Everything) return;   // 过期回复 / 已切走界面
+    if (r->backend == BkWs) {
+        if (r->failed) g.dfWsAvail = -1;   // 本次起停用 WS（fd 单后端，或全无时走旧链路）
+        g.dfWsDone = true;
+    } else if (r->backend == BkFd) {
+        g.dfFdDone = r->finalBatch;        // fd 流式：中间批次不算收尾
+    } else if (r->backend == BkMem) {
+        g.dfMemDone = true;                // 内存索引：单批即收尾
+    } else {
+        g.dfDiskDone = true;               // 磁盘索引：单批即收尾
+    }
+    std::vector<Row> rows;
+    if (!r->failed && r->hits) {
+        for (const auto& h : *r->hits) {
+            Row row;
+            row.kind = h.isFolder ? Row::Folder : Row::File;
+            row.action = h.path;
+            // 与 Everything 行同构：title=名字, sub=父目录（盘根 C:\ 整行一个 title）
+            size_t p = h.path.find_last_of(L'\\');
+            if (p == std::wstring::npos || p + 1 == h.path.size()) {
+                row.title = h.path;
+                row.sub.clear();
+            } else {
+                row.title = h.path.substr(p + 1);
+                row.sub = h.path.substr(0, p);
+                if (row.sub.size() == 2 && row.sub[1] == L':') row.sub += L'\\';  // 盘根目录补分隔符
+            }
+            if (row.title.empty()) row.title = h.path;
+            // 排除路径 / 点开头过滤：与 Everything 结果同一套规则
+            if (IsPathExcluded(row.action, true)) continue;
+            rows.push_back(std::move(row));
+        }
+    }
+    for (auto& nr : rows) {          // fd 到达：与 WS 已收结果按全路径去重合并
+        bool dup = false;
+        for (const auto& er : g.dfBaseRows)
+            if (_wcsicmp(er.action.c_str(), nr.action.c_str()) == 0) { dup = true; break; }
+        if (!dup) g.dfBaseRows.push_back(std::move(nr));
+    }
+    RenderDfResults();
 }
 
 // ---------------- 输入解析与刷新 ----------------
@@ -1793,6 +2087,8 @@ static void Refresh() {
         } else if (tok == L"d" || tok == L"f") {
             g.mode = Mode::Everything;
             g.evFallbackPending = false;  // 新输入作废旧的兜底排期（已投递的 WM_APP 会因标志为 false 直接返回）
+            df::CancelAll();              // 上一代的在途 fd 一并终止，旧回复随代数递增作废
+            ++g.dfGen;
             if (rest.empty()) {
                 g.evFallbackQuery.clear();
                 AddHint(tok == L"f" ? L"输入关键词搜索文件" : L"输入关键词搜索文件夹");
@@ -1802,9 +2098,14 @@ static void Refresh() {
                 g.excludes = pq.excludes;
                 // BuildModifierQuery/BuildPathFallbackQuery 接收含 -词 的原始 rest，自行翻译成 !file:/!folder:
                 g.evQuery = BuildModifierQuery(isFile ? L"file:" : L"folder:", rest);
-                // 主查询无结果时自动追发的路径级兜底（见 HandleEverythingReply）
+                // 主查询无结果时自动追发的路径级兜底（见 HandleEverythingReply；仅旧链路兜底用）
                 g.evFallbackQuery = BuildPathFallbackQuery(isFile ? L"file:" : L"folder:", rest);
                 g.evTermKey = NormalizeSearchTerm(pq.positive);  // 有效搜索词（权重/学习 key，不含排除词）
+                // 双后端结构化查询（正向词表 + 排除词）：防抖到期由 StartDfSearch() 派发
+                g.dfQuery = df::Query{};
+                g.dfQuery.isFile = isFile;
+                g.dfQuery.words = SplitQueryWords(pq.positive);
+                g.dfQuery.excludes = pq.excludes;
                 AddHint(L"正在搜索…");
                 // f/d 自学习：以前打开过的条目先置顶（Everything 结果到达后再合并）
                 PrependLearnedRows(g.evTermKey);
@@ -2612,6 +2913,26 @@ static bool GetStartupEnabled() { return ft::StartupEnabled(); }
 
 static void SetStartup(bool on) { ft::SetStartupPath(GetExePath(), on); }
 
+// 内置索引层启动（幂等）：仅新方案模式需要；Everything 旧链路模式不建索引省 I/O，
+// 设置里切回新方案时由设置应用路径惰性启动。
+static void StartIndexTiersIfNeeded() {
+    if (g.dfBackend != 0) return;
+    {   // 注册表 IndexDirs：附加进毫秒层的目录（每行一个，# 为注释）
+        std::vector<std::wstring> extra;
+        std::wstring text = LoadRegText(L"IndexDirs");
+        size_t i = 0, n = text.size();
+        while (i < n) {
+            size_t j = text.find_first_of(L"\r\n", i);
+            if (j == std::wstring::npos) j = n;
+            std::wstring ln = TrimW(text.substr(i, j - i));
+            if (!ln.empty() && ln[0] != L'#') extra.push_back(ln);
+            i = j + 1;
+        }
+        df::MemIndexStart(extra);   // 后台建用户目录内存索引（桌面/文档等 + IndexDirs，毫秒级第一层）
+        df::DiskIndexStart();       // 全盘磁盘索引（磁盘文件，后台空闲优先级建库）
+    }
+}
+
 // 设置项的唯一读法在 ft::Settings::Load()（settings_model.cpp）；这里只做
 // 「Settings → g 运行态」的搬运。三个入口共用它：启动时读注册表、sidecar 保存后
 // 重放、sidecar 取消时回退快照 —— 保证运行态只有一种被写法。
@@ -2624,6 +2945,8 @@ static void ApplySettingsToRuntime(const ft::Settings& s) {
     g.theme = &kThemes[g.themeIdx];
     g.beautify = s.beautify;
     g.skipDotFolders = s.skipDotFolders;
+    g.dfBackend = s.dfBackend;
+    StartIndexTiersIfNeeded();
     sTune = s.tune;
     s.ApplyTuneToThemes();
     g.weightEnabled = s.weightEnabled;
@@ -3645,6 +3968,8 @@ static void ApplySettingsPreview(const ipc::Preview& p) {
     g.centerWake = p.centerWake != FALSE;
     g.hotkeyMode = p.hotkeyMode;
     g.skipDotFolders = p.skipDotFolders != FALSE;
+    g.dfBackend = p.dfBackend;
+    StartIndexTiersIfNeeded();
     g.fdjEnabled = p.fdjEnabled != FALSE;  // 仅为镜像；判定处现读注册表
     g.weightEnabled = p.weightEnabled != FALSE;
     g.weightFlush = p.weightFlush;
@@ -3997,7 +4322,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_TIMER:
             if (wParam == kTimerDebounce) {
                 KillTimer(hwnd, kTimerDebounce);
-                if (g.mode == Mode::Everything) ExecuteEverythingQuery();
+                if (g.mode == Mode::Everything) StartDfSearch();
             } else if (wParam == kTimerWeightSave) {
                 KillTimer(hwnd, kTimerWeightSave);
                 SaveClickWeightsNow();  // 延迟合并写盘到期：一次写出全部权重
@@ -4056,6 +4381,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_APP_SETTINGS_GONE:
             // sidecar 进程结束（正常关闭 / 被杀 / 崩溃）：未提交就回退实时预览
             OnSettingsSessionEnded();
+            return 0;
+
+        case WM_APP_DF_READY:
+            // d/f 双后端（Windows Search / fd）结果就绪：接管堆上结果并按代数过滤
+            HandleDfReply((DfReply*)lParam);
             return 0;
 
         case WM_APP_EV_FALLBACK: {
@@ -4931,6 +5261,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     ApplyTheme(false);  // 建立主题字体与画刷：此时还没有窗口，只为弹窗准备绘制资源
 
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+
+    StartIndexTiersIfNeeded();  // 新方案模式：后台建内存/磁盘索引（旧链路模式不建，省 I/O）
 
     // 单实例：区分「同版本重复启动」与「新版本替换启动」
     // （放在主题/字体初始化之后，这样弹窗才能用上主题配色与字体）
