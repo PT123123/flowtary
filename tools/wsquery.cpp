@@ -36,7 +36,7 @@ int wmain(int argc, wchar_t** argv) {
     q.isFile = true;
     bool pathMode = false, useFd = false, check = false, useMem = false, memStat = false;
     bool useDisk = false, diskStat = false;
-    int bench = 0;
+    int bench = 0, rows = 0;
     std::wstring fdExe;
     for (int i = 1; i < argc; ++i) {
         std::wstring a = argv[i];
@@ -49,6 +49,7 @@ int wmain(int argc, wchar_t** argv) {
         else if (a == L"--diskstat") diskStat = true;
         else if (a == L"--check") check = true;
         else if (a == L"--bench" && i + 1 < argc) bench = _wtoi(argv[++i]);
+        else if (a == L"--rows" && i + 1 < argc) rows = _wtoi(argv[++i]);
         else if (a == L"--fdpath" && i + 1 < argc) fdExe = argv[++i];
         else if (!a.empty() && a[0] == L'-') { PrintLine(L"未知参数: " + a); return 2; }
         else q.words.push_back(a);
@@ -90,7 +91,7 @@ int wmain(int argc, wchar_t** argv) {
             int n;
             if (useMem || useDisk) {   // 守护进程层（内存+磁盘索引合并）
                 std::vector<df::Hit> dh;
-                if (!df::SearchDaemonQuery(q, pathMode, dh, 200)) {
+                if (!df::SearchDaemonQuery(q, pathMode, dh, rows > 0 ? rows : 200)) {
                     PrintLine(L"守护进程查询失败（未在运行？）");
                     return 1;
                 }
@@ -113,7 +114,7 @@ int wmain(int argc, wchar_t** argv) {
         df::SearchDaemonStart();
         std::vector<df::Hit> hits;
         ULONGLONG t0 = GetTickCount64();
-        bool ok = df::SearchDaemonQuery(q, pathMode, hits, 50);
+        bool ok = df::SearchDaemonQuery(q, pathMode, hits, rows > 0 ? rows : 50);
         if (!ok) { PrintLine(L"守护进程查询失败（未在运行？）"); return 1; }
         PrintLine(L"守护进程命中 " + std::to_wstring((long long)hits.size()) + L" 条, " +
                   std::to_wstring((long long)(GetTickCount64() - t0)) + L" ms:\n");

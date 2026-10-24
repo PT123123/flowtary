@@ -1507,13 +1507,14 @@ static void DfWsWorker(DWORD gen, df::Query q) {
     PostDfReply(gen, BkWs, false, true, hits);
 }
 
-// 守护进程 worker：内存+磁盘索引都在 flowtary-search --serve 进程内，一层查询全拿；
-// 名字零结果再查一次路径模式（同样毫秒级）。守护进程崩溃时查询失败 → fd/WS 层自然接管
+// 守护进程 worker：内存+磁盘索引都在 flowtary-search --serve 进程内，一层查询全拿
+//（名字零命中时守护进程内部已按层做过路径兜底并合并，无需二次查询）。
+// 一次要 800 行：返回的是遍历序，UI 只显示 kMaxResults 行——截断若发生在排序前，
+// 深处目录的精确/前缀命中会被池序噪声挤出候选窗，UI 排序再好也无米下锅。
+// 守护进程崩溃时查询失败 → fd/WS 层自然接管
 static void DfDaemonWorker(DWORD gen, df::Query q) {
     auto* hits = new std::vector<df::Hit>();
-    bool ok = df::SearchDaemonQuery(q, false, *hits, 200);
-    if (ok && hits->empty() && gen == g.dfGen)
-        df::SearchDaemonQuery(q, true, *hits, 200);
+    bool ok = df::SearchDaemonQuery(q, false, *hits, 800);
     PostDfReply(gen, BkMem, ok ? FALSE : TRUE, true, hits);
 }
 
@@ -1632,7 +1633,7 @@ static void RerankDfByWeight() {
 
 static void RenderDfResults() {
     g.items = g.dfBaseRows;
-    // 基础排序：逐词按文件名命中质量（精确 > 前缀 > 包含 > 仅路径）——
+    // 基础排序：逐词按文件名命中质量（精确 > 前缀 > 包含 > 拼音/仅路径）——
     // 两个后端的原始顺序都是遍历序，不重排会让深层目录的包含命中压过浅层的精确命中。
     // 权重重排随后再叠加（点过的条目最前）。
     const std::vector<std::wstring>& words = g.dfQuery.words;
@@ -1646,6 +1647,9 @@ static void RenderDfResults() {
             else if (name.size() >= wl.size() && name.compare(0, wl.size(), wl) == 0) s += 4;
             else if (name.find(wl) != std::wstring::npos) s += 2;
             else if (path.find(wl) != std::wstring::npos) s += 1;
+            else s += 2;   // 词在名字与路径里都不存在 = 守护进程拼音命中（文本过滤的
+                           // WS/fd 后端不可能产出这种行）：与名字包含同档，
+                           // 否则拼音结果会压在仅路径命中（1 分）之下
         }
         return s;
     };

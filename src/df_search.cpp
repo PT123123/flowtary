@@ -1304,7 +1304,7 @@ std::atomic<bool> g_diStarted{false};
 std::atomic<bool> g_diQuit{false};
 std::atomic<bool> g_diRebuilding{false};
 std::mutex g_ovMu;
-std::unordered_map<std::wstring, bool> g_ovAdd;   // å»ºåºåæ°å¢ï¼è·¯å¾ â isDir
+std::unordered_map<std::wstring, std::pair<bool, std::wstring>> g_ovAdd;   // 建库后新增：键(小写反斜杠路径) → {isDir, 真实路径}
 std::unordered_set<std::wstring> g_ovDel;         // å»ºåºåå é¤
 
 DWORD DiskCap() {
@@ -1353,6 +1353,85 @@ bool MemContainsBytes(const unsigned char* hay, size_t hl, const char* nd, size_
 }
 
 // æ å°å·²æç´¢å¼æä»¶ï¼æ ¡éªçæ¬å¤´ + è§£æ COUNTï¼ï¼æåç½® ready
+// ---------------- 目录级大小写还原缓存 ----------------
+// blob 存小写路径，命中后要还原真实大小写（展示用）。GetLongPathNameW 每路径
+// 一次、Defender 环境实测 6-8ms/次（34 命中 = 250ms，800 行请求最坏秒级）。
+// 改为按目录 FindFirstFileW 枚举一次拿到整目录「小写名→真名」映射并进程级缓存
+// ——暖态查询零文件系统调用。缓存里的名字缺失（新建/改名）时查询侧自愈刷新，
+// 无需监听线程失效同步。
+using CaseMap = std::unordered_map<std::wstring, std::wstring>;
+std::mutex g_caseMu;
+std::unordered_map<std::wstring, std::shared_ptr<const CaseMap>> g_caseDirCache;
+
+// 取目录的名字映射（键=全小写目录，无尾分隔符；盘根为 "c:\"）。refresh 强制重枚举。
+// shared_ptr 保证外层 rehash/清理时已取出的映射仍然有效。
+std::shared_ptr<const CaseMap> DiskDirNameMap(const std::wstring& lowDir, bool refresh = false) {
+    {
+        std::lock_guard<std::mutex> lk(g_caseMu);
+        auto it = g_caseDirCache.find(lowDir);
+        if (it != g_caseDirCache.end() && !refresh)
+            return it->second;
+    }
+    const ULONGLONG tEnum = GetTickCount64();
+    CaseMap m;
+    std::wstring pat = lowDir;
+    if (pat.back() != L'\\') pat += L'\\';
+    pat += L'*';
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW(pat.c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (wcscmp(fd.cFileName, L".") != 0 && wcscmp(fd.cFileName, L"..") != 0)
+                m.emplace(ToLower(fd.cFileName), fd.cFileName);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    if (GetEnvironmentVariableW(L"FT_DF_DEBUG", nullptr, 0) > 0) {
+        fwprintf(stderr, L"[case] enum ms=%llu dir=%hs n=%zu\n",
+                 (unsigned long long)(GetTickCount64() - tEnum),
+                 WideToUtf8(lowDir).c_str(), m.size());
+        fflush(stderr);
+    }
+    std::lock_guard<std::mutex> lk(g_caseMu);
+    if (g_caseDirCache.size() > 8192) g_caseDirCache.clear();   // 粗粒度防膨胀
+    auto& slot = g_caseDirCache[lowDir];
+    if (!slot || refresh) slot = std::make_shared<const CaseMap>(std::move(m));
+    return slot;
+}
+
+// blob 小写路径（fd 风格反斜杠已归一）→ 真实大小写。逐段查**父目录**的映射表
+// （该目录枚举出的「子名→真名」）；目录不存在/缓存缺失该名（新建、改名）时
+// 重枚举一次，仍缺则保留小写。
+std::wstring DiskRealCasePath(const std::wstring& lowPath) {
+    if (lowPath.size() < 4 || lowPath[1] != L':' || lowPath[2] != L'\\') return lowPath;
+    std::wstring real;
+    real += (wchar_t)towupper(lowPath[0]);
+    real += L":\\";
+    size_t pos = 3;
+    while (pos < lowPath.size() && real.size() < 1024) {
+        size_t slash = lowPath.find(L'\\', pos);
+        if (slash == std::wstring::npos) slash = lowPath.size();
+        const std::wstring comp = lowPath.substr(pos, slash - pos);
+        if (!comp.empty()) {
+            // 父目录 = 当前组件之前的路径（首个组件的父是盘根 "c:\"，键保留尾分隔符）
+            std::wstring lowDir = lowPath.substr(0, pos);
+            if (lowDir.size() > 3 && lowDir.back() == L'\\') lowDir.pop_back();
+            auto m = DiskDirNameMap(lowDir);
+            std::wstring realComp = comp;
+            auto it = m ? m->find(comp) : CaseMap::iterator();
+            if (m && it == m->end()) {   // 父目录表里没有该名：可能有新条目 → 刷新一次
+                m = DiskDirNameMap(lowDir, /*refresh=*/true);
+                it = m ? m->find(comp) : CaseMap::iterator();
+            }
+            if (m && it != m->end()) realComp = it->second;
+            if (real.back() != L'\\') real += L'\\';
+            real += realComp;
+        }
+        pos = slash + 1;
+    }
+    return real;
+}
+
 bool DiskMapExistingLocked() {
     auto dbg2 = [](const wchar_t* m, unsigned long long v) {
         if (GetEnvironmentVariableW(L"FT_DF_DEBUG", nullptr, 0) > 0) {
@@ -1548,24 +1627,52 @@ void DiskMaybeStartRebuild() {
 }
 
 // 磁盘索引冷页预热：blob 是文件映射页，守护进程重启后首查要为页缓存回填付
-// 218-500ms（实测，docs/SEARCH_DAEMON_NOTES.md 三）。空闲优先级后台线程顺序读
-// 一遍索引文件——缓存管理器与映射视图共享同一批物理页，读文件即暖页，把这笔
-// 一次性成本挪到用户按键之前。启动映射就绪与重建完成两处调用。
+// 数百毫秒（实测 172-609ms，Defender 环境下波动）。顺序读文件只暖缓存管理器的
+// 页，映射视图首触仍有软故障——PrefetchVirtualMemory 直接对映射视图预取才对症
+// （Win8.1+，经 KernelBase 运行时解析；地址失效时优雅失败，不会像裸触碰那样崩）。
+// 旧系统回落为顺序读文件（缓存管理器与映射视图共享同一批物理页，聊胜于无）。
 unsigned __stdcall DiskPrefetchThread(void* p) {
     std::unique_ptr<std::wstring> path((std::wstring*)p);
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
-    HANDLE h = CreateFileW(path->c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                           OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return 0;
     const ULONGLONG t0 = GetTickCount64();
-    char buf[1 << 16];
-    DWORD got = 0;
-    while (ReadFile(h, buf, sizeof(buf), &got, nullptr) && got > 0) {
-        if (g_diQuit) break;
+    const unsigned char* base = nullptr;
+    unsigned long long size = 0;
+    {   // 快照映射范围（重建线程可能并发换映射；快照后不持锁，失效地址预取无害）
+        std::lock_guard<std::mutex> lk(g_diMu);
+        base = g_diView;
+        size = g_diSize;
     }
-    CloseHandle(h);
+    bool mapped = false;
+    if (base && size) {
+        struct MemRangeEntry { void* addr; SIZE_T bytes; };   // == MEMORY_RANGE_ENTRY（避免依赖 SDK 版本宏）
+        using PrefetchFn = BOOL(WINAPI*)(HANDLE, ULONG_PTR, MemRangeEntry*, ULONG);
+        HMODULE kb = GetModuleHandleW(L"KernelBase.dll");
+        PrefetchFn fn = kb ? (PrefetchFn)GetProcAddress(kb, "PrefetchVirtualMemory") : nullptr;
+        if (fn) {
+            HANDLE proc = GetCurrentProcess();
+            for (unsigned long long off = 0; off < size && !g_diQuit; off += 64ull << 20) {
+                MemRangeEntry e{(void*)(base + off),
+                                (SIZE_T)((size - off) > (64ull << 20) ? (64ull << 20) : (size - off))};
+                if (!fn(proc, 1, &e, 0)) break;
+            }
+            mapped = true;
+        }
+    }
+    if (!mapped) {
+        HANDLE h = CreateFileW(path->c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                               OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        if (h != INVALID_HANDLE_VALUE) {
+            char buf[1 << 16];
+            DWORD got = 0;
+            while (ReadFile(h, buf, sizeof(buf), &got, nullptr) && got > 0) {
+                if (g_diQuit) break;
+            }
+            CloseHandle(h);
+        }
+    }
     if (GetEnvironmentVariableW(L"FT_DF_DEBUG", nullptr, 0) > 0) {
-        fwprintf(stderr, L"[prefetch] ms=%llu\n", (unsigned long long)(GetTickCount64() - t0));
+        fwprintf(stderr, L"[prefetch] ms=%llu map=%d\n",
+                 (unsigned long long)(GetTickCount64() - t0), mapped ? 1 : 0);
         fflush(stderr);
     }
     return 0;
@@ -1622,8 +1729,12 @@ unsigned __stdcall DiskWatchThread(void* p) {
             {
                 std::lock_guard<std::mutex> lk(g_ovMu);   // ç­ææéï¼çº¯åå­æå¥
                 for (auto& kv : resolved) {
-                    if (kv.second < 0) { g_ovDel.insert(kv.first); g_ovAdd.erase(kv.first); }
-                    else { g_ovAdd[kv.first] = kv.second != 0; g_ovDel.erase(kv.first); }
+                    std::wstring key = kv.first;
+                    for (auto& c : key)
+                        if (c == L'/') c = L'\\';
+                    key = ToLower(key);   // 键统一小写反斜杠形，与 blob 命中过滤同形可比
+                    if (kv.second < 0) { g_ovDel.insert(key); g_ovAdd.erase(key); }
+                    else { g_ovAdd[key] = {kv.second != 0, kv.first}; g_ovDel.erase(key); }
                 }
             }
             size_t ov = 0;
@@ -1743,32 +1854,36 @@ int DiskIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD 
         if (!ok) continue;
         if (!seen.insert(std::string((const char*)rec, pathLen)).second) continue;
         std::wstring path = Utf8ToWide(std::string((const char*)rec, pathLen));
-        {   // delta åå¹¶ï¼å·²å é¤è·³è¿ï¼å·²æ¯æ°å¢æ¡ç®åäº¤ç»ä¸æ¹ additions æ«æï¼é¿åéå¤
+        {   // delta 合并：已删除跳过；已是新增条目则交给下方 additions 扫描，避免重复。
+            // 键为小写反斜杠形，与 blob 路径（小写正斜杠）只差分隔符
+            std::wstring key = path;
+            for (auto& c : key)
+                if (c == L'/') c = L'\\';
             std::lock_guard<std::mutex> lk2(g_ovMu);
-            if (g_ovDel.count(path)) continue;
-            if (g_ovAdd.count(path)) continue;
+            if (g_ovDel.count(key)) continue;
+            if (g_ovAdd.count(key)) continue;
         }
         found.push_back({std::move(path), isDir});
         }
     }   // g_diMu 释放
-    // blob 存的是小写路径：还原真实大小写（文件存在；不存在时保留小写）
+    // blob 存的是小写路径：还原真实大小写（目录级映射缓存，暖态零文件系统调用；
+    // 文件已删时保留小写）。fd 风格正斜杠先归一为反斜杠，与其他层/UI 一致
     for (auto& f : found) {
         if (out.size() >= (size_t)maxRows) break;
-        wchar_t longBuf[MAX_PATH * 2]{};
-        if (GetLongPathNameW(f.first.c_str(), longBuf, MAX_PATH * 2) > 0) f.first = longBuf;
         for (auto& c : f.first)
-            if (c == L'/') c = L'\\';   // blob 存 fd 风格正斜杠：与其他层统一为反斜杠（UI 拆 title/sub、跨层去重都依赖）
+            if (c == L'/') c = L'\\';
+        f.first = DiskRealCasePath(f.first);
         if (f.first.size() >= 2 && f.first[1] == L':' &&
             f.first[0] >= L'a' && f.first[0] <= L'z')
-            f.first[0] -= L'a' - L'A';   // fd 输出小写盘符：归一为大写，与其他层一致
+            f.first[0] -= L'a' - L'A';   // 盘符兜底大写（DiskRealCasePath 已做）
         out.push_back({std::move(f.first), f.second});
     }
     // å»ºåºåæ°å¢æ¡ç®ï¼RAM deltaï¼ï¼æ°éå°ï¼å®½å­ç¬¦çº¿æ§è¿æ»¤
     std::lock_guard<std::mutex> lk2(g_ovMu);
     for (const auto& kv : g_ovAdd) {
         if (out.size() >= (size_t)maxRows) break;
-        if (q.isFile == kv.second) continue;
-        std::wstring lp = ToLower(kv.first);
+        if (q.isFile == kv.second.first) continue;
+        const std::wstring& lp = kv.first;   // 已是小写反斜杠
         bool ok = true;
         for (const auto& w : wlw)
             if (lp.find(w) == std::wstring::npos) { ok = false; break; }
@@ -1776,21 +1891,22 @@ int DiskIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD 
         for (const auto& e : q.excludes)
             if (!e.empty() && lp.find(e) != std::wstring::npos) { ok = false; break; }
         if (!ok) continue;
-        std::wstring base = kv.first;
-        size_t bp = base.find_last_of(L'\\');
-        base = bp == std::wstring::npos ? base : base.substr(bp + 1);
+        const std::wstring& real = kv.second.second;   // 真实大小写路径（展示用）
         bool hit = true;
         if (!pathMode) {
+            std::wstring base = real;
+            size_t bp = base.find_last_of(L'\\');
+            base = bp == std::wstring::npos ? base : base.substr(bp + 1);
             std::wstring bl = ToLower(base);
             for (const auto& w : wlw)
                 if (bl.find(w) == std::wstring::npos) { hit = false; break; }
         } else {
-            std::wstring fl = ToLower(kv.first);
+            std::wstring fl = ToLower(real);
             for (const auto& w : wlw)
                 if (fl.find(w) == std::wstring::npos) { hit = false; break; }
         }
         if (!hit) continue;
-        out.push_back({kv.first, kv.second});
+        out.push_back({real, kv.second.first});
     }
     dbg(L"scan ms:", (unsigned long long)(GetTickCount64() - t0));
     return (int)out.size();
