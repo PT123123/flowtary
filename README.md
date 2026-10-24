@@ -231,7 +231,11 @@ build\evtest.exe     :: Everything IPC 协议冒烟测试工具（控制台）
 
 ## d/f 搜索后端（不建全盘内存索引）
 
-方案名 **Flowtary Search**。防抖到期后**四层并行**，结果按全路径去重合并（先到先显示、流式上屏）：
+方案名 **Flowtary Search**。架构：**内存索引 + 磁盘索引宿主在独立守护进程
+`flowtary-search.exe --serve` 中**（TCP 127.0.0.1 行协议，单实例、空闲 30 分钟自动退出、
+崩溃不影响 flowtary）——任务管理器里 `flowtary.exe`（UI，约 25MB）与
+`flowtary-search.exe`（索引，约 45–85MB）分开计数，与 Everything 的对比一目了然，
+两者之和约 70–110MB。防抖到期后**四层并行**，结果按全路径去重合并（先到先显示、流式上屏）：
 
 | 层 | 原理 | 覆盖 | 延迟 | 内存 |
 | :--- | :--- | :--- | :--- | :--- |
