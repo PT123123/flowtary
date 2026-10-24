@@ -239,8 +239,8 @@ build\evtest.exe     :: Everything IPC 协议冒烟测试工具（控制台）
 
 | 层 | 原理 | 覆盖 | 延迟 | 内存 |
 | :--- | :--- | :--- | :--- | :--- |
-| ① 内存索引 | flowtary-search 全列用户常用目录 + 注册表 `IndexDirs` 附加目录建库，常驻内存 + ReadDirectoryChangesW 增量维护；磁盘缓存 `%LOCALAPPDATA%\Flowtary\memindex.dat` 重启即用 | 常用目录内**毫秒级** | 查询 10–30ms | ~45MB（16.3 万条，`FT_DF_MEMINDEX_MAX` 限上限） |
-| ② 磁盘索引 | flowtary-search 全盘遍历一次（空闲优先级）→ 小写化 UTF-8 路径 blob（`%LOCALAPPDATA%\Flowtary\diskindex.dat`，数百 MB 磁盘文件）→ mmap 只读 + 首字节 memchr 全 blob 扫描 | **全盘** | 20–40ms（暖） | **进程私有 ~0**（文件映射页可被系统回收） |
+| ① 内存索引 | flowtary-search 全列用户常用目录 + 注册表 `IndexDirs` 附加目录建库，常驻内存 + ReadDirectoryChangesW 增量维护（**增/删/改名事件即时入 RAM delta，查询时与池合并**——新文件含汉字名 2s 内拼音可搜）；磁盘缓存 `%LOCALAPPDATA%\Flowtary\memindex.dat` 重启即用 | 常用目录内**毫秒级** | 整链 **15–31ms**（饱和）；47–62ms（800 行排序候选窗大查询） | ~45MB（16.3 万条，档位可调） |
+| ② 磁盘索引 | flowtary-search 全盘遍历一次（空闲优先级）→ 小写化 UTF-8 路径 blob（`%LOCALAPPDATA%\Flowtary\diskindex.dat`，数百 MB 磁盘文件）→ mmap 只读 + 首字节 memchr 全 blob 扫描；命中经**目录级大小写缓存**还原真名（暖态零文件系统调用） | **全盘** | 扫描 **15ms**（暖） | **进程私有 ~0**（文件映射页可被系统回收；启动时空闲线程 PrefetchVirtualMemory 预取，首查免冷页） |
 | ③ flowtary-search 现查 | 随包 `flowtary-search.exe`（同目录或 PATH）现场并行遍历，**不建任何索引** | 全部固定盘 | 亚秒~8s | 查询瞬时，空闲 0 |
 | ④ Windows Search | OLE DB 查系统索引 `SystemIndex`（覆盖范围 = 系统「索引选项」） | 索引范围内 | 0.8–1.2s 暖查询 | 0（服务系统已有） |
 
@@ -258,10 +258,11 @@ build\evtest.exe     :: Everything IPC 协议冒烟测试工具（控制台）
   附加目录写注册表 `HKCU\Software\Flowtary\IndexDirs`（REG_SZ，每行一个路径，`#` 注释）。
 - **拼音搜索**（毫秒层独有）：含汉字的名字附存全拼，d/f 查询词条可按
   「原名子串 / 全拼子串 / 首字母子序列（≥2 字符）」命中——`wxcszt` 命中
-  `微信测试探针文档.txt`，`weixin` 同时命中 `微信支付…pdf` 与 `Weixin.exe`。
+  `微信测试探针文档.txt`，`weixin` 同时命中 `微信支付…pdf` 与 `Weixin.exe`；
+  新建中文文件经 delta 即时入库，**2 秒内拼音可搜**（无需等整根重建）。
   仅守护进程启用（复用主程序部署的 cpp-pinyin 词典，缺失时静默降级纯名字匹配）；
   转换成本实测 3.9µs/条，对建库时间的影响可忽略。缓存格式 `FTMEMINDEX4`
-  （旧格式缓存自动弃用重建一次）。详见 `docs/SEARCH_DAEMON_NOTES.md`。
+  （旧格式缓存自动弃用重建一次）。可在设置里关闭（省词典内存）。详见 `docs/SEARCH_DAEMON_NOTES.md`。
 - **磁盘索引**：全覆盖但按上述规则剪枝（junk 不进索引，建库时间与体积同步大降）；
   每盘根 ReadDirectoryChangesW → RAM 内 delta 表查询时合并，delta > 5 万条或缓存超 7 天
   自动后台重建（空闲优先级不干扰前台）。`FT_DF_DISKINDEX_MAX` 限条目数（默认 8000000）、
@@ -278,6 +279,11 @@ build\evtest.exe     :: Everything IPC 协议冒烟测试工具（控制台）
 - **后端切换**：设置 → 常规 → 「d/f 搜索后端」下拉——`新方案（内置索引 + fd）`（默认）/
   `Everything（旧链路）`。切到 Everything 时不再建任何索引（省 I/O），d/f 直接走
   Everything IPC（需 Everything 正在运行）；切回新方案时索引层惰性启动。
+- **索引档位（内存 ↔ 速度自选）**：设置 → 常规 → 「搜索索引档位」——
+  `极简`（不建索引，守护进程不驻留，查询实时 fd/WS，秒级）/ `轻量`（索引 ≤10 万条，低内存）/
+  `均衡`（默认，≤30 万 + 全盘 ≤800 万）/ `极速`（≤100 万 + ≤1600 万，大用户目录不截断）；
+  另有「拼音搜索」开关。守护进程自读注册表，**保存后下一次查询自动按新档重启生效**，
+  无需手动重启（值存 `HKCU\Software\Flowtary\DfIndexTier`/`DfPinyin`）。
 
 ## 性能 benchmark（2026-10-24 本机实测）
 
@@ -286,8 +292,8 @@ build\evtest.exe     :: Everything IPC 协议冒烟测试工具（控制台）
 
 | 场景 | ① 内存索引 | ② 磁盘索引 | ③ flowtary-search 现查 | ④ Windows 搜索 | Everything（对照） |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| 桌面/常用目录搜索 | **10–30ms** | 16–93ms | 26s+（8s 预算内部分结果） | — | 毫秒级 |
-| 全盘任意词搜索 | 范围外 | **20–40ms**（暖） | ≤8s 部分结果 | 0.8–1.2s | 毫秒级 |
+| 桌面/常用目录搜索 | **15–31ms** | 16–93ms | 26s+（8s 预算内部分结果） | — | 毫秒级 |
+| 全盘任意词搜索 | 范围外 | **15–47ms**（暖） | ≤8s 部分结果 | 0.8–1.2s | 毫秒级 |
 | 常驻内存 | ~45MB | **≈0**（文件映射页） | 0（查询瞬时 ~31MB） | 0（系统服务） | 257–270MB |
 | 建库成本 | 常用目录 ~65s 后台；重启缓存 0.5s 加载 | 全盘一次（空闲优先级后台） | 无 | 系统自己重建 | 秒级 MFT |
 | 新鲜度 | 实时（目录监听） | 实时（盘根监听 delta）+7 天重建 | 实时（现查） | 秒级（系统索引器） | 实时（USN） |
@@ -302,6 +308,29 @@ build\evtest.exe     :: Everything IPC 协议冒烟测试工具（控制台）
   0–5ms（拼音匹配后仍 <5ms）；磁盘层暖扫描 31–47ms（90MB blob）；守护进程重启后
   首查 200–500ms 为 mmap 页缓存回填，一次性成本，常驻后不复发。索引缓存落盘已改为
   「锁内快照 + 锁外写」，根增量重建不再卡查询。
+
+### 2026-10-25 五轮优化后（守护进程整链路实测，`wsquery --bench` 口径）
+
+同机同口径（Win11 · NVMe · Defender 开 · 内存索引 16.5 万条 + 全盘 blob 68 万条 / 90MB）。
+五轮优化 = 协议批量化、mem 饱和跳磁盘扫描、PrefetchVirtualMemory 冷页预热、目录级
+大小写还原缓存、mem 扫描 ASCII 快路径 + 词条折叠提升（完整记录见 `docs/SEARCH_DAEMON_NOTES.md`）。
+
+| 指标 | 优化前（10-24/25 上） | 优化后（10-25 下） | 说明 |
+| :--- | :--- | :--- | :--- |
+| 饱和查询（命中满 200 行） | 78–250ms | **15–31ms**（~10×） | mem 拿满即跳过磁盘 blob 扫描 + 协议整包一次 send |
+| 0 命中最坏（四层全扫） | ~250ms | **63ms** | mem 扫描 ASCII 快路径：31–47ms → 0–16ms |
+| 800 行排序候选窗大查询 | —（功能新增） | **暖 47–62ms**，冷 860ms 仅守护进程重启后首查 | 冷 = 目录级大小写缓存首次枚举，暖态零文件系统调用 |
+| 磁盘 blob 扫描（暖） | 31–47ms | **15ms** | 90MB memchr 单线程；冷首查 218–609ms 由 PrefetchVirtualMemory 预取挪到启动期 |
+| 每命中大小写还原 | GetLongPathNameW 6–8ms/次（Defender） | **~0（缓存命中）** | 按目录 FindFirstFileW 枚举一次整目录真名映射 + 进程级缓存 |
+| 协议开销 | 逐字节 recv + 逐条 send（一查上万次系统调用） | 请求/响应各一次 send + 4KB 缓冲行读 + TCP_NODELAY | 环回 Nagle+延迟 ACK 的百毫秒级 stall 一并消除 |
+| 新文件可搜（含拼音） | 等整根重建 ~113s | **2s 内**（delta 即时入库 + 即时转拼音） | 删除同样 2s 内生效 |
+| 排序候选窗 | 200 行遍历序 | 800 行（`test` 查询精确/前缀命中 53 → 393 个） | UI 质量排序 + 拼音档（与包含同分）+ 点击权重叠加 |
+| 守护进程内存 | ~45–85MB | 同级；**档位可调**（极简 ≈0 / 轻量 / 均衡 / 极速，设置里选） | 轻量档缓存加载实测 165,282 → 84,471 条 |
+
+> 测试方法：`build\wsquery.exe --bench N [--rows M] --mem 词`（守护进程整链路，
+> 客户端含连接/协议/解析）；`FT_DF_DEBUG=1` 起守护进程可看各层分解
+> （`[mems]`/`[disks]`/`[prefetch]`/`[case]`）。完整方法论与冒烟步骤见
+> `docs/SEARCH_DAEMON_NOTES.md` 第六节。
 
 ## Everything IPC 协议说明（现仅作全部后端不可用时的回退路径）
 
