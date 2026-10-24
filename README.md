@@ -231,14 +231,19 @@ build\evtest.exe     :: Everything IPC 协议冒烟测试工具（控制台）
 
 ## d/f 搜索后端（不建全盘内存索引）
 
-防抖到期后**四层并行**，结果按全路径去重合并（先到先显示、流式上屏）：
+方案名 **Flowtary Search**。防抖到期后**四层并行**，结果按全路径去重合并（先到先显示、流式上屏）：
 
 | 层 | 原理 | 覆盖 | 延迟 | 内存 |
 | :--- | :--- | :--- | :--- | :--- |
-| ① 内存索引 | fd 全列用户常用目录 + 注册表 `IndexDirs` 附加目录建库，常驻内存 + ReadDirectoryChangesW 增量维护；磁盘缓存 `%LOCALAPPDATA%\Flowtary\memindex.dat` 重启即用 | 常用目录内**毫秒级** | 查询 10–30ms | ~45MB（16.3 万条，`FT_DF_MEMINDEX_MAX` 限上限） |
-| ② 磁盘索引 | fd 全盘遍历一次（空闲优先级）→ 小写化 UTF-8 路径 blob（`%LOCALAPPDATA%\Flowtary\diskindex.dat`，数百 MB 磁盘文件）→ mmap 只读 + 首字节 memchr 全 blob 扫描 | **全盘** | 20–40ms（暖） | **进程私有 ~0**（文件映射页可被系统回收） |
-| ③ fd | 随包 `fd.exe`（同目录或 PATH）现场并行遍历，**不建任何索引** | 全部固定盘 | 亚秒~8s | 查询瞬时，空闲 0 |
+| ① 内存索引 | flowtary-search 全列用户常用目录 + 注册表 `IndexDirs` 附加目录建库，常驻内存 + ReadDirectoryChangesW 增量维护；磁盘缓存 `%LOCALAPPDATA%\Flowtary\memindex.dat` 重启即用 | 常用目录内**毫秒级** | 查询 10–30ms | ~45MB（16.3 万条，`FT_DF_MEMINDEX_MAX` 限上限） |
+| ② 磁盘索引 | flowtary-search 全盘遍历一次（空闲优先级）→ 小写化 UTF-8 路径 blob（`%LOCALAPPDATA%\Flowtary\diskindex.dat`，数百 MB 磁盘文件）→ mmap 只读 + 首字节 memchr 全 blob 扫描 | **全盘** | 20–40ms（暖） | **进程私有 ~0**（文件映射页可被系统回收） |
+| ③ flowtary-search 现查 | 随包 `flowtary-search.exe`（同目录或 PATH）现场并行遍历，**不建任何索引** | 全部固定盘 | 亚秒~8s | 查询瞬时，空闲 0 |
 | ④ Windows Search | OLE DB 查系统索引 `SystemIndex`（覆盖范围 = 系统「索引选项」） | 索引范围内 | 0.8–1.2s 暖查询 | 0（服务系统已有） |
+
+> 组件说明：`flowtary-search.exe` 即开源组件 [sharkdp/fd](https://github.com/sharkdp/fd) 10.5.0
+> 改名分发（MIT/Apache-2.0 双许可）——任务管理器里与 `flowtary.exe` 同族一目了然；
+> 查找顺序：同目录 `flowtary-search.exe` → 旧名 `fd.exe` → PATH。仅在查询/建库瞬间运行，
+> 空闲时无常驻进程。
 
 - **建库/遍历剪枝**（fd `-E`，目录级剪枝=整棵子树不进遍历）：点开头、node_modules、
   `__pycache__`、回收站（`$RECYCLE.BIN`/`RECYCLER`）、`System Volume Information`、
@@ -247,14 +252,14 @@ build\evtest.exe     :: Everything IPC 协议冒烟测试工具（控制台）
   首次建库 ~65s（后台，不阻塞②③），之后重启从缓存 0.5s 加载；
   `FT_DF_MEMINDEX_MAX` 调上限、`FT_DF_MEMINDEX_OFF=1` 关闭。
   附加目录写注册表 `HKCU\Software\Flowtary\IndexDirs`（REG_SZ，每行一个路径，`#` 注释）。
-- **磁盘索引**：与 Everything 同为全覆盖（含隐藏与 gitignore 产物，无剪枝）；
+- **磁盘索引**：全覆盖但按上述规则剪枝（junk 不进索引，建库时间与体积同步大降）；
   每盘根 ReadDirectoryChangesW → RAM 内 delta 表查询时合并，delta > 5 万条或缓存超 7 天
-  自动后台重建（IDLE 优先级不干扰前台）。`FT_DF_DISKINDEX_MAX` 限条目数（默认 8000000）、
+  自动后台重建（空闲优先级不干扰前台）。`FT_DF_DISKINDEX_MAX` 限条目数（默认 8000000）、
   `FT_DF_DISKINDEX_OFF=1` 关闭。
-- fd 三段预算（用户目录 2s → 全盘 → 路径兜底，总默认 8000ms，`FT_DF_FD_TIMEOUT_MS` 可调），
+- flowtary-search 三段预算（用户目录 2s → 全盘 → 路径兜底，总默认 8000ms，`FT_DF_FD_TIMEOUT_MS` 可调），
   超时终止保留部分结果；多词 AND（`--and`）、固定字符串、不分大小写；`-I` 不理会 gitignore。
 - ④ 的会话进程级缓存（provider/命令工厂只建一次）；失败自动降级。
-- 全部不可用（无缓存无 fd 无 WSearch）时回退旧 Everything IPC 链路；
+- 全部不可用（无缓存无 flowtary-search 无 WSearch）时回退旧 Everything IPC 链路；
   `FT_DF_DEBUG=1` 向 stderr 打印诊断。
 - 冒烟工具 `build\wsquery.exe`：`--check` 探测 / `--memstat`、`--diskstat` 索引状态 /
   `[-d] [-p] [--fd|--mem|--disk] 词…` 直查。
@@ -269,7 +274,7 @@ build\evtest.exe     :: Everything IPC 协议冒烟测试工具（控制台）
 口径：Win11 · NVMe SSD · Defender 实时防护开启 · 用户目录（桌面+文档等）约 54 万原始条目
 （剪枝后 16.3 万入内存索引）· 全盘数百万文件。所有延迟为「回车后出结果」口径，含防抖 120ms。
 
-| 场景 | ① 内存索引 | ② 磁盘索引 | ③ fd 现查 | ④ Windows 搜索 | Everything（对照） |
+| 场景 | ① 内存索引 | ② 磁盘索引 | ③ flowtary-search 现查 | ④ Windows 搜索 | Everything（对照） |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | 桌面/常用目录搜索 | **10–30ms** | 16–93ms | 26s+（8s 预算内部分结果） | — | 毫秒级 |
 | 全盘任意词搜索 | 范围外 | **20–40ms**（暖） | ≤8s 部分结果 | 0.8–1.2s | 毫秒级 |
@@ -279,7 +284,7 @@ build\evtest.exe     :: Everything IPC 协议冒烟测试工具（控制台）
 
 - flowtary 整体稳态私有内存 **54–72MB**（含 16.3 万条内存索引 + 程序缓存），对照
   Everything 常驻 257–270MB；全盘索引本体放磁盘（数百 MB 文件）不占进程内存。
-- fd 现查全盘走完实测 100s+（Defender 拖累每次目录枚举），因此只作 ≤8s 预算的兜底层；
+- flowtary-search 现查全盘走完实测 100s+（Defender 拖累每次目录枚举），因此只作 ≤8s 预算的兜底层；
   磁盘索引建库同受 Defender 影响（全盘一次约 0.5–1.5h，空闲优先级后台跑一次付清）。
 - Windows Search 的 0.8–1.2s 为暖查询（LIKE 前导通配线性扫描），prefix 场景可换
   CONTAINS 提速（后续项）。
@@ -347,7 +352,7 @@ OCR 链的依赖关系：`ImageReader` → `TinyOCR` + `Ling` → `yoga` + `Clip
 
 ## 已知限制
 
-- fd 现查受 deadline 截止（默认 5s）：全盘走不完时返回部分结果；要完整结果可设
+- flowtary-search 现查受 deadline 截止（默认 8s）：全盘走不完时返回部分结果；要完整结果可设
   `FT_DF_FD_TIMEOUT_MS=0`（走完全盘，本机实测约 100s+），或把常用目录加入系统索引范围
   让 ① 后端秒出。后续可启用 altsearch-scoped 缓存层（指定目录常驻小索引）补齐速度
 - 全屏独占程序中热键仍可响应，但焦点抢占可能被系统限制

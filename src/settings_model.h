@@ -176,7 +176,7 @@ inline std::vector<Option> LearnExpireOptions() {
             {L"180 天未使用即清理", 180}, {L"365 天未使用即清理", 365}};
 }
 inline std::vector<Option> DfBackendOptions() {
-    return {{L"新方案（内置索引 + fd）", 0}, {L"Everything（旧链路，需 Everything 运行）", 1}};
+    return {{L"内置搜索（Flowtary Search）", 0}, {L"Everything（旧链路，需 Everything 运行）", 1}};
 }
 inline std::vector<Option> ShellTypeOptions() {
     return {{L"命令提示符 (cmd)", 0}, {L"PowerShell", 1}, {L"Git Bash", 2}, {L"自定义…", 3}};

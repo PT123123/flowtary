@@ -29,8 +29,8 @@ if (Test-Path (Join-Path $src 'flowtary-settings.exe')) {
 Copy-Item (Join-Path $src 'filedlg_hook64.dll') (Join-Path $Dist 'filedlg_hook64.dll') -Force
 Copy-Item (Join-Path $src 'filedlg_hook32.dll') (Join-Path $Dist 'filedlg_hook32.dll') -Force
 Copy-Item (Join-Path $src 'filedlg_agent32.exe')(Join-Path $Dist 'filedlg_agent32.exe') -Force
-if (Test-Path (Join-Path $src 'fd.exe')) {
-    Copy-Item (Join-Path $src 'fd.exe') (Join-Path $Dist 'fd.exe') -Force  # d/f 搜索后端；缺失时 flowtary 自动回退
+if (Test-Path (Join-Path $src 'flowtary-search.exe')) {
+    Copy-Item (Join-Path $src 'flowtary-search.exe') (Join-Path $Dist 'flowtary-search.exe') -Force  # d/f 搜索组件（fd 改名分发）；缺失时 flowtary 自动回退
 }
 
 Write-Host ("[ok] {0}\flowtary-{1}.exe" -f $Dist, $ver)

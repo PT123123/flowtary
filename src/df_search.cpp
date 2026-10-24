@@ -388,15 +388,29 @@ int WindowsSearchQuery(const Query& q, bool pathMode, std::vector<Hit>& out) {
 }
 
 std::wstring FindFdExe() {
-    WCHAR self[MAX_PATH]{};
-    if (GetModuleFileNameW(nullptr, self, MAX_PATH)) {
-        std::wstring dir(self);
-        size_t p = dir.find_last_of(L"\\/");
-        std::wstring cand = (p == std::wstring::npos ? dir : dir.substr(0, p + 1)) + L"fd.exe";
-        if (GetFileAttributesW(cand.c_str()) != INVALID_FILE_ATTRIBUTES) return cand;
-    }
-    WCHAR found[MAX_PATH]{};
-    if (SearchPathW(nullptr, L"fd.exe", nullptr, MAX_PATH, found, nullptr) > 0) return found;
+    // 组件随包名为 flowtary-search.exe（fd 10.5.0 改名分发，MIT/Apache-2.0）：
+    // 任务管理器里与 flowtary.exe 同族一目了然；旧名 fd.exe 与 PATH 仍作兼容回退
+    auto tryLocate = [](const wchar_t* name, std::wstring& out) -> bool {
+        WCHAR self[MAX_PATH]{};
+        if (GetModuleFileNameW(nullptr, self, MAX_PATH)) {
+            std::wstring dir(self);
+            size_t p = dir.find_last_of(L"\\/");
+            std::wstring cand = (p == std::wstring::npos ? dir : dir.substr(0, p + 1)) + name;
+            if (GetFileAttributesW(cand.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                out = cand;
+                return true;
+            }
+        }
+        WCHAR found[MAX_PATH]{};
+        if (SearchPathW(nullptr, name, nullptr, MAX_PATH, found, nullptr) > 0) {
+            out = found;
+            return true;
+        }
+        return false;
+    };
+    std::wstring out;
+    if (tryLocate(L"flowtary-search.exe", out)) return out;
+    if (tryLocate(L"fd.exe", out)) return out;
     return L"";
 }
 
