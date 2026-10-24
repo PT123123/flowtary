@@ -81,4 +81,20 @@ bool DiskIndexReady();
 int  DiskIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD maxRows);
 size_t DiskIndexRecords();       // 条目数（诊断用）
 
+// ---- 搜索守护进程（Flowtary Search 服务）----
+// 内存索引 + 磁盘索引都驻留在 flowtary-search.exe --serve 进程内：
+// flowtary.exe 回归纯 UI（私有内存 ~25MB），索引内存（池 + blob 映射）记在
+// flowtary-search.exe 名下，任务管理器与 Everything 的对比一目了然。
+// 协议：TCP 127.0.0.1:47771（FT_DF_DAEMON_PORT 可覆盖），行式 UTF-8：
+//   C: "Q <isFile> <pathMode> <maxRows> <nwords> <nexcl>\n" + 词/排除词各一行
+//   S: "N <count>\n" + count 行 "<D|F><path>\n" + "END\n"
+//   C: "STAT\n" → S: "M <ready> <size>\nD <ready> <records>\nEND\n"
+// 守护进程单实例（互斥体），空闲 30 分钟自动退出（磁盘缓存仍在，重开秒级加载）；
+// 崩溃不影响 flowtary（查询失败自动落到 fd/WS 层，下次查询自动重拉守护进程）。
+// 守护进程服务主循环（flowtary-search --serve 进程入口调用，阻塞直至空闲退出）
+int SearchDaemonServe(const std::vector<std::wstring>& extraRoots);
+void SearchDaemonStart();        // 幂等：确保守护进程在跑（不在线则拉起，最多等 ~3s）
+bool SearchDaemonQuery(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD maxRows);
+bool SearchDaemonStat(int& memReady, int& memSize, int& diskReady, int& diskRecords);
+
 }  // namespace df

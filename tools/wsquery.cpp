@@ -51,16 +51,14 @@ int wmain(int argc, wchar_t** argv) {
         else if (!a.empty() && a[0] == L'-') { PrintLine(L"未知参数: " + a); return 2; }
         else q.words.push_back(a);
     }
-    if (memStat) {
-        df::MemIndexStart();
-        while (!df::MemIndexReady()) Sleep(200);
-        PrintLine(L"内存索引就绪，条目数: " + std::to_wstring((long long)df::MemIndexSize()));
-        return 0;
-    }
-    if (diskStat) {
-        df::DiskIndexStart();
-        while (!df::DiskIndexReady()) Sleep(500);   // 建库可达数分钟：等待（空闲优先级）
-        PrintLine(L"磁盘索引就绪，条目数: " + std::to_wstring((long long)df::DiskIndexRecords()));
+    if (memStat || diskStat) {
+        df::SearchDaemonStart();
+        int memReady = 0, memSize = 0, diskReady = 0, diskRecords = 0;
+        df::SearchDaemonStat(memReady, memSize, diskReady, diskRecords);
+        PrintLine(L"内存索引: " + std::wstring(memReady ? L"就绪，" : L"未就绪，") +
+                  std::to_wstring((long long)memSize) + L" 条");
+        PrintLine(L"磁盘索引: " + std::wstring(diskReady ? L"就绪，" : L"建库中/未就绪，") +
+                  std::to_wstring((long long)diskRecords) + L" 条");
         return 0;
     }
     if (check) {
@@ -74,32 +72,17 @@ int wmain(int argc, wchar_t** argv) {
         return 0;
     }
     if (q.words.empty()) {
-        PrintLine(L"用法: wsquery [-d] [-p] [--fd|--mem] [--bench N] 词1 词2 …（或 --check / --memstat）");
+        PrintLine(L"用法: wsquery [-d] [-p] [--fd|--mem|--disk] [--bench N] 词1 词2 …（或 --check / --memstat / --diskstat）");
         return 2;
     }
-    // --mem：内存索引（建库中会等待就绪）
-    if (useMem) {
-        df::MemIndexStart();
-        while (!df::MemIndexReady()) Sleep(200);
-        if (GetEnvironmentVariableW(L"FT_DF_DEBUG", nullptr, 0) > 0)
-            PrintLine(L"[dbg] ready, size=" + std::to_wstring((long long)df::MemIndexSize()));
-        std::vector<df::Hit> hits;
-        int n = df::MemIndexSearch(q, pathMode, hits, 50);
-        if (GetEnvironmentVariableW(L"FT_DF_DEBUG", nullptr, 0) > 0)
-            PrintLine(L"[dbg] searched n=" + std::to_wstring((long long)n));
-        PrintLine(L"内存索引命中 " + std::to_wstring((long long)n) + L" 条:");
-        for (const auto& h : hits)
-            PrintLine((h.isFolder ? L"[D] " : L"[F] ") + h.path);
-        return 0;
-    }
-    // --disk：磁盘索引（全盘 mmap 扫描；建库中会等就绪后查询）
-    if (useDisk) {
-        df::DiskIndexStart();
-        while (!df::DiskIndexReady()) Sleep(500);
+    // --mem / --disk：统一走守护进程（内存+磁盘索引合并结果，毫秒级）
+    if (useMem || useDisk) {
+        df::SearchDaemonStart();
         std::vector<df::Hit> hits;
         ULONGLONG t0 = GetTickCount64();
-        int n = df::DiskIndexSearch(q, pathMode, hits, 50);
-        PrintLine(L"磁盘索引命中 " + std::to_wstring((long long)n) + L" 条, " +
+        bool ok = df::SearchDaemonQuery(q, pathMode, hits, 50);
+        if (!ok) { PrintLine(L"守护进程查询失败（未在运行？）"); return 1; }
+        PrintLine(L"守护进程命中 " + std::to_wstring((long long)hits.size()) + L" 条, " +
                   std::to_wstring((long long)(GetTickCount64() - t0)) + L" ms:");
         for (const auto& h : hits)
             PrintLine((h.isFolder ? L"[D] " : L"[F] ") + h.path);

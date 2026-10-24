@@ -201,6 +201,12 @@ else()
   target_include_directories(wsquery PRIVATE src)
   target_link_libraries(wsquery PRIVATE ole32 shell32 uuid)
 
+  # 搜索守护进程：内存/磁盘索引宿主 + TCP 查询服务（flowtary-search --serve）
+  add_executable(flowtary-search tools/ft_search_main.cpp src/df_search.cpp)
+  set_target_properties(flowtary-search PROPERTIES OUTPUT_NAME flowtary-search)
+  target_include_directories(flowtary-search PRIVATE src)
+  target_link_libraries(flowtary-search PRIVATE ole32 shell32 uuid ws2_32 user32)
+
   add_library(filedlg_hook64 SHARED src/hookdlg.cpp)
   set_target_properties(filedlg_hook64 PROPERTIES
     OUTPUT_NAME filedlg_hook64

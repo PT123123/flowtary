@@ -6,6 +6,8 @@
 //   ② fd：单 exe 子进程，stdout 逐行解析；在途进程注册进 g_fdActive，
 //      CancelAll() 统一终止，保证同时最多一个 fd 在遍历。
 // ============================================================
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -31,6 +33,7 @@
 #include <vector>
 
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "shell32.lib")
 
 namespace df {
@@ -388,8 +391,8 @@ int WindowsSearchQuery(const Query& q, bool pathMode, std::vector<Hit>& out) {
 }
 
 std::wstring FindFdExe() {
-    // 组件随包名为 flowtary-search.exe（fd 10.5.0 改名分发，MIT/Apache-2.0）：
-    // 任务管理器里与 flowtary.exe 同族一目了然；旧名 fd.exe 与 PATH 仍作兼容回退
+    // 遍历器 fd.exe（sharkdp/fd 10.5.0 原名，MIT/Apache-2.0）：守护进程的建库/兜底趟
+    // 与 flowtary 的 fd 层都用它；只在遍历瞬间存在，任务管理器平时看不到
     auto tryLocate = [](const wchar_t* name, std::wstring& out) -> bool {
         WCHAR self[MAX_PATH]{};
         if (GetModuleFileNameW(nullptr, self, MAX_PATH)) {
@@ -409,7 +412,6 @@ std::wstring FindFdExe() {
         return false;
     };
     std::wstring out;
-    if (tryLocate(L"flowtary-search.exe", out)) return out;
     if (tryLocate(L"fd.exe", out)) return out;
     return L"";
 }
@@ -1537,6 +1539,312 @@ int DiskIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD 
         out.push_back({kv.first, kv.second});
     }
     return (int)out.size();
+}
+
+
+// ---------------- 搜索守护进程（内存/磁盘索引的宿主进程） ----------------
+// flowtary-search.exe --serve 常驻：持有内存索引池 + 磁盘 blob 映射 + 监听线程，
+// flowtary.exe 只做 TCP 客户端。索引内存全部记在守护进程名下（对比 Everything 一目了然）；
+// 守护进程崩溃/退出都不影响 flowtary（查询落 fd/WS 层，重拉守护进程秒级恢复）。
+
+namespace dfdaemon {
+
+constexpr u_long kDaemonPort = 47771;                     // FT_DF_DAEMON_PORT 可覆盖
+constexpr DWORD kDaemonIdleExitMs = 30ULL * 60 * 1000;    // 空闲 30 分钟自动退出（缓存已落盘）
+
+bool DaemonReadLine(SOCKET s, std::string& line) {
+    line.clear();
+    for (;;) {
+        char b = 0;
+        int n = recv(s, &b, 1, 0);
+        if (n <= 0) return false;
+        if (b == '\n') return true;
+        if (b == '\r') continue;
+        line += b;
+        if (line.size() > 4096) return false;   // 防御：单行异常超长
+    }
+}
+
+bool DaemonWriteLine(SOCKET s, const std::string& line) {
+    std::string out = line + "\n";
+    int n = send(s, out.data(), (int)out.size(), 0);
+    return n == (int)out.size();
+}
+
+u_long DaemonPort() {
+    wchar_t env[16]{};
+    if (GetEnvironmentVariableW(L"FT_DF_DAEMON_PORT", env, 16) > 0) {
+        u_long v = (u_long)_wtoi(env);
+        if (v || env[0] == L'0') return v;
+    }
+    return kDaemonPort;
+}
+
+}  // namespace
+
+// 单连接处理：读查询 → mem+disk 双搜合并去重 → 回 N/行/END
+void DaemonHandleConn(SOCKET s) {
+    DWORD rcvTo = 5000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rcvTo, sizeof(rcvTo));
+    std::string meta;
+    if (!dfdaemon::DaemonReadLine(s, meta)) return;
+    int isFile = 1, pathMode = 0, maxRows = 200, nwords = 0, nexcl = 0;
+    if (sscanf(meta.c_str(), "Q %d %d %d %d %d", &isFile, &pathMode, &maxRows, &nwords, &nexcl) != 5)
+        return;
+    if (nwords < 0 || nwords > 16 || nexcl < 0 || nexcl > 16 || maxRows < 1 || maxRows > 1000)
+        return;
+    Query q{};
+    q.isFile = isFile != 0;
+    auto readLines = [&](int n, std::vector<std::wstring>& out) {
+        for (int i = 0; i < n; ++i) {
+            std::string ln;
+            if (!dfdaemon::DaemonReadLine(s, ln)) return false;
+            out.push_back(Utf8ToWide(ln));
+        }
+        return true;
+    };
+    if (!readLines(nwords, q.words)) return;
+    if (!readLines(nexcl, q.excludes)) return;
+
+    std::vector<Hit> hits;
+    if (MemIndexSearch(q, false, hits, (DWORD)maxRows) == 0)
+        MemIndexSearch(q, true, hits, (DWORD)maxRows);           // 名字零命中 → 路径兜底
+    std::vector<Hit> diskHits;
+    if (DiskIndexSearch(q, false, diskHits, (DWORD)maxRows) == 0)
+        DiskIndexSearch(q, true, diskHits, (DWORD)maxRows);
+    // 合并去重（小写 UTF-8 键），mem 优先
+    std::unordered_set<std::string> seen;
+    std::vector<Hit> merged;
+    for (Hit& h : hits) {
+        if (!seen.insert(WideToUtf8(ToLower(h.path))).second) continue;
+        merged.push_back(std::move(h));
+        if (merged.size() >= (size_t)maxRows) break;
+    }
+    if (merged.size() < (size_t)maxRows) {
+        for (Hit& h : diskHits) {
+            if (!seen.insert(WideToUtf8(ToLower(h.path))).second) continue;
+            merged.push_back(std::move(h));
+            if (merged.size() >= (size_t)maxRows) break;
+        }
+    }
+
+    char head[64];
+    snprintf(head, sizeof(head), "N %d", (int)merged.size());
+    if (!dfdaemon::DaemonWriteLine(s, head)) return;
+    for (const auto& h : merged) {
+        std::string ln = h.isFolder ? "D" : "F";
+        ln += WideToUtf8(h.path);
+        if (!dfdaemon::DaemonWriteLine(s, ln)) return;
+    }
+    dfdaemon::DaemonWriteLine(s, "END");
+}
+
+namespace dfdaemon {
+
+void DaemonStatsReply(SOCKET s) {
+    int memReady = MemIndexReady() ? 1 : 0;
+    int memSize = (int)MemIndexSize();
+    int diskReady = DiskIndexReady() ? 1 : 0;
+    int diskRecords = (int)DiskIndexRecords();
+    char line[128];
+    snprintf(line, sizeof(line), "M %d %d", memReady, memSize);
+    DaemonWriteLine(s, line);
+    snprintf(line, sizeof(line), "D %d %d", diskReady, diskRecords);
+    DaemonWriteLine(s, line);
+    DaemonWriteLine(s, "END");
+}
+
+// 服务主循环：select 60s 超时轮转（统计空闲），空闲 30 分钟自动退出
+int Serve(const std::vector<std::wstring>& extraRoots) {
+    WSADATA wsa{};
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return 1;
+    SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (ls == INVALID_SOCKET) { WSACleanup(); return 1; }
+    BOOL reuse = TRUE;
+    setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons((u_short)DaemonPort());
+    if (bind(ls, (const sockaddr*)&addr, sizeof(addr)) != 0 ||
+        listen(ls, 4) != 0) {
+        closesocket(ls);
+        WSACleanup();
+        return 1;
+    }
+    MemIndexStart(extraRoots);
+    DiskIndexStart();
+
+    ULONGLONG lastActive = GetTickCount64();
+    for (;;) {
+        fd_set rs;
+        FD_ZERO(&rs);
+        FD_SET(ls, &rs);
+        timeval tv{60, 0};
+        int r = select((int)ls + 1, &rs, nullptr, nullptr, &tv);
+        if (r <= 0) {
+            if (GetTickCount64() - lastActive > kDaemonIdleExitMs) break;   // 空闲退出
+            continue;
+        }
+        sockaddr_in cli{};
+        int cl = sizeof(cli);
+        SOCKET cs = accept(ls, (sockaddr*)&cli, &cl);
+        if (cs == INVALID_SOCKET) continue;
+        lastActive = GetTickCount64();
+        DaemonHandleConn(cs);
+        lastActive = GetTickCount64();
+        closesocket(cs);
+    }
+    closesocket(ls);
+    WSACleanup();
+    return 0;
+}  // namespace dfdaemon
+}
+
+
+// 守护进程服务主循环入口（flowtary-search --serve 进程调用）
+int SearchDaemonServe(const std::vector<std::wstring>& extraRoots) {
+    return dfdaemon::Serve(extraRoots);
+
+}
+
+// 客户端：确保守护进程在线（不在线拉起同目录 flowtary-search.exe --serve 并等 ~3s）
+void SearchDaemonStart() {
+    int mr = 0, ms = 0, dr = 0, drs = 0;
+    if (SearchDaemonStat(mr, ms, dr, drs)) return;   // 已在线
+    WCHAR self[MAX_PATH]{};
+    if (!GetModuleFileNameW(nullptr, self, MAX_PATH)) return;
+    std::wstring dir(self);
+    size_t p = dir.find_last_of(L"\\/");
+    std::wstring exe = (p == std::wstring::npos ? dir : dir.substr(0, p + 1)) + L"flowtary-search.exe";
+    if (GetFileAttributesW(exe.c_str()) == INVALID_FILE_ATTRIBUTES) return;
+    std::wstring cmd = L"\"" + exe + L"\" --serve";
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE,
+                        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+        return;
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    for (int i = 0; i < 15; ++i) {   // 等 ~3s 就绪
+        Sleep(200);
+        if (SearchDaemonStat(mr, ms, dr, drs)) return;
+    }
+}
+
+// 客户端查询：连接 → 发协议 → 收结果。失败返回 false（调用方落 fd/WS 层）
+bool SearchDaemonQuery(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD maxRows) {
+    out.clear();
+    WSADATA wsa{};
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return false;
+    bool ok = false;
+    do {
+        SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (s == INVALID_SOCKET) break;
+        DWORD to = 3000;
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to, sizeof(to));
+        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&to, sizeof(to));
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = htons((u_short)dfdaemon::DaemonPort());
+        if (connect(s, (const sockaddr*)&addr, sizeof(addr)) != 0) { closesocket(s); break; }
+        auto wl = [&](const std::string& x) { return send(s, x.data(), (int)x.size(), 0) == (int)x.size(); };
+        auto wln = [&](const std::string& x) { return wl(x + "\n"); };
+        char head[80];
+        snprintf(head, sizeof(head), "Q %d %d %d %d %d", q.isFile ? 1 : 0, pathMode ? 1 : 0,
+                 (int)maxRows, (int)q.words.size(), (int)q.excludes.size());
+        if (!wln(head)) { closesocket(s); break; }
+        bool wok = true;
+        for (const auto& w : q.words)
+            if (!(wok = wl(WideToUtf8(w)))) break;
+        if (wok)
+            for (const auto& e : q.excludes)
+                if (!(wok = wl(WideToUtf8(e)))) break;
+        if (!wok) { closesocket(s); break; }
+
+        int n = 0;
+        {   // 读 "N count"
+            std::string acc;
+            bool lineOk = false;
+            for (;;) {
+                char b = 0;
+                int r = recv(s, &b, 1, 0);
+                if (r <= 0) break;
+                if (b == '\n') { lineOk = true; break; }
+                acc += b;
+                if (acc.size() > 64) break;
+            }
+            if (lineOk) (void)sscanf(acc.c_str(), "N %d", &n);
+            if (n < 0) n = 0;
+        }
+        int got = 0;
+        std::unordered_set<std::string> seen;
+        for (int i = 0; i < n && got < (int)maxRows; ++i) {
+            std::string ln;
+            std::string acc;
+            bool lineOk = false;
+            for (;;) {
+                char b = 0;
+                int r = recv(s, &b, 1, 0);
+                if (r <= 0) break;
+                if (b == '\n') { ln = acc; lineOk = true; break; }
+                acc += b;
+                if (acc.size() > 4096) break;
+            }
+            if (!lineOk || ln.size() < 2) continue;
+            bool isFolder = ln[0] == 'D';
+            std::wstring path = Utf8ToWide(ln.substr(1));
+            if (path.size() < 2) continue;
+            if (!seen.insert(ln.substr(1)).second) continue;
+            out.push_back({path, isFolder});
+            ++got;
+        }
+        ok = true;
+        closesocket(s);
+    } while (false);
+    WSACleanup();
+    return ok;
+}
+
+// 客户端状态查询（wsquery --memstat/--diskstat 用）
+bool SearchDaemonStat(int& memReady, int& memSize, int& diskReady, int& diskRecords) {
+    memReady = memSize = diskReady = diskRecords = 0;
+    WSADATA wsa{};
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return false;
+    bool ok = false;
+    do {
+        SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (s == INVALID_SOCKET) break;
+        DWORD to = 2000;
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to, sizeof(to));
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = htons((u_short)dfdaemon::DaemonPort());
+        if (connect(s, (const sockaddr*)&addr, sizeof(addr)) != 0) { closesocket(s); break; }
+        if (send(s, "STAT\n", 5, 0) != 5) { closesocket(s); break; }
+        std::string acc;
+        int lines = 0;
+        for (;;) {
+            char b = 0;
+            int r = recv(s, &b, 1, 0);
+            if (r <= 0) break;
+            if (b == '\n') {
+                if (lines == 0 && sscanf(acc.c_str(), "M %d %d", &memReady, &memSize) == 2) ++lines;
+                else if (lines == 1 && sscanf(acc.c_str(), "D %d %d", &diskReady, &diskRecords) == 2) ++lines;
+                acc.clear();
+                if (lines >= 2) { ok = true; break; }
+                continue;
+            }
+            acc += b;
+            if (acc.size() > 128) break;
+        }
+        closesocket(s);
+    } while (false);
+    WSACleanup();
+    return ok;
 }
 
 }  // namespace df

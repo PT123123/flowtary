@@ -1504,22 +1504,14 @@ static void DfWsWorker(DWORD gen, df::Query q) {
     PostDfReply(gen, BkWs, false, true, hits);
 }
 
-// 内存索引worker：常驻条目上毫秒级子串查询；名字零结果再查一次路径模式（同样毫秒级）
-static void DfMemWorker(DWORD gen, df::Query q) {
+// 守护进程 worker：内存+磁盘索引都在 flowtary-search --serve 进程内，一层查询全拿；
+// 名字零结果再查一次路径模式（同样毫秒级）。守护进程崩溃时查询失败 → fd/WS 层自然接管
+static void DfDaemonWorker(DWORD gen, df::Query q) {
     auto* hits = new std::vector<df::Hit>();
-    df::MemIndexSearch(q, false, *hits, 200);
-    if (hits->empty() && gen == g.dfGen)
-        df::MemIndexSearch(q, true, *hits, 200);
-    PostDfReply(gen, BkMem, false, true, hits);
-}
-
-// 磁盘索引worker：全盘 blob mmap 扫描（暖态 20-40ms）；名字零结果再查一次路径模式
-static void DfDiskWorker(DWORD gen, df::Query q) {
-    auto* hits = new std::vector<df::Hit>();
-    df::DiskIndexSearch(q, false, *hits, 200);
-    if (hits->empty() && gen == g.dfGen)
-        df::DiskIndexSearch(q, true, *hits, 200);
-    PostDfReply(gen, BkDisk, false, true, hits);
+    bool ok = df::SearchDaemonQuery(q, false, *hits, 200);
+    if (ok && hits->empty() && gen == g.dfGen)
+        df::SearchDaemonQuery(q, true, *hits, 200);
+    PostDfReply(gen, BkMem, ok ? FALSE : TRUE, true, hits);
 }
 
 static void DfFdWorker(DWORD gen, df::Query q, std::wstring fdExe, bool skipHidden, DWORD budget) {
@@ -1604,18 +1596,15 @@ static void StartDfSearch() {
     // 可用性探测不放在主线程（避免主线程碰 COM）；失败由 failed 回复在 handler 里落定
     const bool wsOk = g.dfWsAvail >= 0;
     const bool fdOk = !g.dfFdExe.empty();
-    g.dfMemDone = !df::MemIndexReady();
-    g.dfDiskDone = !df::DiskIndexReady();
+    g.dfMemDone = false;      // 守护层一批即收尾（失败时 fd 层兜底）
+    g.dfDiskDone = true;      // 磁盘索引已并入守护层
     g.dfWsDone = !wsOk;
     g.dfFdDone = !fdOk;
     g.dfBaseRows.clear();
-    if (!wsOk && !fdOk && g.dfMemDone && g.dfDiskDone) { ExecuteEverythingQuery(); return; }   // 全后端无：旧链路兜底
+    if (!wsOk && !fdOk && g.dfMemDone) { ExecuteEverythingQuery(); return; }   // 全后端无：旧链路兜底
     const df::Query q = g.dfQuery;
     const DWORD budget = df::DefaultFdDeadlineMs();
-    if (!g.dfMemDone)                                            // 内存索引就绪：毫秒级先出结果
-        std::thread(DfMemWorker, gen, q).detach();
-    if (!g.dfDiskDone)                                           // 磁盘索引就绪：全盘覆盖
-        std::thread(DfDiskWorker, gen, q).detach();
+    std::thread(DfDaemonWorker, gen, q).detach();
     if (wsOk) WsEnqueue(gen, q);
     if (fdOk) std::thread(DfFdWorker, gen, q, g.dfFdExe, g.skipDotFolders, budget).detach();
 }
@@ -2913,24 +2902,11 @@ static bool GetStartupEnabled() { return ft::StartupEnabled(); }
 
 static void SetStartup(bool on) { ft::SetStartupPath(GetExePath(), on); }
 
-// 内置索引层启动（幂等）：仅新方案模式需要；Everything 旧链路模式不建索引省 I/O，
+// 内置索引层守护进程（幂等）：仅新方案模式需要；Everything 旧链路模式不建索引省 I/O，
 // 设置里切回新方案时由设置应用路径惰性启动。
 static void StartIndexTiersIfNeeded() {
     if (g.dfBackend != 0) return;
-    {   // 注册表 IndexDirs：附加进毫秒层的目录（每行一个，# 为注释）
-        std::vector<std::wstring> extra;
-        std::wstring text = LoadRegText(L"IndexDirs");
-        size_t i = 0, n = text.size();
-        while (i < n) {
-            size_t j = text.find_first_of(L"\r\n", i);
-            if (j == std::wstring::npos) j = n;
-            std::wstring ln = TrimW(text.substr(i, j - i));
-            if (!ln.empty() && ln[0] != L'#') extra.push_back(ln);
-            i = j + 1;
-        }
-        df::MemIndexStart(extra);   // 后台建用户目录内存索引（桌面/文档等 + IndexDirs，毫秒级第一层）
-        df::DiskIndexStart();       // 全盘磁盘索引（磁盘文件，后台空闲优先级建库）
-    }
+    df::SearchDaemonStart();
 }
 
 // 设置项的唯一读法在 ft::Settings::Load()（settings_model.cpp）；这里只做
