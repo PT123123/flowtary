@@ -18,12 +18,14 @@ static void PrintLine(const std::wstring& w) {
     HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
     DWORD mode = 0;
     if (h && GetConsoleMode(h, &mode)) {
+        std::wstring out = w + L"\n";
         DWORD wr = 0;
-        WriteConsoleW(h, w.c_str(), (DWORD)w.size(), &wr, nullptr);
+        WriteConsoleW(h, out.c_str(), (DWORD)out.size(), &wr, nullptr);
     } else if (h) {
         int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
-        std::string s(n, '\0');
+        std::string s(n + 1, '\0');
         WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), s.data(), n, nullptr, nullptr);
+        s[n] = '\n';
         DWORD wr = 0;
         WriteFile(h, s.data(), (DWORD)s.size(), &wr, nullptr);
     }
@@ -79,21 +81,8 @@ int wmain(int argc, wchar_t** argv) {
         PrintLine(L"用法: wsquery [-d] [-p] [--fd|--mem|--disk] [--bench N] 词1 词2 …（或 --check / --memstat / --diskstat）");
         return 2;
     }
-    // --mem / --disk：统一走守护进程（内存+磁盘索引合并结果，毫秒级）
-    if (useMem || useDisk) {
-        df::SearchDaemonStart();
-        std::vector<df::Hit> hits;
-        ULONGLONG t0 = GetTickCount64();
-        bool ok = df::SearchDaemonQuery(q, pathMode, hits, 50);
-        if (!ok) { PrintLine(L"守护进程查询失败（未在运行？）"); return 1; }
-        PrintLine(L"守护进程命中 " + std::to_wstring((long long)hits.size()) + L" 条, " +
-                  std::to_wstring((long long)(GetTickCount64() - t0)) + L" ms:");
-        for (const auto& h : hits)
-            PrintLine((h.isFolder ? L"[D] " : L"[F] ") + h.path);
-        return 0;
-    }
-    // --bench N：同一进程内连查 N 次（会话缓存生效 = flowtary 常驻线程的暖查询表现），
-    // 打印每次耗时毫秒与命中数
+    // --bench N：同一进程内连查 N 次，打印每次耗时毫秒与命中数。
+    // 必须放在 --mem/--disk 单查分支之前——否则 mem 分支先 return，bench 永远不可达。
     if (bench > 0) {
         for (int i = 0; i < bench; ++i) {
             std::vector<df::Hit> hits;
@@ -115,8 +104,21 @@ int wmain(int argc, wchar_t** argv) {
             }
             PrintLine(L"第 " + std::to_wstring(i + 1) + L" 次: " +
                       std::to_wstring((long long)(GetTickCount64() - t0)) + L" ms, 命中 " +
-                      std::to_wstring((long long)n) + L" 条");
+                      std::to_wstring((long long)n) + L" 条\n");
         }
+        return 0;
+    }
+    // --mem / --disk：统一走守护进程（内存+磁盘索引合并结果，毫秒级）
+    if (useMem || useDisk) {
+        df::SearchDaemonStart();
+        std::vector<df::Hit> hits;
+        ULONGLONG t0 = GetTickCount64();
+        bool ok = df::SearchDaemonQuery(q, pathMode, hits, 50);
+        if (!ok) { PrintLine(L"守护进程查询失败（未在运行？）"); return 1; }
+        PrintLine(L"守护进程命中 " + std::to_wstring((long long)hits.size()) + L" 条, " +
+                  std::to_wstring((long long)(GetTickCount64() - t0)) + L" ms:\n");
+        for (const auto& h : hits)
+            PrintLine((h.isFolder ? L"[D] " : L"[F] ") + h.path + L"\n");
         return 0;
     }
     std::vector<df::Hit> hits;

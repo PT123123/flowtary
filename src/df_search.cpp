@@ -513,13 +513,24 @@ DWORD MemCap() {
 }
 
 // å¤§å°åä¸ææå­ä¸²æ¥æ¾ï¼æ´ç´ ç®æ³ï¼16 ä¸æ¡ç­å â æ¯æ¥è¯¢å æ¯«ç§ï¼æ é SIMDï¼
-const wchar_t* MemCaselessFind(const wchar_t* hay, const wchar_t* needle) {
-    if (!*needle) return hay;
+// ASCII 用内联折叠，仅非 ASCII 才调 towlower CRT——扫描热循环主体是 ASCII 路径，
+// 逐字符 CRT 调用曾占名字扫描的大头（165K 条 31ms → 快路径后约 1/10）。
+inline wchar_t MemFoldChar(wchar_t c) {
+    if (c < 0x80) return (c >= L'A' && c <= L'Z') ? (wchar_t)(c + 32) : c;
+    return (wchar_t)towlower(c);
+}
+
+// 在 hay（原名/拼音）里找已折叠词条 nf。词条折叠由查询入口做一次——这里若有
+// per-call 构造（此前版本），16 万次调用的堆分配会吃掉 ASCII 快路径的全部收益。
+const wchar_t* MemFindFolded(const wchar_t* hay, const std::wstring& nf) {
+    if (nf.empty()) return hay;
+    const size_t nl = nf.size();
     for (; *hay; ++hay) {
-        const wchar_t* h = hay;
-        const wchar_t* n = needle;
-        while (*h && *n && towlower(*h) == towlower(*n)) { ++h; ++n; }
-        if (!*n) return hay;
+        if (MemFoldChar(*hay) != nf[0]) continue;
+        const wchar_t* h = hay + 1;
+        size_t k = 1;
+        while (k < nl && *h && MemFoldChar(*h) == nf[k]) { ++h; ++k; }
+        if (k == nl) return hay;
         if (!*h) break;
     }
     return nullptr;
@@ -1025,7 +1036,12 @@ int MemIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD m
     const ULONGLONG t0 = GetTickCount64();
     std::vector<std::wstring> wl;
     wl.reserve(q.words.size());
-    for (const auto& w : q.words) wl.push_back(ToLower(w));
+    for (const auto& w : q.words) {   // 词条折叠一次（与 MemFoldChar 同规则，供 MemFindFolded）
+        std::wstring f;
+        f.reserve(w.size());
+        for (wchar_t c : w) f += MemFoldChar(c);
+        wl.push_back(std::move(f));
+    }
     std::lock_guard<std::mutex> lk(g_memMu);
     for (const auto& rd : g_memRoots) {
         for (size_t k = 0; k < rd.offs.size(); ++k) {
@@ -1039,12 +1055,12 @@ int MemIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD m
             bool ok = true;
             if (pathMode) {
                 for (const auto& w : wl)
-                    if (!MemCaselessFind(path, w.c_str())) { ok = false; break; }
+                    if (!MemFindFolded(path, w)) { ok = false; break; }
             } else {
                 for (const auto& w : wl) {
-                    if (MemCaselessFind(name, w.c_str())) continue;
+                    if (MemFindFolded(name, w)) continue;
                     if (py && *py) {   // 拼音匹配：全拼子串 或 首字母子序列（≥2 字符防噪声）
-                        if (MemCaselessFind(py, w.c_str())) continue;
+                        if (MemFindFolded(py, w)) continue;
                         if (w.size() >= 2 && MemIsSubsequence(py, w.c_str())) continue;
                     }
                     ok = false;
@@ -1412,6 +1428,8 @@ bool DiskMapExistingLocked() {
     return true;
 }
 
+void DiskPrefetchAsync();   // 定义在 DiskMaybeStartRebuild 之后（重建完成后新 blob 预热）
+
 unsigned __stdcall DiskBuildThread(void*) {
     auto dbg = [](const wchar_t* msg, unsigned long long v) {
         if (GetEnvironmentVariableW(L"FT_DF_DEBUG", nullptr, 0) > 0)
@@ -1516,6 +1534,7 @@ unsigned __stdcall DiskBuildThread(void*) {
             g_ovDel.clear();
         }
         dbg(L"mapped, ready:", g_diReady.load() ? 1 : 0);
+        if (g_diReady.load()) DiskPrefetchAsync();   // 新 blob 预热（避免重建完成后首查付冷页成本）
     } while (false);
     g_diRebuilding = false;
     return 0;
@@ -1523,9 +1542,39 @@ unsigned __stdcall DiskBuildThread(void*) {
 
 void DiskMaybeStartRebuild() {
     bool expect = false;
-    if (g_diRebuilding.compare_exchange_strong(expect, true)) {   // æ¢å°å¯å¨æï¼çº¿ç¨ç»ææ¶èªæ¸é¶ï¼
+    if (g_diRebuilding.compare_exchange_strong(expect, true)) {   // æ¢å°å¯å¨æï¼çº¿ç¨ç»ææ¶èªæ¸é¶ï¼
         CloseHandle((HANDLE)_beginthreadex(nullptr, 0, DiskBuildThread, nullptr, 0, nullptr));
     }
+}
+
+// 磁盘索引冷页预热：blob 是文件映射页，守护进程重启后首查要为页缓存回填付
+// 218-500ms（实测，docs/SEARCH_DAEMON_NOTES.md 三）。空闲优先级后台线程顺序读
+// 一遍索引文件——缓存管理器与映射视图共享同一批物理页，读文件即暖页，把这笔
+// 一次性成本挪到用户按键之前。启动映射就绪与重建完成两处调用。
+unsigned __stdcall DiskPrefetchThread(void* p) {
+    std::unique_ptr<std::wstring> path((std::wstring*)p);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
+    HANDLE h = CreateFileW(path->c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    const ULONGLONG t0 = GetTickCount64();
+    char buf[1 << 16];
+    DWORD got = 0;
+    while (ReadFile(h, buf, sizeof(buf), &got, nullptr) && got > 0) {
+        if (g_diQuit) break;
+    }
+    CloseHandle(h);
+    if (GetEnvironmentVariableW(L"FT_DF_DEBUG", nullptr, 0) > 0) {
+        fwprintf(stderr, L"[prefetch] ms=%llu\n", (unsigned long long)(GetTickCount64() - t0));
+        fflush(stderr);
+    }
+    return 0;
+}
+void DiskPrefetchAsync() {
+    std::wstring path = DiskCachePath();
+    if (path.empty()) return;
+    CloseHandle((HANDLE)_beginthreadex(nullptr, 0, DiskPrefetchThread,
+                                       new std::wstring(std::move(path)), 0, nullptr));
 }
 
 // æ¯çæ ¹ä¸ä¸ªçå¬çº¿ç¨ï¼åæ´è¿ RAM delta è¡¨ï¼æ¥è¯¢æ¶ä¸ blob åå¹¶ï¼
@@ -1557,7 +1606,9 @@ unsigned __stdcall DiskWatchThread(void* p) {
             const FILE_NOTIFY_INFORMATION* fni = (const FILE_NOTIFY_INFORMATION*)buf;
             for (;;) {
                 std::wstring rel(fni->FileName, fni->FileNameLength / sizeof(WCHAR));
-                std::wstring path = root + L"\\" + rel;
+                std::wstring path = root;
+                if (path.back() != L'\\') path += L'\\';   // 盘根自带尾分隔符（"C:\"），别再加成 "C:\\Users"
+                path += rel;
                 int isDir = -1;
                 if (fni->Action == FILE_ACTION_ADDED || fni->Action == FILE_ACTION_RENAMED_NEW_NAME) {
                     DWORD attr = GetFileAttributesW(path.c_str());   // æ éï¼ææ­»åªæä½æ¬çº¿ç¨
@@ -1609,6 +1660,7 @@ void DiskIndexStart() {
             }
         }
     }
+    if (g_diReady) DiskPrefetchAsync();   // 冷页预热：首查的 218-500ms 页缓存回填挪到后台
     if (!g_diReady) DiskMaybeStartRebuild();
     for (const auto& r : DriveRoots()) {
         CloseHandle((HANDLE)_beginthreadex(nullptr, 0, DiskWatchThread,
@@ -1744,6 +1796,44 @@ int DiskIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD 
     return (int)out.size();
 }
 
+// ---------------- 守护进程协议 I/O（客户端/服务端共用） ----------------
+// 逐字节 recv 在 200 行结果规模下是上万次系统调用（客户端读结果 + 服务端读词条
+// 各一遍），是小包扫描之外最大的延迟项——改为 4KB 块收、行从块里切。
+struct LineReader {
+    SOCKET s;
+    char buf[4096];
+    size_t pos = 0, len = 0;
+    explicit LineReader(SOCKET sock) : s(sock) {}
+    // 读一行（剥 \r\n）。对端断开/收包超时/超长（> maxLen）返回 false，
+    // line 保留已收到的部分（与原逐字节版语义一致）。
+    bool next(std::string& line, size_t maxLen = 4096) {
+        line.clear();
+        for (;;) {
+            while (pos < len) {
+                char b = buf[pos++];
+                if (b == '\n') return true;
+                if (b != '\r') line += b;
+                if (line.size() > maxLen) return false;
+            }
+            int n = recv(s, buf, sizeof(buf), 0);
+            if (n <= 0) return false;
+            pos = 0;
+            len = (size_t)n;
+        }
+    }
+};
+
+// 循环 send 直到收完（阻塞 socket 单次 send 可能只收一部分；对端断开返回 false）
+bool SendAll(SOCKET s, const char* p, int n) {
+    while (n > 0) {
+        int w = send(s, p, n, 0);
+        if (w <= 0) return false;
+        p += w;
+        n -= w;
+    }
+    return true;
+}
+
 
 // ---------------- æç´¢å®æ¤è¿ç¨ï¼åå­/ç£çç´¢å¼çå®¿ä¸»è¿ç¨ï¼ ----------------
 // flowtary-search.exe --serve å¸¸é©»ï¼ææåå­ç´¢å¼æ±  + ç£ç blob æ å° + çå¬çº¿ç¨ï¼
@@ -1754,25 +1844,6 @@ namespace dfdaemon {
 
 constexpr u_long kDaemonPort = 47771;                     // FT_DF_DAEMON_PORT å¯è¦ç
 constexpr DWORD kDaemonIdleExitMs = 30ULL * 60 * 1000;    // ç©ºé² 30 åéèªå¨éåºï¼ç¼å­å·²è½çï¼
-
-bool DaemonReadLine(SOCKET s, std::string& line) {
-    line.clear();
-    for (;;) {
-        char b = 0;
-        int n = recv(s, &b, 1, 0);
-        if (n <= 0) return false;
-        if (b == '\n') return true;
-        if (b == '\r') continue;
-        line += b;
-        if (line.size() > 4096) return false;   // é²å¾¡ï¼åè¡å¼å¸¸è¶é¿
-    }
-}
-
-bool DaemonWriteLine(SOCKET s, const std::string& line) {
-    std::string out = line + "\n";
-    int n = send(s, out.data(), (int)out.size(), 0);
-    return n == (int)out.size();
-}
 
 u_long DaemonPort() {
     wchar_t env[16]{};
@@ -1791,8 +1862,9 @@ void DaemonStatsReply(SOCKET s);   // 定义在下方第二个 dfdaemon 块（Da
 void DaemonHandleConn(SOCKET s) {
     DWORD rcvTo = 5000;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rcvTo, sizeof(rcvTo));
+    LineReader in(s);
     std::string meta;
-    if (!dfdaemon::DaemonReadLine(s, meta)) return;
+    if (!in.next(meta)) return;
     if (meta == "STAT") { dfdaemon::DaemonStatsReply(s); return; }   // 状态查询（此前漏接：STAT 永远无应答，客户端恒判守护进程离线）
     auto dbg = [](const char* m) {
         if (GetEnvironmentVariableW(L"FT_DF_DEBUG", nullptr, 0) > 0) {
@@ -1814,7 +1886,7 @@ void DaemonHandleConn(SOCKET s) {
     auto readLines = [&](int n, std::vector<std::wstring>& out) {
         for (int i = 0; i < n; ++i) {
             std::string ln;
-            if (!dfdaemon::DaemonReadLine(s, ln)) return false;
+            if (!in.next(ln)) return false;
             out.push_back(Utf8ToWide(ln));
         }
         return true;
@@ -1824,10 +1896,12 @@ void DaemonHandleConn(SOCKET s) {
 
     std::vector<Hit> hits;
     if (MemIndexSearch(q, false, hits, (DWORD)maxRows) == 0)
-        MemIndexSearch(q, true, hits, (DWORD)maxRows);           // åå­é¶å½ä¸­ â è·¯å¾ååº
+        MemIndexSearch(q, true, hits, (DWORD)maxRows);           // 名字零命中 → 路径兜底
     std::vector<Hit> diskHits;
-    if (DiskIndexSearch(q, false, diskHits, (DWORD)maxRows) == 0)
-        DiskIndexSearch(q, true, diskHits, (DWORD)maxRows);
+    if ((int)hits.size() < maxRows) {   // mem 已拿满：磁盘层条目合并时必然全部丢弃，跳过 90MB blob 扫描
+        if (DiskIndexSearch(q, false, diskHits, (DWORD)maxRows) == 0)
+            DiskIndexSearch(q, true, diskHits, (DWORD)maxRows);
+    }
     // åå¹¶å»éï¼å°å UTF-8 é®ï¼ï¼mem ä¼å
     std::unordered_set<std::string> seen;
     std::vector<Hit> merged;
@@ -1844,15 +1918,19 @@ void DaemonHandleConn(SOCKET s) {
         }
     }
 
+    // 响应整体拼一块一次 send：此前逐条 send（200 命中 = 200+ 小包）叠加客户端
+    // 逐字节 recv，是扫描之外最大的延迟项（扫描 35ms vs 整链 78-250ms）
+    std::string resp;
     char head[64];
-    snprintf(head, sizeof(head), "N %d", (int)merged.size());
-    if (!dfdaemon::DaemonWriteLine(s, head)) return;
+    snprintf(head, sizeof(head), "N %d\n", (int)merged.size());
+    resp += head;
     for (const auto& h : merged) {
-        std::string ln = h.isFolder ? "D" : "F";
-        ln += WideToUtf8(h.path);
-        if (!dfdaemon::DaemonWriteLine(s, ln)) return;
+        resp += h.isFolder ? 'D' : 'F';
+        resp += WideToUtf8(h.path);
+        resp += '\n';
     }
-    dfdaemon::DaemonWriteLine(s, "END");
+    resp += "END\n";
+    SendAll(s, resp.data(), (int)resp.size());
 }
 
 namespace dfdaemon {
@@ -1863,11 +1941,12 @@ void DaemonStatsReply(SOCKET s) {
     int diskReady = DiskIndexReady() ? 1 : 0;
     int diskRecords = (int)DiskIndexRecords();
     char line[128];
-    snprintf(line, sizeof(line), "M %d %d", memReady, memSize);
-    DaemonWriteLine(s, line);
-    snprintf(line, sizeof(line), "D %d %d", diskReady, diskRecords);
-    DaemonWriteLine(s, line);
-    DaemonWriteLine(s, "END");
+    snprintf(line, sizeof(line), "M %d %d\n", memReady, memSize);
+    std::string resp = line;
+    snprintf(line, sizeof(line), "D %d %d\n", diskReady, diskRecords);
+    resp += line;
+    resp += "END\n";
+    SendAll(s, resp.data(), (int)resp.size());
 }
 
 // æå¡ä¸»å¾ªç¯ï¼select 60s è¶æ¶è½®è½¬ï¼ç»è®¡ç©ºé²ï¼ï¼ç©ºé² 30 åéèªå¨éåº
@@ -1938,6 +2017,8 @@ int Serve(const std::vector<std::wstring>& extraRoots) {
         int cl = sizeof(cli);
         SOCKET cs = accept(ls, (sockaddr*)&cli, &cl);
         if (cs == INVALID_SOCKET) continue;
+        BOOL nd = 1;   // 环回上 Nagle+延迟 ACK 对小包可叠加出百毫秒级 stall；协议已是整包发送，关掉无副作用
+        setsockopt(cs, IPPROTO_TCP, TCP_NODELAY, (const char*)&nd, sizeof(nd));
         lastActive.store(GetTickCount64());
         auto* conn = new ConnTask{cs, &lastActive};
         HANDLE th = (HANDLE)_beginthreadex(nullptr, 0, ConnThreadProc, conn, 0, nullptr);
@@ -2010,52 +2091,44 @@ bool SearchDaemonQuery(const Query& q, bool pathMode, std::vector<Hit>& out, DWO
     do {
         SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (s == INVALID_SOCKET) { dbg(L"socket failed", 0); break; }
-        DWORD to = 30000;   // å¨ blob æ«æå¯è½ 1-3sãå·é¡µé¦æ¬¡æ´ä¹ï¼30s ä½é
+        DWORD to = 30000;   // å¨ blob æ«æå¯è½ 1-3sãå·é¡µé¦¬¬æ´ä¹ï¼30s ä½é
         setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to, sizeof(to));
         setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&to, sizeof(to));
+        BOOL nd = 1;
+        setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&nd, sizeof(nd));
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         addr.sin_port = htons((u_short)dfdaemon::DaemonPort());
         if (connect(s, (const sockaddr*)&addr, sizeof(addr)) != 0) { dbg(L"connect failed", WSAGetLastError()); closesocket(s); break; }
-        auto wl = [&](const std::string& x) { return send(s, x.data(), (int)x.size(), 0) == (int)x.size(); };
-        auto wln = [&](const std::string& x) { return wl(x + "\n"); };
+        // 请求一次 send（头 + 词条 + 排除词）：此前逐条小包 send，叠加服务端逐字节
+        // recv 是扫描之外最大的延迟项
+        std::string req;
         char head[80];
-        snprintf(head, sizeof(head), "Q %d %d %d %d %d", q.isFile ? 1 : 0, pathMode ? 1 : 0,
+        snprintf(head, sizeof(head), "Q %d %d %d %d %d\n", q.isFile ? 1 : 0, pathMode ? 1 : 0,
                  (int)maxRows, (int)q.words.size(), (int)q.excludes.size());
-        if (!wln(head)) { dbg(L"send head failed", WSAGetLastError()); closesocket(s); break; }
-        bool wok = true;
-        // 注意必须用 wln（带换行）：服务端按行读取词条。此前误用 wl（裸词无换行），
-        // 服务端等不到行尾、5s 超时后断连——守护进程查询路径自 f559492 起从未成功过，
-        // 所有查询都悄然回落 fd/WS 慢路径。
-        for (const auto& w : q.words)
-            if (!(wok = wln(WideToUtf8(w)))) break;
-        if (wok)
-            for (const auto& e : q.excludes)
-                if (!(wok = wln(WideToUtf8(e)))) break;
-        if (!wok) { dbg(L"send word failed", WSAGetLastError()); closesocket(s); break; }
+        req += head;
+        for (const auto& w : q.words) { req += WideToUtf8(w); req += '\n'; }
+        for (const auto& e : q.excludes) { req += WideToUtf8(e); req += '\n'; }
+        if (!SendAll(s, req.data(), (int)req.size())) {
+            dbg(L"send request failed", WSAGetLastError());
+            closesocket(s);
+            break;
+        }
 
+        // 整个响应用同一个 LineReader：缓冲式读取的块内数据跨行存活——
+        // 头部和结果行各建一个 reader 的话，头部 reader 析构时缓冲里已收到的
+        // 结果行会全部丢失（服务端整包 send 后，剩余数据只在对端 FIN 才醒）
+        LineReader in(s);
+        std::string acc;
         int n = -1;
-        std::string hdrAcc;
-        bool hdrLineOk = false;
-        {   // 读 "N count"。读不到合法头 = 协议错位/守护进程异常：整体按失败处理，
-            // 调用方落 fd/WS 兜底（原先把垃圾当 0 命中且 ok=true，兜底被吞）。
-            std::string acc;
-            for (;;) {
-                char b = 0;
-                int r = recv(s, &b, 1, 0);
-                if (r <= 0) break;
-                if (b == '\n') { hdrLineOk = true; break; }
-                acc += b;
-                if (acc.size() > 64) break;
-            }
-            hdrAcc = acc;
+        if (in.next(acc, 64)) {   // 读 "N count"。读不到合法头 = 协议错位/守护进程异常：整体按失败处理，
+                                  // 调用方落 fd/WS 兜底（原先把垃圾当 0 命中且 ok=true，兜底被吞）
             int v = -1;
-            if (hdrLineOk && sscanf(acc.c_str(), "N %d", &v) == 1 && v >= 0) n = v;
+            if (sscanf(acc.c_str(), "N %d", &v) == 1 && v >= 0) n = v;
         }
         if (n < 0) {
-            dbg(L"bad header, lineOk/bytes:",
-                (unsigned long long)(hdrLineOk ? 1000 : 0) + hdrAcc.size());
+            dbg(L"bad header, bytes:", acc.size());
             closesocket(s);
             break;   // ok 保持 false
         }
@@ -2063,17 +2136,8 @@ bool SearchDaemonQuery(const Query& q, bool pathMode, std::vector<Hit>& out, DWO
         std::unordered_set<std::string> seen;
         for (int i = 0; i < n && got < (int)maxRows; ++i) {
             std::string ln;
-            std::string acc;
-            bool lineOk = false;
-            for (;;) {
-                char b = 0;
-                int r = recv(s, &b, 1, 0);
-                if (r <= 0) break;
-                if (b == '\n') { ln = acc; lineOk = true; break; }
-                acc += b;
-                if (acc.size() > 4096) break;
-            }
-            if (!lineOk || ln.size() < 2) continue;
+            if (!in.next(ln)) break;   // 对端断开/超时：收多少算多少
+            if (ln.size() < 2) continue;
             bool isFolder = ln[0] == 'D';
             std::wstring path = Utf8ToWide(ln.substr(1));
             if (path.size() < 3 || path[1] != L':') continue;   // 守护进程只回 X:\ 绝对路径
