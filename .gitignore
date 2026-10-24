@@ -34,3 +34,6 @@ vendor/slint-cpp-1.18.1/
 vendor/UltraFastFileSearch/
 tools/build-fltk.log
 build-fltk.log
+
+# rustc-wrapper（废弃的 UFFS 实验构建产物）
+tools/rustc-wrapper/
