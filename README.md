@@ -17,7 +17,7 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
 | `d {关键词}` | 只搜**文件夹**，回车在资源管理器打开 |
 | （`f`/`d` 兜底） | 按名字搜不到任何结果时，自动改按**整条路径**逐词再搜一次，如 `d aw-qtui software` 命中 `C:\software\aw-qtui` |
 | （自学习） | 用 `f`/`d` 搜开（或普通搜索打开程序）并**成功打开**过的条目自动记忆（在 `%APPDATA%\Flowtary\learned` 生成 `.lnk` 快捷方式），下次搜同词/前缀词时无视 Everything/程序索引直接**置顶**，exe 优先、长期保留；参数见设置 `自学习` 页 |
-| （排除语法 `-关键词`） | 任意搜索输入里，**以 `-` 开头的词**表示「从结果中排除含该词的项目」，可与正向词混用：`chrome -portable`、`f 报告 -草稿`、`空格 w 浏览器 -无痕`。程序搜索按名称/路径/拼音过滤；`f`/`d` 翻成 Everything 原生 `!file:`/`!folder:` 索引侧排除；权重与自学习的记录 key 只取剥离排除词后的正向词 |
+| （排除语法 `-关键词`） | 任意搜索输入里，**以 `-` 开头的词**表示「从结果中排除含该词的项目」，可与正向词混用：`chrome -portable`、`f 报告 -草稿`、`空格 w 浏览器 -无痕`。程序搜索按名称/路径/拼音过滤，d/f 文件搜索按名称/拼音（全拼子串、首字母子序列）匹配；`f`/`d` 翻成 Everything 原生 `!file:`/`!folder:` 索引侧排除；权重与自学习的记录 key 只取剥离排除词后的正向词 |
 | `bd {q}` | 百度 `https://www.baidu.com/#ie=UTF-8&wd={q}` |
 | `bili {q}` | B站 `https://search.bilibili.com/all?keyword={q}` |
 | `xhs {q}` | 小红书 `https://www.xiaohongshu.com/search_result?keyword={q}` |
@@ -256,6 +256,12 @@ build\evtest.exe     :: Everything IPC 协议冒烟测试工具（控制台）
   首次建库 ~65s（后台，不阻塞②③），之后重启从缓存 0.5s 加载；
   `FT_DF_MEMINDEX_MAX` 调上限、`FT_DF_MEMINDEX_OFF=1` 关闭。
   附加目录写注册表 `HKCU\Software\Flowtary\IndexDirs`（REG_SZ，每行一个路径，`#` 注释）。
+- **拼音搜索**（毫秒层独有）：含汉字的名字附存全拼，d/f 查询词条可按
+  「原名子串 / 全拼子串 / 首字母子序列（≥2 字符）」命中——`wxcszt` 命中
+  `微信测试探针文档.txt`，`weixin` 同时命中 `微信支付…pdf` 与 `Weixin.exe`。
+  仅守护进程启用（复用主程序部署的 cpp-pinyin 词典，缺失时静默降级纯名字匹配）；
+  转换成本实测 3.9µs/条，对建库时间的影响可忽略。缓存格式 `FTMEMINDEX4`
+  （旧格式缓存自动弃用重建一次）。详见 `docs/SEARCH_DAEMON_NOTES.md`。
 - **磁盘索引**：全覆盖但按上述规则剪枝（junk 不进索引，建库时间与体积同步大降）；
   每盘根 ReadDirectoryChangesW → RAM 内 delta 表查询时合并，delta > 5 万条或缓存超 7 天
   自动后台重建（空闲优先级不干扰前台）。`FT_DF_DISKINDEX_MAX` 限条目数（默认 8000000）、
@@ -266,7 +272,7 @@ build\evtest.exe     :: Everything IPC 协议冒烟测试工具（控制台）
 - 全部不可用（无缓存无 flowtary-search 无 WSearch）时回退旧 Everything IPC 链路；
   `FT_DF_DEBUG=1` 向 stderr 打印诊断。
 - 冒烟工具 `build\wsquery.exe`：`--check` 探测 / `--memstat`、`--diskstat` 索引状态 /
-  `[-d] [-p] [--fd|--mem|--disk] 词…` 直查。
+  `[-d] [-p] [--fd|--mem|--disk] 词…` 直查 / `--bench N` 连查 N 次打印暖查询耗时。
 - **想让 Windows 自带搜索也变全盘**：设置 → 隐私和安全性 → 搜索 Windows →
   「查找我的文件」改为**增强**（系统索引服务自己重建，内存由系统服务承担，与 flowtary 无关）。
 - **后端切换**：设置 → 常规 → 「d/f 搜索后端」下拉——`新方案（内置索引 + fd）`（默认）/
@@ -292,6 +298,10 @@ build\evtest.exe     :: Everything IPC 协议冒烟测试工具（控制台）
   磁盘索引建库同受 Defender 影响（全盘一次约 0.5–1.5h，空闲优先级后台跑一次付清）。
 - Windows Search 的 0.8–1.2s 为暖查询（LIKE 前导通配线性扫描），prefix 场景可换
   CONTAINS 提速（后续项）。
+- **2026-10-25 补测**（`docs/SEARCH_DAEMON_NOTES.md` 有完整方法）：内存层扫描
+  0–5ms（拼音匹配后仍 <5ms）；磁盘层暖扫描 31–47ms（90MB blob）；守护进程重启后
+  首查 200–500ms 为 mmap 页缓存回填，一次性成本，常驻后不复发。索引缓存落盘已改为
+  「锁内快照 + 锁外写」，根增量重建不再卡查询。
 
 ## Everything IPC 协议说明（现仅作全部后端不可用时的回退路径）
 
