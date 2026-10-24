@@ -99,7 +99,14 @@ int wmain(int argc, wchar_t** argv) {
             std::vector<df::Hit> hits;
             ULONGLONG t0 = GetTickCount64();
             int n;
-            if (useFd) {
+            if (useMem || useDisk) {   // 守护进程层（内存+磁盘索引合并）
+                std::vector<df::Hit> dh;
+                if (!df::SearchDaemonQuery(q, pathMode, dh, 200)) {
+                    PrintLine(L"守护进程查询失败（未在运行？）");
+                    return 1;
+                }
+                n = (int)dh.size();
+            } else if (useFd) {
                 if (fdExe.empty()) fdExe = df::FindFdExe();
                 bool timedOut = false;
                 n = df::FdQuery(fdExe, q, pathMode, true, hits, df::DefaultFdDeadlineMs(), &timedOut);

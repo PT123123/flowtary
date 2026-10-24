@@ -618,6 +618,24 @@ bool MemIndexLoadLocked() {
 // ä¸å¸¦ -Iï¼å°é .gitignoreï¼build/dist ç­æªå¿½ç¥äº§ç©ä»å¥ç´¢å¼ï¼ã
 // fd å­è¿ç¨è¿è¡å¹¶æè¡æ¶éåå§è¾åºï¼UTF-8ãæ­£ææ ï¼ãä¸¤è¶å¼å»ºåºçå¬å±åºåº§ï¼
 // ä¸å¨è§£æå¾ªç¯éè° GetFileAttributesWââä¸ªå«ç¹æ®æä»¶åä¼è®©å®ææ­»ï¼Defender ç¯å¢ï¼ã
+// fd 遍历子进程统一挂 KILL_ON_JOB_CLOSE Job：宿主（守护进程/flowtary/wsquery）退出
+// 或被杀时，未完成的遍历一并终止，杜绝孤儿 walker 抢占磁盘 I/O。MemListRootFd 与
+// FdQuery 两条 spawn 路径都必须挂——此前只有 FdQuery 挂了，杀守护进程会留下孤儿 fd。
+// 返回进程级单例句柄（创建失败返回 nullptr，fd 照常运行）。
+static HANDLE InitFdWalkerJob() {
+    HANDLE job = CreateJobObjectW(nullptr, nullptr);
+    if (job) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jli{};
+        jli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(job, JobObjectExtendedLimitInformation, &jli, sizeof(jli));
+    }
+    return job;
+}
+static HANDLE FdWalkerJob() {
+    static HANDLE s_job = InitFdWalkerJob();   // C++11 魔法静态：并发初始化安全
+    return s_job;
+}
+
 bool FdCaptureLines(const std::wstring& fdExe, const std::wstring& args, DWORD deadlineMs,
                     std::vector<std::string>& lines) {
     lines.clear();
@@ -641,7 +659,8 @@ bool FdCaptureLines(const std::wstring& fdExe, const std::wstring& args, DWORD d
     if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
     if (!ok) { CloseHandle(hrd); return false; }
     CloseHandle(pi.hThread);
-    SetPriorityClass(pi.hProcess, BELOW_NORMAL_PRIORITY_CLASS);   // ç¥ä½äºåå°ï¼IDLE ä¼è¢«ç­å¾ä¸­çæ®éä¼åçº§çº¿ç¨é¥¿æ­»ï¼å®æµ 3.7s æå¨ vs 10min è¶æ¶ï¼
+    SetPriorityClass(pi.hProcess, BELOW_NORMAL_PRIORITY_CLASS);   // 略低于前台：IDLE 会被等待中的普通优先级线程饿死（实测 3.7s 手动 vs 10min 超时）
+    if (HANDLE job = FdWalkerJob()) AssignProcessToJobObject(job, pi.hProcess);
 
     char buf[262144];
     std::string acc;
@@ -733,13 +752,14 @@ unsigned __stdcall MemWatchThread(void* p) {
         DWORD bytes = 0;
         for (;;) {
             if (g_memQuit) break;
+            // 原地续挂（同句柄反复排队等待）：每批事件后 close+Sleep+reopen 的空窗期
+            // 内的变更会漏标脏。句柄失效（目录被删/重命名）才落到外层重开。
             if (!ReadDirectoryChangesW(h, buf, sizeof(buf), TRUE,
                                        FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME,
                                        &bytes, nullptr, nullptr))
                 break;
-            // åªè¦æäºä»¶å°±æ èï¼é²æç±ç»´æ¤çº¿ç¨åï¼ï¼ç¼å²åºæº¢åºåæ ·æ´ä½æ è
+            // 只要有事件就标脏（防抖由维护线程做）；缓冲区溢出同样整体标脏
             MemMarkDirty(idx);
-            break;
         }
         CloseHandle(h);
         if (g_memQuit) break;
@@ -796,10 +816,23 @@ unsigned __stdcall MemMaintThread(void*) {
 
 // å»ºåºçº¿ç¨ï¼åå è½½ç£çç¼å­ï¼éå¯å³æ¯«ç§çº§å¯ç¨ï¼ï¼åå°éæ ¹éå»ºââæ¯æ ¹æ«å®ç«å³æ¢å¥
 // ï¼ä¸åæ¶ææä¸¤ä»½å¨éæ± ï¼å³°å¼åå­ â å¨éæ±  + åæ ¹ï¼
+size_t MemIndexSizeLocked();   // 持 g_memMu 调用；定义在 MemIndexSize 处
+
 unsigned __stdcall MemBuildThread(void*) {
+    auto dbg = [](const wchar_t* m, unsigned long long v) {
+        if (GetEnvironmentVariableW(L"FT_DF_DEBUG", nullptr, 0) > 0) {
+            fwprintf(stderr, L"[mem] %s %llu\n", m, (unsigned long long)v);
+            fflush(stderr);
+        }
+    };
     {
         std::lock_guard<std::mutex> lk(g_memMu);
-        if (MemIndexLoadLocked()) g_memReady = true;   // ç¼å­å¯è½ç¥æ§ï¼åç¨ï¼éæ ¹å·æ°
+        if (MemIndexLoadLocked()) {
+            g_memReady = true;   // 缓存可能略旧：先用，逐根刷新
+            dbg(L"cache loaded, entries:", MemIndexSizeLocked());
+        } else {
+            dbg(L"cache load failed", 0);
+        }
     }
     std::wstring fdExe = FindFdExe();
     size_t total = 0;
@@ -807,9 +840,12 @@ unsigned __stdcall MemBuildThread(void*) {
         const size_t cap = MemCap();
         for (size_t i = 0; i < g_memRootNames.size() && total < cap; ++i) {
             if (g_memQuit) break;
+            const ULONGLONG t0 = GetTickCount64();
             MemRootData part;
             MemListRootFd(fdExe, g_memRootNames[i], cap - total, part);
             total += part.size();
+            dbg(L"root done:", ((unsigned long long)i << 32) | part.size());
+            dbg(L"root ms:", GetTickCount64() - t0);
             {
                 std::lock_guard<std::mutex> lk(g_memMu);
                 part.pool.shrink_to_fit();
@@ -823,6 +859,7 @@ unsigned __stdcall MemBuildThread(void*) {
             std::lock_guard<std::mutex> lk(g_memMu);
             MemIndexSaveLocked();
         }
+        dbg(L"build done, total:", total);
     }
     g_memReady = true;
     return 0;
@@ -855,11 +892,16 @@ void MemIndexStart(const std::vector<std::wstring>& extraRoots) {
 
 bool MemIndexReady() { return g_memReady.load(); }
 
-size_t MemIndexSize() {
-    std::lock_guard<std::mutex> lk(g_memMu);
+// 持 g_memMu 调用
+size_t MemIndexSizeLocked() {
     size_t n = 0;
     for (const auto& rd : g_memRoots) n += rd.size();
     return n;
+}
+
+size_t MemIndexSize() {
+    std::lock_guard<std::mutex> lk(g_memMu);
+    return MemIndexSizeLocked();
 }
 
 int MemIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD maxRows) {
@@ -890,8 +932,8 @@ int MemIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD m
             if (out.size() >= maxRows) break;
         }
         if (out.size() >= maxRows) break;
+    }
     return (int)out.size();
-}  // namespace
 }
 DWORD DefaultFdDeadlineMs() {
     wchar_t env[16]{};
@@ -1013,18 +1055,7 @@ int FdQuery(const std::wstring& fdExe, const Query& q, bool pathMode, bool skipH
     }
     // Jobï¼KILL_ON_JOB_CLOSEââå®¿ä¸»ï¼å®æ¤è¿ç¨/flowtary/wsqueryï¼éåºæè¢«ææ¶ï¼
     // æªå®æç fd éåä¸å¹¶ç»æ­¢ï¼æç»å­¤å¿ walker æ¢å ç£ç I/Oï¼å®æµ 6 ä¸ªå­¤å¿å¹¶åï¼
-    {
-        static HANDLE s_walkerJob = nullptr;   // è¿ç¨çº§åä¾ï¼éè¿ç¨å­æ´»
-        if (!s_walkerJob) {
-            s_walkerJob = CreateJobObjectW(nullptr, nullptr);
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION jli{};
-            jli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            if (s_walkerJob)
-                SetInformationJobObject(s_walkerJob, JobObjectExtendedLimitInformation,
-                                        &jli, sizeof(jli));
-        }
-        if (s_walkerJob) AssignProcessToJobObject(s_walkerJob, pi.hProcess);
-    }
+    if (HANDLE job = FdWalkerJob()) AssignProcessToJobObject(job, pi.hProcess);
     CloseHandle(pi.hThread);
     {
         std::lock_guard<std::mutex> lk(g_fdMutex);
@@ -1383,6 +1414,8 @@ unsigned __stdcall DiskWatchThread(void* p) {
         DWORD bytes = 0;
         for (;;) {
             if (g_diQuit) break;
+            // 原地续挂（同句柄反复排队等待）：每批事件后 close+Sleep(200)+reopen 的
+            // 空窗期内的事件会丢——磁盘索引靠 delta 表保新鲜度，丢了就是陈旧结果。
             if (!ReadDirectoryChangesW(h, buf, sizeof(buf), TRUE,
                                        FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME,
                                        &bytes, nullptr, nullptr))
@@ -1414,7 +1447,6 @@ unsigned __stdcall DiskWatchThread(void* p) {
             size_t ov = 0;
             { std::lock_guard<std::mutex> lk(g_ovMu); ov = g_ovAdd.size() + g_ovDel.size(); }
             if (ov > 50000 && !g_diRebuilding) DiskMaybeStartRebuild();   // delta å¤ªå¤§ï¼æ´ä½éå»º
-            break;
         }
         CloseHandle(h);
         if (g_diQuit) break;
@@ -1483,17 +1515,19 @@ int DiskIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD 
     for (const auto& e : q.excludes) ex.push_back(Utf8LowerAscii(WideToUtf8(e)));
 
     std::unordered_set<std::string> seen;              // å»éï¼fd å¯¹ junction å¯è½éå¤æä¸¾ï¼
-    std::lock_guard<std::mutex> lk(g_diMu);
-    if (!g_diView) return -1;
-    dbg(L"locked, size:", g_diSize);
-    const unsigned char* base = g_diView;
-    const unsigned long long total = g_diSize;
-    const std::string& w0 = wl[0];
-    const unsigned char c0 = (unsigned char)w0[0];
-    for (const unsigned char* p = base; out.size() < (size_t)maxRows; ++p) {
-        if ((unsigned long long)(p - base) + w0.size() > total) break;
-        p = (const unsigned char*)memchr(p, c0, (size_t)(total - (p - base)));
-        if (!p) break;
+    std::vector<std::pair<std::wstring, bool>> found;   // 锁内先收集小写路径
+    {   // GetLongPathNameW 属文件系统调用（个别路径会挂死），绝不持 g_diMu 调用
+        std::lock_guard<std::mutex> lk(g_diMu);
+        if (!g_diView) return -1;
+        dbg(L"locked, size:", g_diSize);
+        const unsigned char* base = g_diView;
+        const unsigned long long total = g_diSize;
+        const std::string& w0 = wl[0];
+        const unsigned char c0 = (unsigned char)w0[0];
+        for (const unsigned char* p = base; found.size() < (size_t)maxRows; ++p) {
+            if ((unsigned long long)(p - base) + w0.size() > total) break;
+            p = (const unsigned char*)memchr(p, c0, (size_t)(total - (p - base)));
+            if (!p) break;
         // åå¨è¯ memcmp ç¡®è®¤å½ä¸­ï¼å»ä»·ï¼ï¼ååéè¡é¦ï¼åéæ¯æ¯å½ä¸­æè´µçæä½ââ
         // é¦å­èå½ä¸­çæé«ï¼åç¡®è®¤å¯æåéæ¬¡æ°ä»æ°ç¾ä¸éå°å½ä¸­æ°ï¼
         if ((unsigned long long)(total - (p - base)) < w0.size()) break;
@@ -1531,10 +1565,17 @@ int DiskIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD 
             if (g_ovDel.count(path)) continue;
             if (g_ovAdd.count(path)) continue;
         }
-        // blob å­çæ¯å°åè·¯å¾ï¼è¿åçå®å¤§å°åï¼æä»¶å­å¨ï¼ä¸å­å¨æ¶ä¿çå°åï¼
+        found.push_back({std::move(path), isDir});
+        }
+    }   // g_diMu 释放
+    // blob 存的是小写路径：还原真实大小写（文件存在；不存在时保留小写）
+    for (auto& f : found) {
+        if (out.size() >= (size_t)maxRows) break;
         wchar_t longBuf[MAX_PATH * 2]{};
-        if (GetLongPathNameW(path.c_str(), longBuf, MAX_PATH * 2) > 0) path = longBuf;
-        out.push_back({path, isDir});
+        if (GetLongPathNameW(f.first.c_str(), longBuf, MAX_PATH * 2) > 0) f.first = longBuf;
+        for (auto& c : f.first)
+            if (c == L'/') c = L'\\';   // blob 存 fd 风格正斜杠：与其他层统一为反斜杠（UI 拆 title/sub、跨层去重都依赖）
+        out.push_back({std::move(f.first), f.second});
     }
     // å»ºåºåæ°å¢æ¡ç®ï¼RAM deltaï¼ï¼æ°éå°ï¼å®½å­ç¬¦çº¿æ§è¿æ»¤
     std::lock_guard<std::mutex> lk2(g_ovMu);
@@ -1608,6 +1649,8 @@ u_long DaemonPort() {
     return kDaemonPort;
 }
 
+void DaemonStatsReply(SOCKET s);   // 定义在下方第二个 dfdaemon 块（DaemonHandleConn 转 STAT 用）
+
 }  // namespace
 
 // åè¿æ¥å¤çï¼è¯»æ¥è¯¢ â mem+disk åæåå¹¶å»é â å N/è¡/END
@@ -1616,11 +1659,22 @@ void DaemonHandleConn(SOCKET s) {
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rcvTo, sizeof(rcvTo));
     std::string meta;
     if (!dfdaemon::DaemonReadLine(s, meta)) return;
+    if (meta == "STAT") { dfdaemon::DaemonStatsReply(s); return; }   // 状态查询（此前漏接：STAT 永远无应答，客户端恒判守护进程离线）
+    auto dbg = [](const char* m) {
+        if (GetEnvironmentVariableW(L"FT_DF_DEBUG", nullptr, 0) > 0) {
+            fwprintf(stderr, L"[conn] %hs\n", m);
+            fflush(stderr);
+        }
+    };
     int isFile = 1, pathMode = 0, maxRows = 200, nwords = 0, nexcl = 0;
-    if (sscanf(meta.c_str(), "Q %d %d %d %d %d", &isFile, &pathMode, &maxRows, &nwords, &nexcl) != 5)
+    if (sscanf(meta.c_str(), "Q %d %d %d %d %d", &isFile, &pathMode, &maxRows, &nwords, &nexcl) != 5) {
+        dbg("meta parse failed");
         return;
-    if (nwords < 0 || nwords > 16 || nexcl < 0 || nexcl > 16 || maxRows < 1 || maxRows > 1000)
+    }
+    if (nwords < 0 || nwords > 16 || nexcl < 0 || nexcl > 16 || maxRows < 1 || maxRows > 1000) {
+        dbg("meta validation failed");
         return;
+    }
     Query q{};
     q.isFile = isFile != 0;
     auto readLines = [&](int n, std::vector<std::wstring>& out) {
@@ -1683,6 +1737,20 @@ void DaemonStatsReply(SOCKET s) {
 }
 
 // æå¡ä¸»å¾ªç¯ï¼select 60s è¶æ¶è½®è½¬ï¼ç»è®¡ç©ºé²ï¼ï¼ç©ºé² 30 åéèªå¨éåº
+// 每连接一个短命线程的载体：SOCKET + 空闲计时指针（线程结束后刷新）
+struct ConnTask {
+    SOCKET s;
+    std::atomic<ULONGLONG>* lastActive;
+};
+
+unsigned __stdcall ConnThreadProc(void* p) {
+    std::unique_ptr<ConnTask> t((ConnTask*)p);
+    DaemonHandleConn(t->s);
+    closesocket(t->s);
+    t->lastActive->store(GetTickCount64());
+    return 0;
+}
+
 int Serve(const std::vector<std::wstring>& extraRoots) {
     WSADATA wsa{};
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return 1;
@@ -1718,7 +1786,10 @@ int Serve(const std::vector<std::wstring>& extraRoots) {
     MemIndexStart(extraRoots);
     DiskIndexStart();
 
-    ULONGLONG lastActive = GetTickCount64();
+    // 每连接一个短命线程：STAT/诊断连接不再排队在长查询（全 blob 扫描可达 1-3s+）
+    // 后面——否则 UI 线程的建库状态轮询会被 2s 收包超时整个卡住。连接间不共享
+    // 可变状态（并发保护在 MemIndexSearch/DiskIndexSearch 的内部锁），线程安全。
+    std::atomic<ULONGLONG> lastActive{GetTickCount64()};
     for (;;) {
         fd_set rs;
         FD_ZERO(&rs);
@@ -1726,18 +1797,23 @@ int Serve(const std::vector<std::wstring>& extraRoots) {
         timeval tv{60, 0};
         int r = select((int)ls + 1, &rs, nullptr, nullptr, &tv);
         if (r <= 0) {
-            if (GetTickCount64() - lastActive > kDaemonIdleExitMs) break;   // ç©ºé²éåº
+            if (GetTickCount64() - lastActive.load() > kDaemonIdleExitMs) break;   // 空闲退出
             continue;
         }
         sockaddr_in cli{};
         int cl = sizeof(cli);
         SOCKET cs = accept(ls, (sockaddr*)&cli, &cl);
         if (cs == INVALID_SOCKET) continue;
-        lastActive = GetTickCount64();
-        DaemonHandleConn(cs);
-        lastActive = GetTickCount64();
-        closesocket(cs);
+        lastActive.store(GetTickCount64());
+        auto* conn = new ConnTask{cs, &lastActive};
+        HANDLE th = (HANDLE)_beginthreadex(nullptr, 0, ConnThreadProc, conn, 0, nullptr);
+        if (th) CloseHandle(th);   // 关句柄只是解除持有，线程继续跑
+        else {                     // 线程创建失败：退回串行处理，连接不丢
+            DaemonHandleConn(cs);
+            closesocket(cs);
+        }
     }
+
     closesocket(ls);
     WSACleanup();
     return 0;
@@ -1751,10 +1827,19 @@ int SearchDaemonServe(const std::vector<std::wstring>& extraRoots) {
 
 }
 
-// å®¢æ·ç«¯ï¼ç¡®ä¿å®æ¤è¿ç¨å¨çº¿ï¼ä¸å¨çº¿æèµ·åç®å½ flowtary-search.exe --serve å¹¶ç­ ~3sï¼
+// 客户端：确保守护进程在线（不在线拉起同目录 flowtary-search.exe --serve 并等 ~1s）。
+// UI 线程逐键调用：限频 3s 一次，就绪等待 1s 封顶——起不来的病态场景不能把按键卡成秒级。
 void SearchDaemonStart() {
     int mr = 0, ms = 0, dr = 0, drs = 0;
-    if (SearchDaemonStat(mr, ms, dr, drs)) return;   // å·²å¨çº¿
+    if (SearchDaemonStat(mr, ms, dr, drs)) return;   // 已在线
+    // 拉起限频：exe 在但始终起不来时（端口被占/安全软件拦杀），每次按键都
+    // CreateProcess + 白等会把 UI 线程反复卡住——3s 内只拉起一次。
+    static std::atomic<ULONGLONG> s_lastSpawn{0};
+    const ULONGLONG nowTick = GetTickCount64();
+    ULONGLONG lastTick = s_lastSpawn.load(std::memory_order_relaxed);
+    if (lastTick != 0 && nowTick - lastTick < 3000) return;
+    if (!s_lastSpawn.compare_exchange_strong(lastTick, nowTick,
+                                             std::memory_order_relaxed)) return;
     WCHAR self[MAX_PATH]{};
     if (!GetModuleFileNameW(nullptr, self, MAX_PATH)) return;
     std::wstring dir(self);
@@ -1770,8 +1855,8 @@ void SearchDaemonStart() {
         return;
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
-    for (int i = 0; i < 15; ++i) {   // ç­ ~3s å°±ç»ª
-        Sleep(200);
+    for (int i = 0; i < 5; ++i) {   // 等 ~1s 就绪（bind 在建库线程之前，通常 ≤200ms）；
+        Sleep(200);                 // 首查没赶上也无妨：fd/WS 兜底，下次按键已在线
         if (SearchDaemonStat(mr, ms, dr, drs)) return;
     }
 }
@@ -1779,12 +1864,18 @@ void SearchDaemonStart() {
 // å®¢æ·ç«¯æ¥è¯¢ï¼è¿æ¥ â ååè®® â æ¶ç»æãå¤±è´¥è¿å falseï¼è°ç¨æ¹è½ fd/WS å±ï¼
 bool SearchDaemonQuery(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD maxRows) {
     out.clear();
+    auto dbg = [](const wchar_t* m, unsigned long long v) {
+        if (GetEnvironmentVariableW(L"FT_DF_DEBUG", nullptr, 0) > 0) {
+            fwprintf(stderr, L"[qcli] %s %llu\n", m, (unsigned long long)v);
+            fflush(stderr);
+        }
+    };
     WSADATA wsa{};
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return false;
     bool ok = false;
     do {
         SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (s == INVALID_SOCKET) break;
+        if (s == INVALID_SOCKET) { dbg(L"socket failed", 0); break; }
         DWORD to = 30000;   // å¨ blob æ«æå¯è½ 1-3sãå·é¡µé¦æ¬¡æ´ä¹ï¼30s ä½é
         setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to, sizeof(to));
         setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&to, sizeof(to));
@@ -1792,35 +1883,47 @@ bool SearchDaemonQuery(const Query& q, bool pathMode, std::vector<Hit>& out, DWO
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         addr.sin_port = htons((u_short)dfdaemon::DaemonPort());
-        if (connect(s, (const sockaddr*)&addr, sizeof(addr)) != 0) { closesocket(s); break; }
+        if (connect(s, (const sockaddr*)&addr, sizeof(addr)) != 0) { dbg(L"connect failed", WSAGetLastError()); closesocket(s); break; }
         auto wl = [&](const std::string& x) { return send(s, x.data(), (int)x.size(), 0) == (int)x.size(); };
         auto wln = [&](const std::string& x) { return wl(x + "\n"); };
         char head[80];
         snprintf(head, sizeof(head), "Q %d %d %d %d %d", q.isFile ? 1 : 0, pathMode ? 1 : 0,
                  (int)maxRows, (int)q.words.size(), (int)q.excludes.size());
-        if (!wln(head)) { closesocket(s); break; }
+        if (!wln(head)) { dbg(L"send head failed", WSAGetLastError()); closesocket(s); break; }
         bool wok = true;
+        // 注意必须用 wln（带换行）：服务端按行读取词条。此前误用 wl（裸词无换行），
+        // 服务端等不到行尾、5s 超时后断连——守护进程查询路径自 f559492 起从未成功过，
+        // 所有查询都悄然回落 fd/WS 慢路径。
         for (const auto& w : q.words)
-            if (!(wok = wl(WideToUtf8(w)))) break;
+            if (!(wok = wln(WideToUtf8(w)))) break;
         if (wok)
             for (const auto& e : q.excludes)
-                if (!(wok = wl(WideToUtf8(e)))) break;
-        if (!wok) { closesocket(s); break; }
+                if (!(wok = wln(WideToUtf8(e)))) break;
+        if (!wok) { dbg(L"send word failed", WSAGetLastError()); closesocket(s); break; }
 
-        int n = 0;
-        {   // è¯» "N count"
+        int n = -1;
+        std::string hdrAcc;
+        bool hdrLineOk = false;
+        {   // 读 "N count"。读不到合法头 = 协议错位/守护进程异常：整体按失败处理，
+            // 调用方落 fd/WS 兜底（原先把垃圾当 0 命中且 ok=true，兜底被吞）。
             std::string acc;
-            bool lineOk = false;
             for (;;) {
                 char b = 0;
                 int r = recv(s, &b, 1, 0);
                 if (r <= 0) break;
-                if (b == '\n') { lineOk = true; break; }
+                if (b == '\n') { hdrLineOk = true; break; }
                 acc += b;
                 if (acc.size() > 64) break;
             }
-            if (lineOk) (void)sscanf(acc.c_str(), "N %d", &n);
-            if (n < 0) n = 0;
+            hdrAcc = acc;
+            int v = -1;
+            if (hdrLineOk && sscanf(acc.c_str(), "N %d", &v) == 1 && v >= 0) n = v;
+        }
+        if (n < 0) {
+            dbg(L"bad header, lineOk/bytes:",
+                (unsigned long long)(hdrLineOk ? 1000 : 0) + hdrAcc.size());
+            closesocket(s);
+            break;   // ok 保持 false
         }
         int got = 0;
         std::unordered_set<std::string> seen;
@@ -1839,7 +1942,7 @@ bool SearchDaemonQuery(const Query& q, bool pathMode, std::vector<Hit>& out, DWO
             if (!lineOk || ln.size() < 2) continue;
             bool isFolder = ln[0] == 'D';
             std::wstring path = Utf8ToWide(ln.substr(1));
-            if (path.size() < 2) continue;
+            if (path.size() < 3 || path[1] != L':') continue;   // 守护进程只回 X:\ 绝对路径
             if (!seen.insert(ln.substr(1)).second) continue;
             out.push_back({path, isFolder});
             ++got;
