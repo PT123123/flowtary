@@ -55,10 +55,14 @@ int wmain(int argc, wchar_t** argv) {
         df::SearchDaemonStart();
         int memReady = 0, memSize = 0, diskReady = 0, diskRecords = 0;
         df::SearchDaemonStat(memReady, memSize, diskReady, diskRecords);
-        PrintLine(L"内存索引: " + std::wstring(memReady ? L"就绪，" : L"未就绪，") +
+        PrintLine(L"内存索引: " + std::wstring(memReady ? L"就绪，" : L"建库中，") +
                   std::to_wstring((long long)memSize) + L" 条");
-        PrintLine(L"磁盘索引: " + std::wstring(diskReady ? L"就绪，" : L"建库中/未就绪，") +
+        PrintLine(L"磁盘索引: " + std::wstring(diskReady ? L"就绪，" : L"建库中，") +
                   std::to_wstring((long long)diskRecords) + L" 条");
+        if (memReady && diskReady)
+            PrintLine(L"== 建库全部完成 ==");
+        else
+            PrintLine(L"== 建库进行中 ==");
         return 0;
     }
     if (check) {

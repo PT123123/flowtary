@@ -1589,6 +1589,7 @@ static void StartDfSearch() {
         return;
     }
     df::CancelAll();             // 上一代的 fd 若还在遍历：终止（保证同时最多一个 fd 在跑）
+    df::SearchDaemonStart();     // 守护进程不在线（崩溃/空闲退出）则自动重拉
     ++g.dfGen;
     const DWORD gen = g.dfGen;
     if (!g.dfFdLookedUp) { g.dfFdExe = df::FindFdExe(); g.dfFdLookedUp = true; }
