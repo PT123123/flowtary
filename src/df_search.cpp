@@ -441,8 +441,10 @@ void CancelAll() {
 // exe 同目录无 dict/（或转换失败）时保持空指针，功能静默降级为纯名字匹配。
 std::unique_ptr<Pinyin::Pinyin> g_py;
 std::mutex g_pyMu;   // 建库线程与维护线程可能并发转换
+bool g_dfPinyinEnabled = true;   // 设置「拼音搜索」开关（守护进程自读注册表；仅守护进程路径存在）
 
 void MemPinyinStart() {
+    if (!g_dfPinyinEnabled) return;
     if (g_py) return;
     WCHAR exePath[MAX_PATH]{};
     if (!GetModuleFileNameW(nullptr, exePath, MAX_PATH)) return;
@@ -763,20 +765,20 @@ bool MemIndexLoadLocked() {
         if (consumed) has = nextLine(line);
     }
     if (byRoot.empty()) return false;
-    size_t total = 0;
-    for (const auto& name : g_memRootNames) {
-        auto it = byRoot.find(ToLower(name));
-        if (it != byRoot.end()) total += it->second.size();
-    }
-    if (total == 0) return false;
     g_memRoots.clear();
     g_memRoots.reserve(g_memRootNames.size());
-    for (const auto& name : g_memRootNames) {   // æå½åæ ¹é¡ºåºå¯¹é½
+    size_t taken = 0;
+    const size_t cap = MemCap();   // 档位上限（环境变量已由 ApplyTierCaps 按注册表档位设好）
+    for (const auto& name : g_memRootNames) {   // 按当前根顺序对齐；超出档位上限的根不载入（重建同样受 cap 约束）
         auto it = byRoot.find(ToLower(name));
-        if (it != byRoot.end()) g_memRoots.push_back(std::move(it->second));
-        else g_memRoots.push_back(MemRootData{});
+        if (it != byRoot.end() && taken + it->second.size() <= cap) {
+            taken += it->second.size();
+            g_memRoots.push_back(std::move(it->second));
+        } else {
+            g_memRoots.push_back(MemRootData{});
+        }
     }
-    return true;
+    return taken > 0;
 }
 
 // fd å¨åä¸ä¸ªæ ¹ï¼æ¨¡å¼ . å¹éä»»æéç©ºåï¼ãåªæè§ AppendPruneArgsï¼
@@ -2092,6 +2094,8 @@ void DaemonStatsReply(SOCKET s);   // 定义在下方第二个 dfdaemon 块（Da
 
 }  // namespace
 
+bool DfTierChanged();   // 定义在 SearchDaemonServe 前（连接入口/轮询检测设置档位变更）
+
 // åè¿æ¥å¤çï¼è¯»æ¥è¯¢ â mem+disk åæåå¹¶å»é â å N/è¡/END
 void DaemonHandleConn(SOCKET s) {
     DWORD rcvTo = 5000;
@@ -2099,6 +2103,10 @@ void DaemonHandleConn(SOCKET s) {
     LineReader in(s);
     std::string meta;
     if (!in.next(meta)) return;
+    if (DfTierChanged()) {   // 设置档位/拼音开关变了：本进程退出，主程序下轮查询按新档重拉
+        SendAll(s, "BYE\n", 4);
+        exit(0);
+    }
     if (meta == "STAT") { dfdaemon::DaemonStatsReply(s); return; }   // 状态查询（此前漏接：STAT 永远无应答，客户端恒判守护进程离线）
     auto dbg = [](const char* m) {
         if (GetEnvironmentVariableW(L"FT_DF_DEBUG", nullptr, 0) > 0) {
@@ -2244,6 +2252,7 @@ int Serve(const std::vector<std::wstring>& extraRoots) {
         timeval tv{60, 0};
         int r = select((int)ls + 1, &rs, nullptr, nullptr, &tv);
         if (r <= 0) {
+            if (DfTierChanged()) break;   // 设置变更：退出，等主程序按新档重拉
             if (GetTickCount64() - lastActive.load() > kDaemonIdleExitMs) break;   // 空闲退出
             continue;
         }
@@ -2271,7 +2280,58 @@ int Serve(const std::vector<std::wstring>& extraRoots) {
 
 
 // å®æ¤è¿ç¨æå¡ä¸»å¾ªç¯å¥å£ï¼flowtary-search --serve è¿ç¨è°ç¨ï¼
+// ---------------- 搜索索引档位（设置「常规」页，内存 ↔ 速度权衡） ----------------
+// 守护进程自己读注册表（HKCU\Software\Flowtary\DfIndexTier / DfPinyin）：
+// 设置保存后无需主程序传递——任一查询连接或 60s 轮询发现变更即退出，
+// 主程序下轮查询自动以新档拉起（SearchDaemonStart 拉起限频 3s 兜底）。
+struct DfTierConfig {
+    int tier = 2;        // 0=极简 1=轻量 2=均衡 3=极速
+    bool pinyin = true;
+};
+DfTierConfig DfTierFromReg() {
+    DfTierConfig c;
+    DWORD v = 0, sz = sizeof(v);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"DfIndexTier",
+                     RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS && v <= 3)
+        c.tier = (int)v;
+    sz = sizeof(v);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"DfPinyin",
+                     RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS)
+        c.pinyin = v != 0;
+    return c;
+}
+
+// 档位 → 索引条目上限（MemCap/DiskCap 读环境变量）。必须在建库启动之前调用。
+void ApplyTierCaps(int tier) {
+    const wchar_t* mem = L"300000";
+    const wchar_t* disk = L"8000000";
+    if (tier == 1) { mem = L"100000"; disk = L"2000000"; }
+    else if (tier == 3) { mem = L"1000000"; disk = L"16000000"; }
+    SetEnvironmentVariableW(L"FT_DF_MEMINDEX_MAX", mem);
+    SetEnvironmentVariableW(L"FT_DF_DISKINDEX_MAX", disk);
+}
+
+// 与启动基线相比档位/拼音开关是否变化（首次调用登记基线）。
+bool DfTierChanged() {
+    static int s_tier = -1;
+    static bool s_pinyin = false;
+    DfTierConfig c = DfTierFromReg();
+    if (s_tier < 0) {
+        s_tier = c.tier;
+        s_pinyin = c.pinyin;
+        return false;
+    }
+    if (c.tier == s_tier && c.pinyin == s_pinyin) return false;
+    s_tier = c.tier;
+    s_pinyin = c.pinyin;
+    return true;
+}
+
 int SearchDaemonServe(const std::vector<std::wstring>& extraRoots) {
+    DfTierConfig cfg = DfTierFromReg();
+    if (cfg.tier == 0) return 0;   // 极简档：不建索引不驻留（fd/WS 实时兜底）
+    ApplyTierCaps(cfg.tier);
+    g_dfPinyinEnabled = cfg.pinyin;
     MemPinyinStart();   // 毫秒层拼音索引（exe 同目录无 dict/ 时静默降级为纯名字匹配）
     return dfdaemon::Serve(extraRoots);
 }

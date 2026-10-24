@@ -172,6 +172,7 @@ static ipc::Preview MakePreview() {
     p.skipDotFolders = g_s.skipDotFolders ? TRUE : FALSE;
     p.fdjEnabled = g_s.fdjEnabled ? TRUE : FALSE;
     p.dfBackend = g_s.dfBackend;
+    p.dfIndexTier = g_s.dfIndexTier;
     p.weightEnabled = g_s.weightEnabled ? TRUE : FALSE;
     p.weightFlush = g_s.weightFlush;
     p.weightMaxEntries = g_s.weightMaxEntries;
@@ -792,7 +793,14 @@ static void BuildTabGeneral() {
     AddChoiceRow(p, 78, L"唤醒位置：", ft::CenterWakeOptions(), &g_s.centerWake);
     AddCheck(p, 0, 116, kPW, L"文件对话框跳转（在文件对话框中直接定位文件夹）", &g_s.fdjEnabled);
     AddChoiceRow(p, 150, L"d/f 搜索后端：", ft::DfBackendOptions(), &g_s.dfBackend);
-    AddHint(p, 0, 184, kPW, 46,
+    AddChoiceRow(p, 184, L"搜索索引档位：", ft::DfIndexTierOptions(), &g_s.dfIndexTier);
+    AddCheck(p, 0, 218, kPW, L"拼音搜索（汉字文件名按全拼或首字母检索，如 wxcs → 微信测试）",
+             &g_s.dfPinyin);
+    AddHint(p, 0, 244, kPW, 60,
+            L"索引档位是「内存 ↔ 速度」的权衡：极简=不建索引每次实时搜（秒级、守护进程不驻留）；"
+            L"轻量/均衡/极速逐级加大索引覆盖（毫秒级），内存占用随之上升。\n"
+            L"两项仅对内置搜索生效；保存后守护进程自动按新档重启（首次切档需重新建库）。");
+    AddHint(p, 0, 308, kPW, 46,
             L"d/f 搜索后端：新方案=内置索引+fd（不依赖 Everything，后台自动建索引）；"
             L"Everything=旧链路（需 Everything 正在运行）。\n"
             L"唤起快捷键（Alt+Space）在托盘菜单里开关；结果项快捷键改动立即生效。");

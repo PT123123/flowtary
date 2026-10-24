@@ -239,6 +239,7 @@ struct App {
     // 路径中任一层名以 '.' 开头（目录 .git / .vscode，或文件 .gitignore）即过滤该行。
     bool skipDotFolders = true;
     int dfBackend = 0;          // d/f 搜索后端：0=新方案（内置索引） 1=Everything 旧链路（设置「常规」页）
+    int dfIndexTier = 2;        // 搜索索引档位：0=极简（不建索引，fd/WS 实时兜底）3=极速
     int indexMemReady = -1;     // 守护进程索引状态（-1=未知 0=建库中 1=就绪），托盘提示与 d/f 提示行用
     int indexDiskReady = -1;
     bool fdjEnabled = true;    // 文件对话框跳转总开关（默认开；UI 在设置「常规」Tab，不再放托盘菜单）
@@ -1593,7 +1594,8 @@ static void StartDfSearch() {
         return;
     }
     df::CancelAll();             // 上一代的 fd 若还在遍历：终止（保证同时最多一个 fd 在跑）
-    df::SearchDaemonStart();     // 守护进程不在线（崩溃/空闲退出）则自动重拉
+    const bool daemonLayer = g.dfIndexTier > 0;   // 极简档：无守护层，fd/WS 实时兜底
+    if (daemonLayer) df::SearchDaemonStart();     // 守护进程不在线（崩溃/空闲退出）则自动重拉
     ++g.dfGen;
     const DWORD gen = g.dfGen;
     if (!g.dfFdLookedUp) { g.dfFdExe = df::FindFdExe(); g.dfFdLookedUp = true; }
@@ -1601,15 +1603,15 @@ static void StartDfSearch() {
     // 可用性探测不放在主线程（避免主线程碰 COM）；失败由 failed 回复在 handler 里落定
     const bool wsOk = g.dfWsAvail >= 0;
     const bool fdOk = !g.dfFdExe.empty();
-    g.dfMemDone = false;      // 守护层一批即收尾（失败时 fd 层兜底）
-    g.dfDiskDone = true;      // 磁盘索引已并入守护层
+    g.dfMemDone = !daemonLayer;   // 守护层一批即收尾（失败时 fd 层兜底）；极简档无守护层
+    g.dfDiskDone = true;          // 磁盘索引已并入守护层
     g.dfWsDone = !wsOk;
     g.dfFdDone = !fdOk;
     g.dfBaseRows.clear();
     if (!wsOk && !fdOk && g.dfMemDone) { ExecuteEverythingQuery(); return; }   // 全后端无：旧链路兜底
     const df::Query q = g.dfQuery;
     const DWORD budget = df::DefaultFdDeadlineMs();
-    std::thread(DfDaemonWorker, gen, q).detach();
+    if (daemonLayer) std::thread(DfDaemonWorker, gen, q).detach();
     if (wsOk) WsEnqueue(gen, q);
     if (fdOk) std::thread(DfFdWorker, gen, q, g.dfFdExe, g.skipDotFolders, budget).detach();
 }
@@ -1660,7 +1662,8 @@ static void RenderDfResults() {
     // f/d 自学习置顶（与 Everything 展示路径同一套：摘出与结果重复的学习行后插到最前）
     PrependLearnedRows(g.evTermKey);
     // 守护进程索引建库中：结果行尾部挂一条状态提示（完成后自动消失）
-    bool indexBuilding = g.dfBackend == 0 && (g.indexMemReady == 0 || g.indexDiskReady == 0);
+    bool indexBuilding = g.dfBackend == 0 && g.dfIndexTier > 0 &&
+                    (g.indexMemReady == 0 || g.indexDiskReady == 0);   // 极简档无索引不提示
     if (g.items.empty()) {
         if (indexBuilding)
             AddHint(L"索引建库中…完成后 d/f 全盘毫秒级（当前由 fd 兜底，结果偏少属正常）");
@@ -2766,8 +2769,9 @@ static std::wstring TrayTipText() {
     std::wstring tip = g.startingUp ? L"Flowtary — 正在启动中…"
                                     : (g.hotkeyWake ? (L"Flowtary — " + g.hotkeyName + L" 唤出")
                                                     : L"Flowtary — 左键点击唤出");
-    // 索引建库中：托盘提示常驻可见（完成即自动消失，无需用户查询）
-    if (g.dfBackend == 0 && (g.indexMemReady == 0 || g.indexDiskReady == 0))
+    // 索引建库中：托盘提示常驻可见（完成即自动消失，无需用户查询；极简档无索引不提示）
+    if (g.dfBackend == 0 && g.dfIndexTier > 0 &&
+        (g.indexMemReady == 0 || g.indexDiskReady == 0))
         tip += L"（索引建库中…）";
     std::wstring ver;
     for (const char* p = FT_VER_DOT; *p; ++p) ver += (wchar_t)(unsigned char)*p;
@@ -2921,10 +2925,11 @@ static bool GetStartupEnabled() { return ft::StartupEnabled(); }
 
 static void SetStartup(bool on) { ft::SetStartupPath(GetExePath(), on); }
 
-// 内置索引层守护进程（幂等）：仅新方案模式需要；Everything 旧链路模式不建索引省 I/O，
-// 设置里切回新方案时由设置应用路径惰性启动。
+// 内置索引层守护进程（幂等）：仅新方案模式且非极简档需要；Everything 旧链路或
+// 极简档不建索引省内存省 I/O，设置里切回时由设置应用路径惰性启动（守护进程
+// 自己读注册表档位，档位变更时它会自行退出、这里按新档重拉）。
 static void StartIndexTiersIfNeeded() {
-    if (g.dfBackend != 0) return;
+    if (g.dfBackend != 0 || g.dfIndexTier == 0) return;
     df::SearchDaemonStart();
 }
 
@@ -2941,6 +2946,7 @@ static void ApplySettingsToRuntime(const ft::Settings& s) {
     g.beautify = s.beautify;
     g.skipDotFolders = s.skipDotFolders;
     g.dfBackend = s.dfBackend;
+    g.dfIndexTier = s.dfIndexTier;
     StartIndexTiersIfNeeded();
     sTune = s.tune;
     s.ApplyTuneToThemes();
@@ -3964,6 +3970,7 @@ static void ApplySettingsPreview(const ipc::Preview& p) {
     g.hotkeyMode = p.hotkeyMode;
     g.skipDotFolders = p.skipDotFolders != FALSE;
     g.dfBackend = p.dfBackend;
+    g.dfIndexTier = p.dfIndexTier;
     StartIndexTiersIfNeeded();
     g.fdjEnabled = p.fdjEnabled != FALSE;  // 仅为镜像；判定处现读注册表
     g.weightEnabled = p.weightEnabled != FALSE;
@@ -4186,7 +4193,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             UINT blink = GetCaretBlinkTime();
             if (blink == 0 || blink == INFINITE) blink = 530;
             SetTimer(hwnd, kTimerBlink, blink, nullptr);
-            if (g.dfBackend == 0) SetTimer(hwnd, kTimerIndexStat, 10000, nullptr);   // 索引建库状态轮询
+            if (g.dfBackend == 0 && g.dfIndexTier > 0) SetTimer(hwnd, kTimerIndexStat, 10000, nullptr);   // 索引建库状态轮询（极简档无索引不轮询）
             return 0;
         }
         case WM_DESTROY:

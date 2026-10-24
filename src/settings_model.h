@@ -122,6 +122,8 @@ struct Settings {
     std::vector<std::wstring> excludePaths;
     bool skipDotFolders = true;
     int dfBackend = 0;              // d/f 搜索后端：0=新方案（内置索引） 1=Everything 旧链路
+    int dfIndexTier = 2;            // 搜索索引档位：0=极简 1=轻量 2=均衡 3=极速（内存↔速度权衡；守护进程自读注册表）
+    bool dfPinyin = true;           // 拼音搜索：汉字文件名按全拼/首字母检索（转拼音表占少量内存）
     // 搜索权重
     bool weightEnabled = true;
     int weightFlush = 1;
@@ -177,6 +179,12 @@ inline std::vector<Option> LearnExpireOptions() {
 }
 inline std::vector<Option> DfBackendOptions() {
     return {{L"内置搜索（Flowtary Search）", 0}, {L"Everything（旧链路，需 Everything 运行）", 1}};
+}
+inline std::vector<Option> DfIndexTierOptions() {
+    return {{L"极简（不建索引：实时搜索，内存占用最低）", 0},
+            {L"轻量（索引约 10 万条：低内存）", 1},
+            {L"均衡（默认：约 30 万条 + 全盘索引）", 2},
+            {L"极速（最大覆盖：内存占用最高）", 3}};
 }
 inline std::vector<Option> ShellTypeOptions() {
     return {{L"命令提示符 (cmd)", 0}, {L"PowerShell", 1}, {L"Git Bash", 2}, {L"自定义…", 3}};

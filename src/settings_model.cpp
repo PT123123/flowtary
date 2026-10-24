@@ -499,6 +499,10 @@ void Settings::Load() {
     skipDotFolders = RegGetDword(L"SkipDotFolders", v) ? v != 0 : true;
     v = 0;
     if (RegGetDword(L"DfBackend", v)) dfBackend = (v == 1) ? 1 : 0;
+    v = 2;
+    if (RegGetDword(L"DfIndexTier", v)) dfIndexTier = (v > 3) ? 2 : (int)v;   // 越界回默认档
+    v = 1;
+    dfPinyin = RegGetDword(L"DfPinyin", v) ? v != 0 : true;
 
     // 主题微调 blob：长度与主题数量不符时整块忽略（用 kThemes 预设默认）
     tune.assign(kThemeCount, ThemeTune());
@@ -614,6 +618,8 @@ void Settings::Save() {
 
     RegSetDword(L"SkipDotFolders", skipDotFolders ? 1 : 0);
     RegSetDword(L"DfBackend", (DWORD)dfBackend);
+    RegSetDword(L"DfIndexTier", (DWORD)dfIndexTier);
+    RegSetDword(L"DfPinyin", dfPinyin ? 1 : 0);
     RegSetDword(L"TopCmd", topEnabled ? 1 : 0);
     RegSetDword(L"CmdCmd", cmdEnabled ? 1 : 0);
     RegSetDword(L"WinCmd", winEnabled ? 1 : 0);
