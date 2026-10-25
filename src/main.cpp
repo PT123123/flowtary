@@ -4436,23 +4436,24 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             } else if (ev == WM_RBUTTONUP || ev == WM_CONTEXTMENU) {
                 SetForegroundWindow(hwnd);
                 HMENU menu = CreatePopupMenu();
+                // 标准 Windows 菜单，深色由 EnableDarkMenus 的 SetPreferredAppMode 施加；
+                // 不能再走自绘/MIM_BACKGROUND（StyleDarkMenu），否则混出浅底深字。
                 if (g.startingUp) {
                     // 扫描未完成：菜单照样弹出来（有响应），但只显示状态项与退出
-                    AppendMenuW(menu, MF_OWNERDRAW | MF_STRING | MF_GRAYED | MF_DISABLED, 0,
+                    AppendMenuW(menu, MF_STRING | MF_GRAYED | MF_DISABLED, 0,
                                 (LPCWSTR)L"正在启动中…");
-                    AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, 0, (LPCWSTR)L"");  // 自绘分隔线
-                    AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_EXIT, L"退出(&X)");
+                    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+                    AppendMenuW(menu, MF_STRING, IDM_EXIT, L"退出(&X)");
                 } else {
-                    AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_SETTINGS, L"设置(&S)");
-                    AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_REFRESH, L"刷新缓存(&R)");
-                    AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, 0, (LPCWSTR)L"");  // 自绘分隔线
+                    AppendMenuW(menu, MF_STRING, IDM_SETTINGS, L"设置(&S)");
+                    AppendMenuW(menu, MF_STRING, IDM_REFRESH, L"刷新缓存(&R)");
+                    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
                     // 唤起快捷键开关：文字随状态切换（开启→“关闭…”，关闭→“开启…”）
-                    AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_WAKE_HOTKEY,
+                    AppendMenuW(menu, MF_STRING, IDM_WAKE_HOTKEY,
                                 g.hotkeyWake ? L"关闭唤起快捷键(&H)" : L"开启唤起快捷键(&H)");
-                    AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, 0, (LPCWSTR)L"");  // 自绘分隔线
-                    AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_EXIT, L"退出(&X)");
+                    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+                    AppendMenuW(menu, MF_STRING, IDM_EXIT, L"退出(&X)");
                 }
-                StyleDarkMenu(menu);
                 POINT p;
                 GetCursorPos(&p);
                 int cmd = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
