@@ -1414,6 +1414,7 @@ int FdQuery(const std::wstring& fdExe, const Query& q, bool pathMode, bool skipH
 // delta è¶ 5 ä¸æ¡æç¼å­è¶ 7 å¤©èªå¨åå°éå»ºï¼ç©ºé²ä¼åçº§ï¼ãFT_DF_DISKINDEX_OFF=1 å³é­ã
 
 HANDLE g_diFile = nullptr, g_diMap = nullptr;
+bool g_diskHasPinyin = false;              // blob 行含 "|全拼" 后缀（重建时拼音可用则写入）
 const unsigned char* g_diView = nullptr;   // è®°å½åºèµ·å§ï¼è·³è¿å¤´é¨ï¼
 unsigned long long g_diSize = 0;           // è®°å½åºå­èæ°
 unsigned long long g_diDataOff = 0;        // å¤´é¨ä¹åçè®°å½åºèµ·å§åç§»
@@ -1598,9 +1599,14 @@ bool DiskMapExistingLocked() {
         return false;
     }
     // å¤´é¨ï¼"FTDISKIDX2\nCOUNT\t<10ä½æ°å­>\n"
-    if (memcmp(view, "FTDISKIDX2\n", 11) != 0 ||
+    // 头部："FTDISKIDX3\nCOUNT\t<10位数字>\nPY\t0|1\n"（PY=行尾是否含 "|全拼" 后缀；
+    // v3 起磁盘层支持拼音搜索，旧 v2 缓存头不符自动弃用重建一次）
+    if (memcmp(view, "FTDISKIDX3\n", 11) != 0 ||
         memcmp(view + 11, "COUNT\t", 6) != 0 ||
-        view[11 + 6 + 10] != '\n') {
+        view[11 + 6 + 10] != '\n' ||
+        memcmp(view + 28, "PY\t", 3) != 0 ||
+        (view[31] != '0' && view[31] != '1') ||
+        view[32] != '\n') {
         dbg2(L"header bad:", view[0]);
         UnmapViewOfFile(view);
         CloseHandle(g_diMap);
@@ -1610,7 +1616,7 @@ bool DiskMapExistingLocked() {
     }
     unsigned long long n = 0;
     for (int i = 0; i < 10; ++i) n = n * 10 + (unsigned long long)(view[11 + 6 + i] - '0');
-    if (n == 0) {   // ç©ºç´¢å¼ï¼fd å¤±è´¥ç­ï¼ï¼è§ä¸ºä¸å¯ç¨ï¼äº¤ç±éå»º
+    if (n == 0) {   // ç©ºç´¢å¼ï¼fd å¤±è´¥ç­ï¼è§ä¸ºä¸å¯ç¨ï¼äº¤ç±éå»º
         dbg2(L"empty index:", 0);
         UnmapViewOfFile(view);
         CloseHandle(g_diMap);
@@ -1618,8 +1624,9 @@ bool DiskMapExistingLocked() {
         g_diMap = g_diFile = nullptr;
         return false;
     }
+    g_diskHasPinyin = view[31] == '1';
     g_diRecords = n;
-    g_diDataOff = 11 + 6 + 10 + 1;
+    g_diDataOff = 33;
     g_diView = view + g_diDataOff;
     g_diSize = (unsigned long long)sz.QuadPart - g_diDataOff;
     g_diReady = true;
@@ -1655,8 +1662,10 @@ unsigned __stdcall DiskBuildThread(void*) {
             }
             return true;
         };
-        if (!writeAll("FTDISKIDX2\nCOUNT\t0000000000\n", 29)) { CloseHandle(h); break; }
-        dbg(L"header written:", 0);
+        const bool pyBuild = g_dfPinyinEnabled && g_py != nullptr;   // 拼音可用：行尾写 "|全拼"
+        if (!writeAll(pyBuild ? "FTDISKIDX3\nCOUNT\t0000000000\nPY\t1\n"
+                              : "FTDISKIDX3\nCOUNT\t0000000000\nPY\t0\n", 33)) { CloseHandle(h); break; }
+        dbg(L"header written:", pyBuild ? 1 : 0);
 
         // ä¸¤è¶å¨åï¼åç®å½åæä»¶ï¼+ ç»ä¸åªæï¼ä¸åå­ç´¢å¼åè§åï¼junk ä¸è¿ç´¢å¼ï¼ï¼
         // è§£ææé¶ GetFileAttributes è°ç¨ï¼ä¸ªå«ç¹æ®æä»¶åä¼ææ­»ï¼
@@ -1698,6 +1707,16 @@ unsigned __stdcall DiskBuildThread(void*) {
                     if (low.size() < 2) continue;
                     chunk += pass == 0 ? "D" : "F";
                     chunk += low;
+                    if (pyBuild) {   // basename 全拼后缀（仅汉字名；路径不含 '|'——Windows 文件名非法字符）
+                        const size_t bp = low.find_last_of('/');
+                        std::wstring wbase = Utf8ToWide(
+                            low.substr(bp == std::wstring::npos ? 0 : bp + 1));
+                        std::wstring wp = MemNameToPinyin(wbase.c_str());
+                        if (!wp.empty()) {
+                            chunk += '|';
+                            chunk += WideToUtf8(wp);
+                        }
+                    }
                     chunk += "\n";
                     ++count;
                     if (chunk.size() >= 4 * 1024 * 1024) {
@@ -1892,6 +1911,8 @@ void DiskIndexStart() {
         }
     }
     if (g_diReady) DiskPrefetchAsync();   // 冷页预热：首查的 218-500ms 页缓存回填挪到后台
+    if (g_diReady && g_dfPinyinEnabled && !g_diskHasPinyin)
+        DiskMaybeStartRebuild();   // 拼音开启但缓存是 PY0（关拼音期间建的）：后台重建补上，旧映射照常服务
     if (!g_diReady) DiskMaybeStartRebuild();
     for (const auto& r : DriveRoots()) {
         CloseHandle((HANDLE)_beginthreadex(nullptr, 0, DiskWatchThread,
@@ -1956,18 +1977,37 @@ int DiskIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD 
         const bool isDir = ls[0] == 'D';
         if (q.isFile == isDir) continue;
         const unsigned char* rec = ls + 1;
-        const size_t pathLen = recLen - 1;
-        // åå­æ¨¡å¼ï¼è¯å¿é¡»è½å¨æåä¸æ®µï¼åºåï¼åï¼è·¯å¾æ¨¡å¼ï¼æ´æ¡è·¯å¾
+        size_t pathLen = recLen - 1;
+        // 拼音后缀切分（v3："路径|全拼"；路径段不含 '|'）。PY0 缓存无后缀，pyLen 恒 0
+        const unsigned char* pySeg = nullptr;
+        size_t pyLen = 0;
+        if (g_diskHasPinyin) {
+            const void* pipe = memchr(rec, '|', pathLen);
+            if (pipe) {
+                pySeg = (const unsigned char*)pipe + 1;
+                pyLen = (size_t)(le - pySeg);
+                pathLen = (size_t)((const unsigned char*)pipe - rec);
+            }
+        }
+        // åæ¨¡å¼ï¼è¯å¿é»å¨æåä¸æ®µï¼åæ®µï¼å ï¼è·¯å¾æ¨¡å¼ï¼æ´æ¡è·¯å¾
         const unsigned char* seg = rec;
         size_t segLen = pathLen;
         if (!pathMode) {
             for (size_t i = pathLen; i > 0; --i)
                 if (rec[i - 1] == '/') { seg = rec + i; segLen = pathLen - i; break; }
         }
-        if (!MemContainsBytes(seg, segLen, w0.data(), w0.size())) continue;   // å½ä¸­è·¨è¡/è·¨æ®µç­åé³æ§
+        // 名字模式：词落在名字段，或落在该条目的拼音段（全拼子串，与 memchr 候选枚举
+        // 相容——非连续的首字母子序列无法被候选扫描发现，仅内存层支持）；路径模式：词落在路径段
+        auto wordHit = [&](const std::string& w) -> bool {
+            if (MemContainsBytes(seg, segLen, w.data(), w.size())) return true;
+            if (!pathMode && pyLen > 0)
+                return MemContainsBytes(pySeg, pyLen, w.data(), w.size()) != 0;
+            return false;
+        };
+        if (!wordHit(w0)) continue;
         bool ok = true;
         for (size_t i = 1; i < wl.size(); ++i)
-            if (!MemContainsBytes(seg, segLen, wl[i].data(), wl[i].size())) { ok = false; break; }
+            if (!wordHit(wl[i])) { ok = false; break; }
         if (!ok) continue;
         for (const auto& e : ex)
             if (!e.empty() && MemContainsBytes(rec, pathLen, e.data(), e.size())) { ok = false; break; }
@@ -2332,6 +2372,10 @@ int SearchDaemonServe(const std::vector<std::wstring>& extraRoots) {
     if (cfg.tier == 0) return 0;   // 极简档：不建索引不驻留（fd/WS 实时兜底）
     ApplyTierCaps(cfg.tier);
     g_dfPinyinEnabled = cfg.pinyin;
+    if (GetEnvironmentVariableW(L"FT_DF_DEBUG", nullptr, 0) > 0) {
+        fwprintf(stderr, L"[tier] %d pinyin=%d\n", cfg.tier, cfg.pinyin ? 1 : 0);
+        fflush(stderr);
+    }
     MemPinyinStart();   // 毫秒层拼音索引（exe 同目录无 dict/ 时静默降级为纯名字匹配）
     return dfdaemon::Serve(extraRoots);
 }

@@ -79,6 +79,9 @@ int MemIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD m
 // 新鲜度：每盘根 ReadDirectoryChangesW → RAM 内小 delta 表（增/删），查询时合并；
 // delta 超 5 万条自动后台重建。blob 可被系统换出，不计入进程私有内存。
 // FT_DF_DISKINDEX_MAX 限条目数（默认 8000000）、FT_DF_DISKINDEX_OFF=1 关闭。
+// 缓存格式 v3（FTDISKIDX3）：行 = "D|F<小写路径>[|<basename 全拼>]"——拼音开关开启且
+// 词典可用时建库写入，扫描按首个 '|' 切分（Windows 路径不含 '|'）；拼音开启但缓存
+// 是无拼音版（PY0）时后台重建一次补上。
 void DiskIndexStart();           // 幂等：映射已有索引；缺失/过期则后台建库
 bool DiskIndexReady();
 int  DiskIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD maxRows);
