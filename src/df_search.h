@@ -94,6 +94,11 @@ size_t DiskIndexRecords();       // 条目数（诊断用）
 //   C: "STAT\n" → S: "M <ready> <size>\nD <ready> <records>\nEND\n"
 // 守护进程单实例（互斥体），空闲 30 分钟自动退出（磁盘缓存仍在，重开秒级加载）；
 // 崩溃不影响 flowtary（查询失败自动落到 fd/WS 层，下次查询自动重拉守护进程）。
+// 索引档位（设置「常规」页，内存↔速度权衡）：守护进程自读注册表
+//   HKCU\Software\Flowtary\DfIndexTier（0=极简 1=轻量 2=均衡 3=极速）与
+//   DfPinyin（拼音开关）——启动时应用条目上限与拼音开关；运行中任一查询连接
+//   或 60s 轮询发现变更即退出（回 BYE），主程序下轮查询自动按新档重拉。
+//   极简档守护进程启动即退（不驻留），主程序不拉起、查询走 fd/WS 实时兜底。
 // 守护进程服务主循环（flowtary-search --serve 进程入口调用，阻塞直至空闲退出）
 int SearchDaemonServe(const std::vector<std::wstring>& extraRoots);
 void SearchDaemonStart();        // 幂等：确保守护进程在跑（不在线则拉起，最多等 ~3s）

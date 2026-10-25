@@ -367,6 +367,16 @@ static ChoiceCtl* AddChoice(Fl_Group* p, int x, int y, int w, std::vector<ft::Op
     return ctl;
 }
 
+// 搜索索引档位/拼音开关只在「内置搜索」后端下有效——选 Everything 旧链路时置灰，
+// 与实际行为一致（后端=Everything 时守护进程不启动，这两个设置不产生任何效果）
+static ChoiceCtl* s_tierCtl = nullptr;
+static Fl_Check_Button* s_pinyinChk = nullptr;
+static void ApplySearchCtlGating() {
+    const bool on = g_s.dfBackend == 0;
+    if (s_tierCtl) on ? s_tierCtl->w->activate() : s_tierCtl->w->deactivate();
+    if (s_pinyinChk) on ? s_pinyinChk->activate() : s_pinyinChk->deactivate();
+}
+
 static ChoiceCtl* AddChoiceRow(Fl_Group* p, int y, const WCHAR* label,
                                std::vector<ft::Option> opts, int* bind, int kind = 0) {
     AddLabel(p, 0, y, 160, kRowH, label);
@@ -434,6 +444,7 @@ static void onChoice(Fl_Widget*, void* v) {
         ApplyShellLayout();
         g_win->redraw();
     }
+    if (ctl->kind == 2) ApplySearchCtlGating();  // d/f 搜索后端：Everything 时档位/拼音置灰
     PushPreview();
 }
 
@@ -792,10 +803,11 @@ static void BuildTabGeneral() {
     AddChoiceRow(p, 44, L"结果项快捷键：", ft::HotkeyModeOptions(), &g_s.hotkeyMode);
     AddChoiceRow(p, 78, L"唤醒位置：", ft::CenterWakeOptions(), &g_s.centerWake);
     AddCheck(p, 0, 116, kPW, L"文件对话框跳转（在文件对话框中直接定位文件夹）", &g_s.fdjEnabled);
-    AddChoiceRow(p, 150, L"d/f 搜索后端：", ft::DfBackendOptions(), &g_s.dfBackend);
-    AddChoiceRow(p, 184, L"搜索索引档位：", ft::DfIndexTierOptions(), &g_s.dfIndexTier);
-    AddCheck(p, 0, 218, kPW, L"拼音搜索（汉字文件名按全拼或首字母检索，如 wxcs → 微信测试）",
-             &g_s.dfPinyin);
+    AddChoiceRow(p, 150, L"d/f 搜索后端：", ft::DfBackendOptions(), &g_s.dfBackend, 2);
+    s_tierCtl = AddChoiceRow(p, 184, L"搜索索引档位：", ft::DfIndexTierOptions(), &g_s.dfIndexTier);
+    s_pinyinChk = AddCheck(p, 0, 218, kPW, L"拼音搜索（汉字文件名按全拼或首字母检索，如 wxcs → 微信测试）",
+                           &g_s.dfPinyin);
+    ApplySearchCtlGating();   // 初始状态：Everything 旧链路时档位/拼音置灰
     AddHint(p, 0, 244, kPW, 60,
             L"索引档位是「内存 ↔ 速度」的权衡：极简=不建索引每次实时搜（秒级、守护进程不驻留）；"
             L"轻量/均衡/极速逐级加大索引覆盖（毫秒级），内存占用随之上升。\n"

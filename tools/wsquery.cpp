@@ -3,6 +3,7 @@
 //   用法:
 //     wsquery --check                    探测 Windows Search / fd 可用性
 //     wsquery [-d] [-p] [--fd] 词1 词2…  -d 只搜文件夹；-p 路径级兜底；--fd 用 fd 后端
+//     wsquery [--rows N] …               --rows 限守护进程返回行数（默认 50，bench 200）
 //   示例:
 //     wsquery 报告            Windows Search 按名字搜文件
 //     wsquery -d repo         搜文件夹
@@ -13,6 +14,16 @@
 #include <string>
 #include <vector>
 #include "df_search.h"
+
+// 搜索索引档位（设置「常规」页）：0=极简（守护进程不驻留）。wsquery 直读注册表，
+// 与守护进程/主程序同一真源，用于给出不误导的状态输出。
+static int QueryIndexTier() {
+    DWORD v = 2, sz = sizeof(v);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"DfIndexTier",
+                     RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS && v <= 3)
+        return (int)v;
+    return 2;
+}
 
 static void PrintLine(const std::wstring& w) {
     HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -55,6 +66,12 @@ int wmain(int argc, wchar_t** argv) {
         else q.words.push_back(a);
     }
     if (memStat || diskStat) {
+        if (QueryIndexTier() == 0) {
+            PrintLine(L"索引档位: 极简（不建索引，守护进程不驻留，内存占用 ≈0）");
+            PrintLine(L"查询路径: 实时 fd / Windows Search 兜底（秒级）");
+            PrintLine(L"== 索引已按极简档关闭 ==");
+            return 0;
+        }
         df::SearchDaemonStart();
         int memReady = 0, memSize = 0, diskReady = 0, diskRecords = 0;
         df::SearchDaemonStat(memReady, memSize, diskReady, diskRecords);
@@ -79,7 +96,7 @@ int wmain(int argc, wchar_t** argv) {
         return 0;
     }
     if (q.words.empty()) {
-        PrintLine(L"用法: wsquery [-d] [-p] [--fd|--mem|--disk] [--bench N] 词1 词2 …（或 --check / --memstat / --diskstat）");
+        PrintLine(L"用法: wsquery [-d] [-p] [--fd|--mem|--disk] [--bench N] [--rows N] 词1 词2 …（或 --check / --memstat / --diskstat）");
         return 2;
     }
     // --bench N：同一进程内连查 N 次，打印每次耗时毫秒与命中数。
@@ -115,7 +132,12 @@ int wmain(int argc, wchar_t** argv) {
         std::vector<df::Hit> hits;
         ULONGLONG t0 = GetTickCount64();
         bool ok = df::SearchDaemonQuery(q, pathMode, hits, rows > 0 ? rows : 50);
-        if (!ok) { PrintLine(L"守护进程查询失败（未在运行？）"); return 1; }
+        if (!ok) {
+            PrintLine(QueryIndexTier() == 0
+                          ? L"守护进程查询失败（极简档不驻留守护进程，属正常；实际查询由主程序落 fd/WS 兜底）"
+                          : L"守护进程查询失败（未在运行？）");
+            return 1;
+        }
         PrintLine(L"守护进程命中 " + std::to_wstring((long long)hits.size()) + L" 条, " +
                   std::to_wstring((long long)(GetTickCount64() - t0)) + L" ms:\n");
         for (const auto& h : hits)
