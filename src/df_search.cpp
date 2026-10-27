@@ -12,6 +12,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <shlobj.h>
+#include <psapi.h>
 
 #define DBINITCONSTANTS
 #include <initguid.h>   // è®© oledb.h ç DEFINE_GUID å¨æ¬ç¼è¯ååå®ä¾åï¼ä»æ­¤å¤å¼å¥ï¼
@@ -19,6 +20,7 @@
 #include <oledberr.h>
 
 #include "df_search.h"
+#include "pinyin_text.h"
 
 #include <algorithm>
 #include <atomic>
@@ -144,21 +146,18 @@ std::wstring ItemUrlToPath(const wchar_t* u) {
     return o;
 }
 
-// COM æ¯çº¿ç¨åªåå§åä¸æ¬¡ãæ°¸ä¸ä¸»å¨ååå§åï¼CoUninitialize ä¼æ MTA å¼ç¨è®¡æ°
-// åå° 0 å¹¶æææ´ä¸ªå¬å¯ï¼ç¼å­éç provider/ä¼è¯æééä¹å¤±æï¼ç¬¬äºæ¬¡æ¥è¯¢å³å´©ï¼ã
-// è°ç¨æ¹çº¿ç¨åä¸ºé¿å½çº¿ç¨ï¼flowtary å¸¸é©» WS å·¥ä½çº¿ç¨ / wsquery ä¸»çº¿ç¨ï¼ï¼å®å¨ã
-// fd è·¯å¾ä¹éè¦å®ï¼SHGetFolderPathW è§£æç¨æ·ç®å½è¦ COMã
+// Short-lived fd/folder callers balance COM lexically, before the thread starts tearing down.
+struct ThreadComScope {
+    HRESULT result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    ~ThreadComScope() { if (SUCCEEDED(result)) CoUninitialize(); }
+};
+
+// Only the persistent WS worker uses this lifetime: its cached MTA interfaces must stay alive.
 void EnsureThreadCom() {
-    static thread_local bool t_comInit = false;
-    if (!t_comInit) {
-        HRESULT hrInit = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        if (SUCCEEDED(hrInit)) t_comInit = true;
-        // RPC_E_CHANGED_MODEï¼çº¿ç¨å·²æ¯ STAââç§å¸¸èµ°ï¼ç¼å­è°ç¨çº¿ç¨ä¸ä¼æ¯ STA çº¿ç¨ï¼
-    }
+    static thread_local HRESULT initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 }
 
-// è¿ç¨çº§ä¼è¯ç¼å­ï¼provider åå§å + å½ä»¤å·¥ååªå»ºä¸æ¬¡ï¼åç»­æ¥è¯¢æ¯«ç§çº§ã
-// æµç¨æ ä¸å¯è½æä¸¤ä¸ªè°ç¨çº¿ç¨ï¼ä¸»ç¨åºå¸¸é©» WS å·¥ä½çº¿ç¨ / wsquery ä¸»çº¿ç¨ï¼ï¼äºæ¥ä¿æ¤ã
+// Cache OLE DB interfaces only in the apartment that created them.
 struct WsCache {
     std::mutex mu;
     IDBInitialize* init = nullptr;
@@ -181,12 +180,13 @@ void WsStep(std::wstring* diag, const wchar_t* stage, HRESULT hr) {
 
 // å»ºä¼è¯ï¼è°ç¨æ¹å·²æéï¼ãè¿å false æ¶ *hrOut ä¸ºé¦ä¸ªå¤±è´¥ç¹ã
 bool WsBuildSession(std::wstring* diag, HRESULT* hrOut) {
+    auto& cache = g_wsCache;
     CLSID clsid;
     HRESULT hr = CLSIDFromProgID(L"Search.CollatorDSO", &clsid);
     WsStep(diag, L"CLSID", hr);
     if (FAILED(hr)) { *hrOut = hr; return false; }
     hr = CoCreateInstance(clsid, nullptr, CLSCTX_INPROC_SERVER, IID_IDBInitialize,
-                          (void**)&g_wsCache.init);
+                          (void**)&cache.init);
     WsStep(diag, L"CREATE", hr);
     if (FAILED(hr)) { *hrOut = hr; return false; }
     // EXTENDED PROPERTIES="Application:Windows"ï¼å®æ¹è¿æ¥ä¸²åæ¬¾ï¼â DBPROP_INIT_PROVIDERSTRING
@@ -201,19 +201,19 @@ bool WsBuildSession(std::wstring* diag, HRESULT* hrOut) {
     set.guidPropertySet = DBPROPSET_DBINIT;
     {
         CI<IDBProperties> props;
-        bool setOk = SUCCEEDED(g_wsCache.init->QueryInterface(IID_IDBProperties, (void**)&props.p)) &&
+        bool setOk = SUCCEEDED(cache.init->QueryInterface(IID_IDBProperties, (void**)&props.p)) &&
                      SUCCEEDED(props->SetProperties(1, &set));
         VariantClear(&prop.vValue);
         if (!setOk) { WsStep(diag, L"PROP", E_FAIL); *hrOut = E_FAIL; return false; }
     }
-    hr = g_wsCache.init->Initialize();
+    hr = cache.init->Initialize();
     WsStep(diag, L"INIT", hr);
     if (FAILED(hr)) { *hrOut = hr; return false; }
     CI<IDBCreateSession> sessFactory;
-    if (FAILED(g_wsCache.init->QueryInterface(IID_IDBCreateSession, (void**)&sessFactory.p))) {
+    if (FAILED(cache.init->QueryInterface(IID_IDBCreateSession, (void**)&sessFactory.p))) {
         WsStep(diag, L"QI", E_FAIL); *hrOut = E_FAIL; return false;
     }
-    hr = sessFactory->CreateSession(nullptr, IID_IDBCreateCommand, (IUnknown**)&g_wsCache.cmdFactory);
+    hr = sessFactory->CreateSession(nullptr, IID_IDBCreateCommand, (IUnknown**)&cache.cmdFactory);
     WsStep(diag, L"SESSION", hr);
     if (FAILED(hr)) { *hrOut = hr; return false; }
     return true;
@@ -247,20 +247,23 @@ int WsQueryImpl(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD maxR
     // å®æ¹ç¤ºä¾åä¸ºè£¸æ è¯ç¬¦ï¼ä¸å åå¼å·
     const std::wstring sql = L"SELECT System.ItemUrl, System.FileName, System.ItemType"
                              L" FROM SystemIndex WHERE " + where;
-
-    // COM æ¯çº¿ç¨åªåå§åä¸æ¬¡ãæ°¸ä¸ä¸»å¨ååå§åï¼è§ EnsureThreadCom æ³¨éï¼
+    // Ensure COM outlives this thread's cached provider/session.
     EnsureThreadCom();
+    auto& cache = g_wsCache;
     int result = -1;
     for (int attempt = 0; attempt < 2; ++attempt) {  // ä¼è¯å¤±æï¼æå¡åéå¯ç­ï¼ï¼éå»ºåéè¯ä¸æ¬¡
         // ä¼è¯ç¼å­ï¼provider/ä¼è¯åªå»ºä¸æ¬¡ï¼æ¥è¯¢å¤±è´¥éå»ºä¸æ¬¡åè¯ï¼æå¡éå¯ç­æåµï¼
-        std::unique_lock<std::mutex> lk(g_wsCache.mu);
+        std::unique_lock<std::mutex> lk(cache.mu);
         HRESULT hr = S_OK;
         HRESULT buildHr = S_OK;
-        if (!g_wsCache.ready() && !WsBuildSession(diag, &buildHr)) break;
+        if (!cache.ready()) {
+            cache.reset();
+            if (!WsBuildSession(diag, &buildHr)) { cache.reset(); break; }
+        }
         CI<ICommandText> cmd;
-        hr = g_wsCache.cmdFactory->CreateCommand(nullptr, IID_ICommandText, (IUnknown**)&cmd.p);
+        hr = cache.cmdFactory->CreateCommand(nullptr, IID_ICommandText, (IUnknown**)&cmd.p);
         WsStep(diag, L"CMD", hr);
-        if (FAILED(hr)) { g_wsCache.reset(); continue; }   // éå»ºä¼è¯åèµ°ä¸é
+        if (FAILED(hr)) { cache.reset(); continue; }   // éå»ºä¼è¯åèµ°ä¸é
         hr = cmd->SetCommandText(DBGUID_DBSQL, sql.c_str());
         WsStep(diag, L"SETTEXT", hr);
         if (FAILED(hr)) break;
@@ -270,7 +273,7 @@ int WsQueryImpl(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD maxR
         hr = cmd->Execute(nullptr, IID_IRowset, nullptr, &affected, &rsUnk.p);
         WsStep(diag, L"EXEC", hr);
         if (FAILED(hr)) {
-            if (!diag) { g_wsCache.reset(); continue; }    // éé»éè¯ä¸æ¬¡ï¼æå¡å¯è½åéå¯ï¼
+            if (!diag) { cache.reset(); continue; }    // éé»éè¯ä¸æ¬¡ï¼æå¡å¯è½åéå¯ï¼
             break;
         }
         CI<IRowset> rs;
@@ -465,15 +468,23 @@ std::wstring MemNameToPinyin(const wchar_t* name) {
         if (*p >= 0x4E00 && *p <= 0x9FFF) { hasHan = true; break; }
     if (!hasHan) return L"";
     std::lock_guard<std::mutex> lk(g_pyMu);
-    auto res = g_py->hanziToPinyin(WideToUtf8(name), Pinyin::ManTone::Style::NORMAL,
+    try {
+        auto res = g_py->hanziToPinyin(WideToUtf8(ft::PinyinBmpText(name)), Pinyin::ManTone::Style::NORMAL,
                                    Pinyin::Error::Default, false, false, false);
-    std::string py;
-    for (const auto& r : res) {
-        if (!r.error && !r.pinyin.empty()) py += r.pinyin;
-        else if (!r.hanzi.empty()) py += r.hanzi;
+        std::string py;
+        for (const auto& r : res) {
+            if (!r.error && !r.pinyin.empty()) py += r.pinyin;
+            else if (!r.hanzi.empty()) py += r.hanzi;
+        }
+        if (py.empty()) return L"";
+        return ToLower(Utf8ToWide(py));
+    } catch (const std::bad_alloc&) {
+        throw;
+    } catch (const std::exception& error) {
+        if (GetEnvironmentVariableW(L"FT_DF_DEBUG", nullptr, 0) > 0)
+            fprintf(stderr, "[pinyin] skipped unsupported name: %s\n", error.what());
+        return L"";   // Original-name matching remains available for this entry.
     }
-    if (py.empty()) return L"";
-    return ToLower(Utf8ToWide(py));
 }
 
 // q 是否为 s 的子序列（首字母匹配：wxltjl ⊆ weixinliaotianjilu）；空 q 视为不匹配
@@ -724,14 +735,24 @@ void MemPoolAdd(MemRootData& rd, const std::string& path, bool isDir) {
 // ç´¢å¼ç¼å­è½çï¼UTF-8 ææ¬ï¼é¦è¡çæ¬æ è®°ï¼R\tæ ¹ç®å½ ä¸ºåèæ è®°ï¼D/F\tpath ä¸ºæ¡ç®ï¼ã
 // ä½ç¨ï¼éå¯æ¶æ¯«ç§çº§å è½½ç«å³å¯ç¨ï¼å¯è½ç¥æ§ï¼åå°å¨ééå»ºåè¦çï¼ï¼
 // 100s çº§çå»ºåºææ¬åªå¨é¦æ¬¡è¿è¡ï¼æåªæè§ååæ´åï¼æ¯ä»ã
-std::wstring MemCachePath() {
-    EnsureThreadCom();
+std::wstring IndexCacheDir() {
+    wchar_t overrideDir[32768]{};
+    DWORD n = GetEnvironmentVariableW(L"FT_DF_CACHE_DIR", overrideDir, 32768);
+    if (n && n < 32768) {
+        CreateDirectoryW(overrideDir, nullptr);
+        return overrideDir;
+    }
+    ThreadComScope com;
     wchar_t p[MAX_PATH]{};
     if (FAILED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, p)))
         return L"";
     std::wstring dir = std::wstring(p) + L"\\Flowtary";
     CreateDirectoryW(dir.c_str(), nullptr);
-    return dir + L"\\memindex.dat";
+    return dir;
+}
+std::wstring MemCachePath() {
+    std::wstring dir = IndexCacheDir();
+    return dir.empty() ? L"" : dir + L"\\memindex.dat";
 }
 // æ g_memMu è°ç¨ãåååæä»¶ï¼1MB ç¼å²ï¼ââä¸æ´ä¸²æ¼æ¥ï¼é¿å 20MBÃ2 çå å³°å¼é©»ç
 std::mutex g_memSaveMu;
@@ -739,6 +760,7 @@ std::mutex g_memSaveMu;
 // 序列化+写盘在锁外——此前整段 41MB 落盘都持 g_memMu，根重建完成时查询被卡 50-150ms。
 // 可不持 g_memMu 调用；g_memSaveMu 串行化并发写（维护线程与建库线程可能同时保存）。
 void MemIndexSave() {
+    std::lock_guard<std::mutex> savelk(g_memSaveMu);
     std::vector<MemRootData> snap;
     std::vector<std::wstring> names;
     {
@@ -755,7 +777,6 @@ void MemIndexSave() {
             snap.push_back(std::move(c));
         }
     }
-    std::lock_guard<std::mutex> savelk(g_memSaveMu);
     std::wstring path = MemCachePath();
     if (path.empty()) return;
     std::wstring tmp = path + L".tmp";
@@ -898,14 +919,16 @@ static HANDLE FdWalkerJob() {
     return s_job;
 }
 
-bool FdCaptureLines(const std::wstring& fdExe, const std::wstring& args, DWORD deadlineMs,
-                    std::vector<std::string>& lines) {
-    lines.clear();
+// Consume fd output as it arrives. Index builders can enumerate millions of paths; retaining
+// every line in a vector before indexing made their peak private bytes proportional to a disk.
+bool FdCaptureStream(const std::wstring& fdExe, const std::wstring& args, DWORD deadlineMs,
+                     const std::function<bool(std::string&&)>& consumeLine) {
     std::wstring cmd = QuoteArg(fdExe) + args;
     SECURITY_ATTRIBUTES sa{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
     HANDLE hrd = nullptr, wr = nullptr;
-    if (!CreatePipe(&hrd, &wr, &sa, 0)) return false;
-    HANDLE nul = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+    if (!CreatePipe(&hrd, &wr, &sa, 262144)) return false;
+    SetHandleInformation(hrd, HANDLE_FLAG_INHERIT, 0);
+    HANDLE nul = CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
                              &sa, OPEN_EXISTING, 0, nullptr);
     STARTUPINFOW si{};
     si.cb = sizeof(si);
@@ -928,37 +951,75 @@ bool FdCaptureLines(const std::wstring& fdExe, const std::wstring& args, DWORD d
     std::string acc;
     const ULONGLONG start = GetTickCount64();
     ULONGLONG lastData = start;   // 无输出超时基线：deadlineMs 是「挂死保护」而非总预算——
+    bool consumeOk = true;
+    DWORD failure = ERROR_SUCCESS;
     for (;;) {   // 磁盘全量建库合法地走 30-90 分钟，按总时长杀会得到永久残缺索引（实测踩过）
         DWORD avail = 0;
-        if (!PeekNamedPipe(hrd, nullptr, 0, nullptr, &avail, nullptr)) break;
+        if (!PeekNamedPipe(hrd, nullptr, 0, nullptr, &avail, nullptr)) {
+            DWORD error = GetLastError();
+            if (error != ERROR_BROKEN_PIPE) failure = error;
+            break;
+        }
         if (avail > 0) {
             DWORD want = avail > sizeof(buf) ? (DWORD)sizeof(buf) : avail;
             DWORD nread = 0;
-            if (!ReadFile(hrd, buf, want, &nread, nullptr) || nread == 0) break;
+            if (!ReadFile(hrd, buf, want, &nread, nullptr)) {
+                DWORD error = GetLastError();
+                if (error != ERROR_BROKEN_PIPE) failure = error;
+                break;
+            }
+            if (nread == 0) break;
             acc.append(buf, nread);
             lastData = GetTickCount64();
+            size_t consumed = 0;
             size_t p;
-            while ((p = acc.find('\n')) != std::string::npos) {
-                std::string ln = acc.substr(0, p);
-                acc.erase(0, p + 1);
+            while ((p = acc.find('\n', consumed)) != std::string::npos) {
+                std::string ln = acc.substr(consumed, p - consumed);
+                consumed = p + 1;
                 if (!ln.empty() && ln.back() == '\r') ln.pop_back();
                 if (ln.empty()) continue;
-                lines.push_back(std::move(ln));
+                try {
+                    if (!consumeLine(std::move(ln))) {
+                        consumeOk = false;
+                        break;
+                    }
+                } catch (const std::exception& error) {
+                    fprintf(stderr, "[stream] consumer failed, path=%s, error=%s\n", ln.c_str(), error.what());
+                    fflush(stderr);
+                    throw;
+                }
             }
+            if (consumed > 0) acc.erase(0, consumed);
+            if (acc.size() > 1024 * 1024) { failure = ERROR_BUFFER_OVERFLOW; break; }
+            if (!consumeOk) break;
             continue;
         }
-        if (WaitForSingleObject(pi.hProcess, 100) == WAIT_OBJECT_0) {
+        if (WaitForSingleObject(pi.hProcess, 10) == WAIT_OBJECT_0) {
             if (!PeekNamedPipe(hrd, nullptr, 0, nullptr, &avail, nullptr) || avail == 0) break;
         } else if (deadlineMs && GetTickCount64() - lastData > deadlineMs) {
+            failure = WAIT_TIMEOUT;
             TerminateProcess(pi.hProcess, 0);   // 无输出超时：fd 挂死在特殊文件上才触发
             break;
         }
     }
-    TerminateProcess(pi.hProcess, 0);
-    WaitForSingleObject(pi.hProcess, 3000);
+    if (!consumeOk || failure) TerminateProcess(pi.hProcess, 0);
+    if (WaitForSingleObject(pi.hProcess, 3000) != WAIT_OBJECT_0) {
+        failure = WAIT_TIMEOUT;
+        TerminateProcess(pi.hProcess, 0);
+        WaitForSingleObject(pi.hProcess, 3000);
+    }
+    DWORD exitCode = 0;
+    if (!GetExitCodeProcess(pi.hProcess, &exitCode) || exitCode > 1)
+        failure = ERROR_PROCESS_ABORTED;
+    // Accept an unterminated final line only after a successful traversal, never after a timeout.
+    if (consumeOk && !failure && !acc.empty()) {
+        if (acc.back() == '\r') acc.pop_back();
+        if (!acc.empty()) consumeOk = consumeLine(std::move(acc));
+    }
     CloseHandle(pi.hProcess);
     CloseHandle(hrd);
-    return true;
+    if (failure) SetLastError(failure);
+    return consumeOk && !failure;
 }
 
 // fd ä¸¤è¶å¨åä¸ä¸ªæ ¹ï¼åç®å½åæä»¶ï¼ï¼æ¡ç®è¿æ± ãåªæè§ AppendPruneArgsï¼
@@ -971,23 +1032,21 @@ bool MemListRootFd(const std::wstring& fdExe, const std::wstring& root, size_t c
     const unsigned tidDbg = GetCurrentThreadId();   // 建库/维护线程并发走根，日志须可归因
     // æ³¨æé¡ºåºï¼-E åªæ¿å¿é¡»å¨ã-- æ ¹ãä¹åï¼-- ä¹åçåæ°é½æ¯ä½ç½®åæ°ï¼ä¸åæ¯éé¡¹ï¼
     for (int pass = 0; pass < 2; ++pass) {
-        std::wstring args = L" -a -H --max-results " + std::to_wstring(cap);
+        if (rd.size() >= cap) break;   // fd --max-results 0 means unlimited, not zero.
+        std::wstring args = L" -a -H --max-results " + std::to_wstring(cap - rd.size());
         AppendPruneArgs(args, /*includeDot=*/true);
         args += pass == 0 ? L" -t d" : L" -t f";
         args += L" . -- " + QuoteArg(root);
-        std::vector<std::string> lines;
-        if (!FdCaptureLines(fdExe, args, 120000, lines)) return false;
-        if (dbgMem) {
-            fwprintf(stderr, L"[mem] T%u pass %d captured %zu lines\n", tidDbg, pass,
-                     lines.size());
-            fflush(stderr);
-        }
         size_t added = 0;
-        for (const auto& ln : lines) {
-            std::string path = ln;   // fd 输出 UTF-8，直接入池（宽字符转换只在命中展示时做）
+        size_t captured = 0;
+        if (!FdCaptureStream(fdExe, args, 120000, [&](std::string&& path) {
+            ++captured;
+            // fd 输出 UTF-8，直接入池（宽字符转换只在命中展示时做）。逐行消费，
+            // 避免先保留整根路径列表、再复制进索引池。
             std::replace(path.begin(), path.end(), '/', '\\');
             if (path.size() > 3 && path.back() == '\\') path.pop_back();
-            if (path.size() < 2) continue;
+            if (path.size() < 2) return true;
+            if (rd.size() >= cap) return true;
             MemPoolAdd(rd, path, pass == 0);
             ++added;
             if (dbgMem && added % 500 == 0) {   // 卡点定位：最后一条即卡住条目的邻域
@@ -995,6 +1054,12 @@ bool MemListRootFd(const std::wstring& fdExe, const std::wstring& root, size_t c
                          path.c_str());
                 fflush(stderr);
             }
+            return true;
+        })) return false;
+        if (dbgMem) {
+            fwprintf(stderr, L"[mem] T%u pass %d captured %zu lines\n", tidDbg, pass,
+                     captured);
+            fflush(stderr);
         }
         if (dbgMem) {
             fwprintf(stderr, L"[mem] T%u pass %d done, added %zu\n", tidDbg, pass, added);
@@ -1117,8 +1182,16 @@ unsigned __stdcall MemMaintThread(void*) {
             }
             lastWalk[idx] = now;
             if (idx >= g_memRootNames.size()) continue;
+            size_t available = 0;
+            {
+                std::lock_guard<std::mutex> lk(g_memMu);
+                size_t other = 0;
+                for (size_t i = 0; i < g_memRoots.size(); ++i)
+                    if (i != idx) other += g_memRoots[i].size();
+                if (other < MemCap()) available = MemCap() - other;
+            }
             MemRootData part;
-            MemListRootFd(fdExe, g_memRootNames[idx], MemCap(), part);   // ä¸æéï¼å¯è¾¾åéçº§ï¼
+            if (!MemListRootFd(fdExe, g_memRootNames[idx], available, part)) continue;
         bool swapped = false;
         {
             std::lock_guard<std::mutex> lk(g_memMu);
@@ -1167,11 +1240,22 @@ unsigned __stdcall MemBuildThread(void*) {
     size_t total = 0;
     if (!fdExe.empty()) {
         const size_t cap = MemCap();
-        for (size_t i = 0; i < g_memRootNames.size() && total < cap; ++i) {
+        for (size_t i = 0; i < g_memRootNames.size(); ++i) {
             if (g_memQuit) break;
             const ULONGLONG t0 = GetTickCount64();
+            if (GetEnvironmentVariableW(L"FT_DF_DEBUG", nullptr, 0) > 0) {
+                fprintf(stderr, "[mem] root start: %s\n", WideToUtf8(g_memRootNames[i]).c_str());
+                fflush(stderr);
+            }
             MemRootData part;
-            MemListRootFd(fdExe, g_memRootNames[i], cap - total, part);
+            if (!MemListRootFd(fdExe, g_memRootNames[i], cap - total, part)) {
+                std::lock_guard<std::mutex> lk(g_memMu);
+                if (i < g_memRoots.size()) {
+                    if (g_memRoots[i].size() <= cap - total) total += g_memRoots[i].size();
+                    else g_memRoots[i] = MemRootData{};
+                }
+                continue;   // Keep a usable cached root rather than publish a truncated traversal.
+            }
             total += part.size();
             dbg(L"root done:", ((unsigned long long)i << 32) | part.size());
             dbg(L"root ms:", GetTickCount64() - t0);
@@ -1335,7 +1419,7 @@ DWORD DefaultFdDeadlineMs() {
 
 // ç¨æ·å¸¸ç¨ç®å½æ ¹ï¼æ¡é¢/ææ¡£/ä¸è½½/å¾ç/é³ä¹/è§é¢ï¼
 std::vector<std::wstring> UserDirsRoots() {
-    EnsureThreadCom();
+    ThreadComScope com;
     std::vector<std::wstring> roots;
     auto addRoot = [&](const std::wstring& r) {
         if (r.size() < 3 || r[1] != L':') return;
@@ -1386,7 +1470,7 @@ int FdQuery(const std::wstring& fdExe, const Query& q, bool pathMode, bool skipH
             const std::vector<std::wstring>& rootsOverride) {
     out.clear();
     if (timedOut) *timedOut = false;
-    EnsureThreadCom();   // SHGetFolderPathW è§£æç¨æ·ç®å½éè¦ COM
+    ThreadComScope com;
     // æç´¢æ ¹ï¼é»è®¤ = ç¨æ·å¸¸ç¨ç®å½ï¼æ¡é¢/ææ¡£/ä¸è½½/å¾ç/é³ä¹/è§é¢ï¼åç½® + å¨é¨åºå®çã
     // fd çå±äº«éåéåæ²¡ææ ¹ä¼åçº§ï¼å¤§æ ¹ä¼æå°æ ¹çç»ææ·¹æ²¡å°å åç§ä¹åââ
     // éè¦ä¸¥æ ¼ä¿è¯å¸¸ç¨åºåååºç»ææ¶ï¼è°ç¨æ¹åºåé¶æ®µè°ç¨
@@ -1542,6 +1626,7 @@ int FdQuery(const std::wstring& fdExe, const Query& q, bool pathMode, bool skipH
 // delta è¶ 5 ä¸æ¡æç¼å­è¶ 7 å¤©èªå¨åå°éå»ºï¼ç©ºé²ä¼åçº§ï¼ãFT_DF_DISKINDEX_OFF=1 å³é­ã
 
 HANDLE g_diFile = nullptr, g_diMap = nullptr;
+const unsigned char* g_diBase = nullptr;   // MapViewOfFile base; g_diView skips the header.
 bool g_diskHasPinyin = false;              // blob 行含 "|全拼" 后缀（重建时拼音可用则写入）
 const unsigned char* g_diView = nullptr;   // è®°å½åºèµ·å§ï¼è·³è¿å¤´é¨ï¼
 unsigned long long g_diSize = 0;           // è®°å½åºå­èæ°
@@ -1552,9 +1637,71 @@ std::mutex g_diMu;                         // ä¿æ¤ view/map æ¢å¥
 std::atomic<bool> g_diStarted{false};
 std::atomic<bool> g_diQuit{false};
 std::atomic<bool> g_diRebuilding{false};
+std::atomic<bool> g_diNeedsRebuild{false};
+std::atomic<DWORD> g_diLastBuildError{0};
+std::atomic<ULONGLONG> g_diLastBuildAttempt{0};
 std::mutex g_ovMu;
-std::unordered_map<std::wstring, std::pair<bool, std::wstring>> g_ovAdd;   // 建库后新增：键(小写反斜杠路径) → {isDir, 真实路径}
-std::unordered_set<std::wstring> g_ovDel;         // å»ºåºåå é¤
+struct DiskAddedEntry { bool isDir; std::wstring path; ULONGLONG generation; };
+std::unordered_map<std::wstring, DiskAddedEntry> g_ovAdd;
+std::unordered_map<std::wstring, ULONGLONG> g_ovDel;
+size_t g_ovBytes = 0;
+ULONGLONG g_ovGeneration = 0;
+bool g_ovOverflow = false;
+constexpr size_t kDiskDeltaMaxEntries = 50000;
+constexpr size_t kDiskDeltaMaxBytes = 16 * 1024 * 1024;
+
+size_t DiskDeltaCost(const std::wstring& key, const std::wstring* path = nullptr) {
+    return 128 + sizeof(wchar_t) * (key.size() + 1 + (path ? path->size() + 1 : 0));
+}
+
+// Called under g_ovMu. Clearing both nodes and buckets prevents retained heap growth after floods.
+void DiskDeltaClearLocked() {
+    decltype(g_ovAdd){}.swap(g_ovAdd);
+    decltype(g_ovDel){}.swap(g_ovDel);
+    g_ovBytes = 0;
+}
+
+void DiskDeltaApplyLocked(const std::wstring& key, const std::wstring& path, int isDir) {
+    ++g_ovGeneration;
+    if (g_ovOverflow) return;
+    auto a = g_ovAdd.find(key);
+    auto d = g_ovDel.find(key);
+    size_t oldCost = a != g_ovAdd.end() ? DiskDeltaCost(a->first, &a->second.path)
+                   : d != g_ovDel.end() ? DiskDeltaCost(d->first) : 0;
+    size_t cost = DiskDeltaCost(key, isDir < 0 ? nullptr : &path);
+    bool existing = a != g_ovAdd.end() || d != g_ovDel.end();
+    if ((!existing && g_ovAdd.size() + g_ovDel.size() >= kDiskDeltaMaxEntries) ||
+        g_ovBytes - oldCost + cost > kDiskDeltaMaxBytes) {
+        DiskDeltaClearLocked();
+        g_ovOverflow = true;
+        g_diReady = false;   // Never serve a blob whose dropped changes could make it stale.
+        g_diNeedsRebuild = true;
+        return;
+    }
+    g_ovBytes = g_ovBytes - oldCost + cost;
+    if (isDir < 0) {
+        g_ovAdd.erase(key);
+        g_ovDel[key] = g_ovGeneration;
+    } else {
+        g_ovDel.erase(key);
+        g_ovAdd[key] = {isDir != 0, path, g_ovGeneration};
+    }
+}
+
+void DiskDeltaFoldLocked(ULONGLONG through) {
+    for (auto it = g_ovAdd.begin(); it != g_ovAdd.end();) {
+        if (it->second.generation <= through) {
+            g_ovBytes -= DiskDeltaCost(it->first, &it->second.path);
+            it = g_ovAdd.erase(it);
+        } else ++it;
+    }
+    for (auto it = g_ovDel.begin(); it != g_ovDel.end();) {
+        if (it->second <= through) {
+            g_ovBytes -= DiskDeltaCost(it->first);
+            it = g_ovDel.erase(it);
+        } else ++it;
+    }
+}
 
 DWORD DiskCap() {
     wchar_t env[16]{};
@@ -1566,13 +1713,8 @@ DWORD DiskCap() {
 }
 
 std::wstring DiskCachePath() {
-    EnsureThreadCom();
-    wchar_t p[MAX_PATH]{};
-    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, p)))
-        return L"";
-    std::wstring dir = std::wstring(p) + L"\\Flowtary";
-    CreateDirectoryW(dir.c_str(), nullptr);
-    return dir + L"\\diskindex.dat";
+    std::wstring dir = IndexCacheDir();
+    return dir.empty() ? L"" : dir + L"\\diskindex.dat";
 }
 
 // blob åè·¯å¾å·²å°ååï¼ASCII æå ï¼é ASCII åæ ·ï¼ââè¿éåªå ASCII æå 
@@ -1610,7 +1752,10 @@ bool MemContainsBytes(const unsigned char* hay, size_t hl, const char* nd, size_
 // 无需监听线程失效同步。
 using CaseMap = std::unordered_map<std::wstring, std::wstring>;
 std::mutex g_caseMu;
-std::unordered_map<std::wstring, std::shared_ptr<const CaseMap>> g_caseDirCache;
+struct CaseCacheEntry { std::shared_ptr<const CaseMap> map; size_t bytes = 0; };
+std::unordered_map<std::wstring, CaseCacheEntry> g_caseDirCache;
+size_t g_caseCacheBytes = 0;
+constexpr size_t kCaseCacheMaxBytes = 8 * 1024 * 1024;
 
 // 取目录的名字映射（键=全小写目录，无尾分隔符；盘根为 "c:\"）。refresh 强制重枚举。
 // shared_ptr 保证外层 rehash/清理时已取出的映射仍然有效。
@@ -1619,10 +1764,12 @@ std::shared_ptr<const CaseMap> DiskDirNameMap(const std::wstring& lowDir, bool r
         std::lock_guard<std::mutex> lk(g_caseMu);
         auto it = g_caseDirCache.find(lowDir);
         if (it != g_caseDirCache.end() && !refresh)
-            return it->second;
+            return it->second.map;
     }
     const ULONGLONG tEnum = GetTickCount64();
     CaseMap m;
+    size_t bytes = 0;
+    bool tooLarge = false;
     std::wstring pat = lowDir;
     if (pat.back() != L'\\') pat += L'\\';
     pat += L'*';
@@ -1630,8 +1777,11 @@ std::shared_ptr<const CaseMap> DiskDirNameMap(const std::wstring& lowDir, bool r
     HANDLE h = FindFirstFileW(pat.c_str(), &fd);
     if (h != INVALID_HANDLE_VALUE) {
         do {
-            if (wcscmp(fd.cFileName, L".") != 0 && wcscmp(fd.cFileName, L"..") != 0)
+            if (wcscmp(fd.cFileName, L".") != 0 && wcscmp(fd.cFileName, L"..") != 0) {
+                bytes += 128 + 2 * (wcslen(fd.cFileName) + 1) * sizeof(wchar_t);
+                if (bytes > kCaseCacheMaxBytes) { tooLarge = true; break; }
                 m.emplace(ToLower(fd.cFileName), fd.cFileName);
+            }
         } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
@@ -1642,10 +1792,18 @@ std::shared_ptr<const CaseMap> DiskDirNameMap(const std::wstring& lowDir, bool r
         fflush(stderr);
     }
     std::lock_guard<std::mutex> lk(g_caseMu);
-    if (g_caseDirCache.size() > 8192) g_caseDirCache.clear();   // 粗粒度防膨胀
+    if (g_caseDirCache.size() >= 1024 || g_caseCacheBytes + bytes > kCaseCacheMaxBytes) {
+        g_caseDirCache.clear();
+        g_caseCacheBytes = 0;
+    }
     auto& slot = g_caseDirCache[lowDir];
-    if (!slot || refresh) slot = std::make_shared<const CaseMap>(std::move(m));
-    return slot;
+    if (!slot.map || refresh) {
+        g_caseCacheBytes -= slot.bytes;
+        slot.map = tooLarge ? nullptr : std::make_shared<const CaseMap>(std::move(m));
+        slot.bytes = tooLarge ? 0 : bytes;
+        g_caseCacheBytes += slot.bytes;
+    }
+    return slot.map;
 }
 
 // blob 小写路径（fd 风格反斜杠已归一）→ 真实大小写。逐段查**父目录**的映射表
@@ -1666,6 +1824,11 @@ std::wstring DiskRealCasePath(const std::wstring& lowPath) {
             std::wstring lowDir = lowPath.substr(0, pos);
             if (lowDir.size() > 3 && lowDir.back() == L'\\') lowDir.pop_back();
             auto m = DiskDirNameMap(lowDir);
+            if (!m) {   // Oversized directories use a direct lookup instead of a huge cached map.
+                std::vector<wchar_t> buf(32768);
+                DWORD n = GetLongPathNameW(lowPath.c_str(), buf.data(), (DWORD)buf.size());
+                return n > 0 && n < buf.size() ? std::wstring(buf.data(), n) : lowPath;
+            }
             std::wstring realComp = comp;
             auto it = m ? m->find(comp) : CaseMap::iterator();
             if (m && it == m->end()) {   // 父目录表里没有该名：可能有新条目 → 刷新一次
@@ -1681,6 +1844,16 @@ std::wstring DiskRealCasePath(const std::wstring& lowPath) {
     return real;
 }
 
+void DiskUnmapLocked() {
+    if (g_diBase) UnmapViewOfFile(g_diBase);
+    if (g_diMap) CloseHandle(g_diMap);
+    if (g_diFile) CloseHandle(g_diFile);
+    g_diBase = g_diView = nullptr;
+    g_diMap = g_diFile = nullptr;
+    g_diSize = g_diRecords = g_diDataOff = 0;
+    g_diReady = false;
+}
+
 bool DiskMapExistingLocked() {
     auto dbg2 = [](const wchar_t* m, unsigned long long v) {
         if (GetEnvironmentVariableW(L"FT_DF_DEBUG", nullptr, 0) > 0) {
@@ -1691,13 +1864,10 @@ bool DiskMapExistingLocked() {
         }
     };
     dbg2(L"enter, file size:", 0);
-    if (g_diView) { UnmapViewOfFile(g_diView); g_diView = nullptr; }
-    if (g_diMap) { CloseHandle(g_diMap); g_diMap = nullptr; }
-    if (g_diFile) { CloseHandle(g_diFile); g_diFile = nullptr; }
-    g_diReady = false;
+    DiskUnmapLocked();
     std::wstring path = DiskCachePath();
     if (path.empty()) { dbg2(L"no path:", 0); return false; }
-    g_diFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+    g_diFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (g_diFile == INVALID_HANDLE_VALUE) {
         dbg2(L"open failed:", GetLastError());
@@ -1705,7 +1875,7 @@ bool DiskMapExistingLocked() {
         return false;
     }
     LARGE_INTEGER sz{};
-    if (!GetFileSizeEx(g_diFile, &sz) || sz.QuadPart < 64) {
+    if (!GetFileSizeEx(g_diFile, &sz) || sz.QuadPart < 33) {
         dbg2(L"size bad:", (unsigned long long)sz.QuadPart);
         CloseHandle(g_diFile);
         g_diFile = nullptr;
@@ -1743,7 +1913,11 @@ bool DiskMapExistingLocked() {
         return false;
     }
     unsigned long long n = 0;
-    for (int i = 0; i < 10; ++i) n = n * 10 + (unsigned long long)(view[11 + 6 + i] - '0');
+    for (int i = 0; i < 10; ++i) {
+        unsigned char c = view[11 + 6 + i];
+        if (c < '0' || c > '9') { n = 0; break; }
+        n = n * 10 + (c - '0');
+    }
     if (n == 0) {   // ç©ºç´¢å¼ï¼fd å¤±è´¥ç­ï¼è§ä¸ºä¸å¯ç¨ï¼äº¤ç±éå»º
         dbg2(L"empty index:", 0);
         UnmapViewOfFile(view);
@@ -1753,6 +1927,7 @@ bool DiskMapExistingLocked() {
         return false;
     }
     g_diskHasPinyin = view[31] == '1';
+    g_diBase = view;
     g_diRecords = n;
     g_diDataOff = 33;
     g_diView = view + g_diDataOff;
@@ -1770,17 +1945,23 @@ unsigned __stdcall DiskBuildThread(void*) {
             fwprintf(stderr, L"[disk] %s %llu\n", msg, v), fflush(stderr);
     };
     g_diRebuilding = true;
+    g_diNeedsRebuild = true;
+    DWORD buildError = ERROR_SUCCESS;
     const std::wstring fdExe = FindFdExe();
     dbg(L"fdExe chars:", fdExe.size());
     do {
-        if (fdExe.empty()) break;
+        if (fdExe.empty()) { buildError = ERROR_FILE_NOT_FOUND; break; }
+        // Finish the bounded user-directory build first. A whole-drive fd pass can otherwise
+        // occupy g_fdWalkMu for tens of minutes between two small memory-index roots.
+        while (g_memStarted && !g_memBuildDone && !g_diQuit) Sleep(100);
+        if (g_diQuit) { buildError = ERROR_CANCELLED; break; }
         std::wstring path = DiskCachePath();
-        if (path.empty()) break;
+        if (path.empty()) { buildError = ERROR_PATH_NOT_FOUND; break; }
         dbg(L"cache path ok, rebuilding:", 1);
         std::wstring tmp = path + L".tmp";
         HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr,
                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (h == INVALID_HANDLE_VALUE) { dbg(L"tmp open failed:", GetLastError()); break; }
+        if (h == INVALID_HANDLE_VALUE) { buildError = GetLastError(); dbg(L"tmp open failed:", buildError); break; }
         auto writeAll = [&](const char* p, DWORD n) {
             while (n > 0) {
                 DWORD w = 0;
@@ -1792,8 +1973,19 @@ unsigned __stdcall DiskBuildThread(void*) {
         };
         const bool pyBuild = g_dfPinyinEnabled && g_py != nullptr;   // 拼音可用：行尾写 "|全拼"
         if (!writeAll(pyBuild ? "FTDISKIDX3\nCOUNT\t0000000000\nPY\t1\n"
-                              : "FTDISKIDX3\nCOUNT\t0000000000\nPY\t0\n", 33)) { CloseHandle(h); break; }
+                              : "FTDISKIDX3\nCOUNT\t0000000000\nPY\t0\n", 33)) {
+            buildError = ERROR_WRITE_FAULT;
+            CloseHandle(h);
+            DeleteFileW(tmp.c_str());
+            break;
+        }
         dbg(L"header written:", pyBuild ? 1 : 0);
+        ULONGLONG foldThrough;
+        {
+            std::lock_guard<std::mutex> lk(g_ovMu);
+            if (g_ovOverflow) { DiskDeltaClearLocked(); g_ovOverflow = false; }
+            foldThrough = g_ovGeneration;
+        }
 
         // ä¸¤è¶å¨åï¼åç®å½åæä»¶ï¼+ ç»ä¸åªæï¼ä¸åå­ç´¢å¼åè§åï¼junk ä¸è¿ç´¢å¼ï¼ï¼
         // è§£ææé¶ GetFileAttributes è°ç¨ï¼ä¸ªå«ç¹æ®æä»¶åä¼ææ­»ï¼
@@ -1825,42 +2017,55 @@ unsigned __stdcall DiskBuildThread(void*) {
                 AppendPruneArgs(args, /*includeDot=*/true);
                 args += pass == 0 ? L" -t d" : L" -t f";
                 args += L" . -- " + QuoteArg(root);
-                std::vector<std::string> lines;
+                unsigned long long passLines = 0;
                 bool capOk;
                 {
                     std::lock_guard<std::mutex> wlkg(g_fdWalkMu);   // 与内存走根互斥（I/O 独占）
-                    capOk = FdCaptureLines(fdExe, args, 600000, lines);
-                }
-                dbg(L"pass lines:", (unsigned long long)((pass * 1000000) + lines.size()));
-                if (!capOk) continue;
-                for (const auto& ln : lines) {
-                    std::string low = Utf8LowerAscii(ln);
-                    if (low.size() > 3 && low.back() == '/') low.pop_back();
-                    if (low.size() < 2) continue;
-                    chunk += pass == 0 ? "D" : "F";
-                    chunk += low;
-                    if (pyBuild) {   // basename 全拼后缀（仅汉字名；路径不含 '|'——Windows 文件名非法字符）
-                        const size_t bp = low.find_last_of('/');
-                        std::wstring wbase = Utf8ToWide(
-                            low.substr(bp == std::wstring::npos ? 0 : bp + 1));
-                        std::wstring wp = MemNameToPinyin(wbase.c_str());
-                        if (!wp.empty()) {
-                            chunk += '|';
-                            chunk += WideToUtf8(wp);
+                    capOk = FdCaptureStream(fdExe, args, 600000, [&](std::string&& ln) {
+                        ++passLines;
+                        std::string low = Utf8LowerAscii(ln);
+                        if (low.size() > 3 && low.back() == '/') low.pop_back();
+                        if (low.size() < 2) return true;
+                        if (count >= DiskCap()) return true;
+                        chunk += pass == 0 ? "D" : "F";
+                        chunk += low;
+                        if (pyBuild) {   // basename 全拼后缀（仅汉字名；路径不含 '|'——Windows 文件名非法字符）
+                            const size_t bp = low.find_last_of('/');
+                            std::wstring wbase = Utf8ToWide(
+                                low.substr(bp == std::wstring::npos ? 0 : bp + 1));
+                            std::wstring wp = MemNameToPinyin(wbase.c_str());
+                            if (!wp.empty()) {
+                                chunk += '|';
+                                chunk += WideToUtf8(wp);
+                            }
                         }
-                    }
-                    chunk += "\n";
-                    ++count;
-                    if (chunk.size() >= 4 * 1024 * 1024) {
-                        okW = writeAll(chunk.data(), (DWORD)chunk.size());
-                        chunk.clear();
-                    }
+                        chunk += "\n";
+                        ++count;
+                        if (chunk.size() >= 4 * 1024 * 1024) {
+                            okW = writeAll(chunk.data(), (DWORD)chunk.size());
+                            chunk.clear();
+                        }
+                        return okW;
+                    });
                 }
+                dbg(L"pass lines:", (unsigned long long)((pass * 1000000) + passLines));
                 if (!okW) break;
+                if (!capOk) {
+                    buildError = GetLastError();
+                    if (!buildError) buildError = ERROR_READ_FAULT;
+                    okW = false;
+                    break;
+                }
             }
         }
         dbg(L"walk done, count:", count);
-        if (okW && !chunk.empty()) writeAll(chunk.data(), (DWORD)chunk.size());
+        if (okW && !chunk.empty()) okW = writeAll(chunk.data(), (DWORD)chunk.size());
+        if (!okW || g_diQuit || count == 0) {
+            if (!buildError) buildError = !okW ? ERROR_WRITE_FAULT : ERROR_NO_DATA;
+            CloseHandle(h);
+            DeleteFileW(tmp.c_str());
+            break;
+        }
         // ååçå® COUNTï¼å®å®½ 10 ä½ï¼
         char cnt[11];
         snprintf(cnt, sizeof(cnt), "%010llu", count);
@@ -1868,32 +2073,47 @@ unsigned __stdcall DiskBuildThread(void*) {
         off.QuadPart = 11 + 6;
         SetFilePointer(h, off.LowPart, &off.HighPart, FILE_BEGIN);
         DWORD written = 0;
-        WriteFile(h, cnt, 10, &written, nullptr);
-        FlushFileBuffers(h);
+        bool finalized = WriteFile(h, cnt, 10, &written, nullptr) && written == 10 && FlushFileBuffers(h);
         CloseHandle(h);   // åå³ç¬å å¥æï¼å¦åæ å°çè¯»æå¼ä¼ sharing violation
-        if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
-            dbg(L"rename failed:", GetLastError());
+        if (!finalized) {
+            buildError = ERROR_WRITE_FAULT;
+            DeleteFileW(tmp.c_str());
             break;
         }
-        dbg(L"renamed:", count);
-        {   // æ¢æ å° + æ¸ delta
+        {
             std::lock_guard<std::mutex> lk(g_diMu);
-            DiskMapExistingLocked();
+            // Release the old view/file before replacing it; Windows otherwise denies replacement.
+            DiskUnmapLocked();
+            if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+                buildError = GetLastError();
+                DiskMapExistingLocked();   // Keep the last usable index on replacement failure.
+            } else if (!DiskMapExistingLocked()) {
+                buildError = ERROR_INVALID_DATA;
+            }
             std::lock_guard<std::mutex> lk2(g_ovMu);
-            g_ovAdd.clear();
-            g_ovDel.clear();
+            if (!buildError && !g_ovOverflow) {
+                DiskDeltaFoldLocked(foldThrough);   // Preserve events received during the scan.
+                g_diNeedsRebuild = false;
+            }
+            if (g_ovOverflow) { g_diReady = false; buildError = ERROR_RETRY; }
         }
         dbg(L"mapped, ready:", g_diReady.load() ? 1 : 0);
         if (g_diReady.load()) DiskPrefetchAsync();   // 新 blob 预热（避免重建完成后首查付冷页成本）
     } while (false);
+    g_diLastBuildError = buildError;
     g_diRebuilding = false;
     return 0;
 }
 
 void DiskMaybeStartRebuild() {
+    ULONGLONG now = GetTickCount64(), last = g_diLastBuildAttempt.load();
+    if (last && now - last < 60000) return;   // Missing dependencies/failing disks must not spin.
     bool expect = false;
     if (g_diRebuilding.compare_exchange_strong(expect, true)) {   // æ¢å°å¯å¨æï¼çº¿ç¨ç»ææ¶èªæ¸é¶ï¼
-        CloseHandle((HANDLE)_beginthreadex(nullptr, 0, DiskBuildThread, nullptr, 0, nullptr));
+        g_diLastBuildAttempt = now;
+        HANDLE th = (HANDLE)_beginthreadex(nullptr, 0, DiskBuildThread, nullptr, 0, nullptr);
+        if (th) CloseHandle(th);
+        else { g_diLastBuildError = ERROR_NOT_ENOUGH_MEMORY; g_diRebuilding = false; }
     }
 }
 
@@ -1978,7 +2198,15 @@ unsigned __stdcall DiskWatchThread(void* p) {
                                        FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME,
                                        &bytes, nullptr, nullptr))
                 break;
-            if (bytes == 0) break;   // æº¢åºï¼äº¤ç»éå»ºå¨æ
+            if (bytes == 0) {
+                std::lock_guard<std::mutex> lk(g_ovMu);
+                DiskDeltaClearLocked();
+                g_ovOverflow = true;
+                g_diReady = false;
+                g_diNeedsRebuild = true;
+                DiskMaybeStartRebuild();
+                continue;
+            }
             // åæ éè§£æäºä»¶ï¼å«å±æ§ï¼ï¼åç­ææéå¥è¡¨
             std::vector<std::pair<std::wstring, int>> resolved;   // path, isDir(-1=å é¤)
             const FILE_NOTIFY_INFORMATION* fni = (const FILE_NOTIFY_INFORMATION*)buf;
@@ -2004,13 +2232,10 @@ unsigned __stdcall DiskWatchThread(void* p) {
                     for (auto& c : key)
                         if (c == L'/') c = L'\\';
                     key = ToLower(key);   // 键统一小写反斜杠形，与 blob 命中过滤同形可比
-                    if (kv.second < 0) { g_ovDel.insert(key); g_ovAdd.erase(key); }
-                    else { g_ovAdd[key] = {kv.second != 0, kv.first}; g_ovDel.erase(key); }
+                    DiskDeltaApplyLocked(key, kv.first, kv.second);
                 }
             }
-            size_t ov = 0;
-            { std::lock_guard<std::mutex> lk(g_ovMu); ov = g_ovAdd.size() + g_ovDel.size(); }
-            if (ov > 50000 && !g_diRebuilding) DiskMaybeStartRebuild();   // delta å¤ªå¤§ï¼æ´ä½éå»º
+            if (g_diNeedsRebuild) DiskMaybeStartRebuild();
         }
         CloseHandle(h);
         if (g_diQuit) break;
@@ -2045,7 +2270,7 @@ void DiskIndexStart() {
     if (g_diReady) DiskPrefetchAsync();   // 冷页预热：首查的 218-500ms 页缓存回填挪到后台
     if (g_diReady && g_dfPinyinEnabled && !g_diskHasPinyin)
         DiskMaybeStartRebuild();   // 拼音开启但缓存是 PY0（关拼音期间建的）：后台重建补上，旧映射照常服务
-    if (!g_diReady) DiskMaybeStartRebuild();
+    if (!g_diReady) { g_diNeedsRebuild = true; DiskMaybeStartRebuild(); }
     for (const auto& r : DriveRoots()) {
         CloseHandle((HANDLE)_beginthreadex(nullptr, 0, DiskWatchThread,
                                            new std::wstring(r), 0, nullptr));
@@ -2054,7 +2279,10 @@ void DiskIndexStart() {
 
 bool DiskIndexReady() { return g_diReady.load(); }
 
-size_t DiskIndexRecords() { return g_diReady ? g_diRecords : 0; }
+size_t DiskIndexRecords() {
+    std::lock_guard<std::mutex> lk(g_diMu);
+    return g_diReady ? g_diRecords : 0;
+}
 
 // å¨ blob é¦å­è memchr æ«æ + è¡çº§ AND æ ¡éªï¼delta è¡¨åå¹¶å¢å 
 int DiskIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD maxRows) {
@@ -2085,7 +2313,7 @@ int DiskIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD 
     std::vector<std::pair<std::wstring, bool>> found;   // 锁内先收集小写路径
     {   // GetLongPathNameW 属文件系统调用（个别路径会挂死），绝不持 g_diMu 调用
         std::lock_guard<std::mutex> lk(g_diMu);
-        if (!g_diView) return -1;
+        if (!g_diView || !g_diReady) return -1;
         dbg(L"locked, size:", g_diSize);
         const unsigned char* base = g_diView;
         const unsigned long long total = g_diSize;
@@ -2174,7 +2402,7 @@ int DiskIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD 
     std::lock_guard<std::mutex> lk2(g_ovMu);
     for (const auto& kv : g_ovAdd) {
         if (out.size() >= (size_t)maxRows) break;
-        if (q.isFile == kv.second.first) continue;
+        if (q.isFile == kv.second.isDir) continue;
         const std::wstring& lp = kv.first;   // 已是小写反斜杠
         bool ok = true;
         for (const auto& w : wlw)
@@ -2183,7 +2411,7 @@ int DiskIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD 
         for (const auto& e : q.excludes)
             if (!e.empty() && lp.find(e) != std::wstring::npos) { ok = false; break; }
         if (!ok) continue;
-        const std::wstring& real = kv.second.second;   // 真实大小写路径（展示用）
+        const std::wstring& real = kv.second.path;   // 真实大小写路径（展示用）
         bool hit = true;
         if (!pathMode) {
             std::wstring base = real;
@@ -2198,7 +2426,7 @@ int DiskIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD 
                 if (fl.find(w) == std::wstring::npos) { hit = false; break; }
         }
         if (!hit) continue;
-        out.push_back({real, kv.second.first});
+        out.push_back({real, kv.second.isDir});
     }
     dbg(L"scan ms:", (unsigned long long)(GetTickCount64() - t0));
     return (int)out.size();
@@ -2263,6 +2491,7 @@ u_long DaemonPort() {
 }
 
 void DaemonStatsReply(SOCKET s);   // 定义在下方第二个 dfdaemon 块（DaemonHandleConn 转 STAT 用）
+void DaemonMemoryReply(SOCKET s);
 
 }  // namespace
 
@@ -2280,6 +2509,7 @@ void DaemonHandleConn(SOCKET s) {
         exit(0);
     }
     if (meta == "STAT") { dfdaemon::DaemonStatsReply(s); return; }   // 状态查询（此前漏接：STAT 永远无应答，客户端恒判守护进程离线）
+    if (meta == "MEMSTAT") { dfdaemon::DaemonMemoryReply(s); return; }
     auto dbg = [](const char* m) {
         if (GetEnvironmentVariableW(L"FT_DF_DEBUG", nullptr, 0) > 0) {
             fwprintf(stderr, L"[conn] %hs\n", m);
@@ -2349,6 +2579,46 @@ void DaemonHandleConn(SOCKET s) {
 
 namespace dfdaemon {
 
+void DaemonMemoryReply(SOCKET s) {
+    std::string resp;
+    auto add = [&](const char* key, unsigned long long value) {
+        resp += key;
+        resp += '=';
+        resp += std::to_string(value);
+        resp += '\n';
+    };
+    PROCESS_MEMORY_COUNTERS_EX pm{};
+    if (GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pm, sizeof(pm))) {
+        add("private_bytes", pm.PrivateUsage);
+        add("working_set_bytes", pm.WorkingSetSize);
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_memMu);
+        size_t bytes = 0;
+        for (const auto& root : g_memRoots)
+            bytes += root.pool.capacity() + root.pyPool.capacity() +
+                sizeof(uint32_t) * (root.offs.capacity() + root.nameFlags.capacity() + root.pyOffs.capacity());
+        add("mem_pool_bytes", bytes);
+        add("mem_entries", MemIndexSizeLocked());
+    }
+    { std::lock_guard<std::mutex> lk(g_memDeltaMu);
+      add("mem_delta_entries", g_memDeltaAdd.size() + g_memDeltaDel.size()); }
+    { std::lock_guard<std::mutex> lk(g_ovMu);
+      add("disk_delta_entries", g_ovAdd.size() + g_ovDel.size());
+      add("disk_delta_bytes", g_ovBytes);
+      add("disk_delta_overflow", g_ovOverflow); }
+    { std::lock_guard<std::mutex> lk(g_caseMu);
+      add("case_cache_bytes", g_caseCacheBytes);
+      add("case_cache_dirs", g_caseDirCache.size()); }
+    add("disk_ready", g_diReady.load());
+    add("disk_rebuilding", g_diRebuilding.load());
+    add("disk_needs_rebuild", g_diNeedsRebuild.load());
+    add("disk_last_error", g_diLastBuildError.load());
+    add("fd_found", !FindFdExe().empty());
+    resp += "END\n";
+    SendAll(s, resp.data(), (int)resp.size());
+}
+
 void DaemonStatsReply(SOCKET s) {
     int memReady = MemIndexReady() ? 1 : 0;
     int memSize = (int)MemIndexSize();
@@ -2358,6 +2628,8 @@ void DaemonStatsReply(SOCKET s) {
     snprintf(line, sizeof(line), "M %d %d\n", memReady, memSize);
     std::string resp = line;
     snprintf(line, sizeof(line), "D %d %d\n", diskReady, diskRecords);
+    resp += line;
+    snprintf(line, sizeof(line), "E %lu %d\n", g_diLastBuildError.load(), g_diRebuilding.load() ? 1 : 0);
     resp += line;
     resp += "END\n";
     SendAll(s, resp.data(), (int)resp.size());
@@ -2418,6 +2690,7 @@ int Serve(const std::vector<std::wstring>& extraRoots) {
     // 可变状态（并发保护在 MemIndexSearch/DiskIndexSearch 的内部锁），线程安全。
     std::atomic<ULONGLONG> lastActive{GetTickCount64()};
     for (;;) {
+        if (g_diNeedsRebuild) DiskMaybeStartRebuild();
         fd_set rs;
         FD_ZERO(&rs);
         FD_SET(ls, &rs);
@@ -2623,8 +2896,11 @@ bool SearchDaemonQuery(const Query& q, bool pathMode, std::vector<Hit>& out, DWO
 }
 
 // å®¢æ·ç«¯ç¶ææ¥è¯¢ï¼wsquery --memstat/--diskstat ç¨ï¼
-bool SearchDaemonStat(int& memReady, int& memSize, int& diskReady, int& diskRecords) {
+bool SearchDaemonStat(int& memReady, int& memSize, int& diskReady, int& diskRecords,
+                      int* diskError, int* diskBuilding) {
     memReady = memSize = diskReady = diskRecords = 0;
+    if (diskError) *diskError = 0;
+    if (diskBuilding) *diskBuilding = -1;   // Old daemons do not expose build state.
     WSADATA wsa{};
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return false;
     bool ok = false;
@@ -2648,8 +2924,17 @@ bool SearchDaemonStat(int& memReady, int& memSize, int& diskReady, int& diskReco
             if (b == '\n') {
                 if (lines == 0 && sscanf(acc.c_str(), "M %d %d", &memReady, &memSize) == 2) ++lines;
                 else if (lines == 1 && sscanf(acc.c_str(), "D %d %d", &diskReady, &diskRecords) == 2) ++lines;
+                else if (lines >= 2) {
+                    int error = 0, building = -1;
+                    if (sscanf(acc.c_str(), "E %d %d", &error, &building) == 2) {
+                        if (diskError) *diskError = error;
+                        if (diskBuilding) *diskBuilding = building;
+                    }
+                    ok = true;
+                    break;
+                }
                 acc.clear();
-                if (lines >= 2) { ok = true; break; }
+                if (lines >= 2 && !diskError && !diskBuilding) { ok = true; break; }
                 continue;
             }
             acc += b;

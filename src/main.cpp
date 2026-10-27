@@ -84,6 +84,8 @@ struct List {
 
 // ---------------- 汉字拼音转换（使用 cpp-pinyin 库） ----------------
 #include <cpp-pinyin/Pinyin.h>
+#include <type_traits>
+#include "pinyin_text.h"
 #include <cpp-pinyin/ManTone.h>
 #include <cpp-pinyin/G2pglobal.h>
 
@@ -107,17 +109,23 @@ static std::wstring Utf8ToWString(const std::string& str) {
 
 static std::wstring ToPinyin(const std::wstring& hanzi) {
     if (!g_pinyin) return hanzi;
-    std::string utf8 = WStringToUtf8(hanzi);
-    auto res = g_pinyin->hanziToPinyin(utf8, Pinyin::ManTone::Style::NORMAL, Pinyin::Error::Default, false, false, false);
-    std::string pinyin;
-    for (const auto& r : res) {
-        if (!r.error && !r.pinyin.empty()) {
-            pinyin += r.pinyin;
-        } else if (!r.hanzi.empty()) {
-            pinyin += r.hanzi;
+    try {
+        std::string utf8 = WStringToUtf8(ft::PinyinBmpText(hanzi));
+        auto res = g_pinyin->hanziToPinyin(utf8, Pinyin::ManTone::Style::NORMAL, Pinyin::Error::Default, false, false, false);
+        std::string pinyin;
+        for (const auto& r : res) {
+            if (!r.error && !r.pinyin.empty()) {
+                pinyin += r.pinyin;
+            } else if (!r.hanzi.empty()) {
+                pinyin += r.hanzi;
+            }
         }
+        return Utf8ToWString(pinyin);
+    } catch (const std::bad_alloc&) {
+        throw;
+    } catch (const std::exception&) {
+        return hanzi;
     }
-    return Utf8ToWString(pinyin);
 }
 
 // ---------------- 设置数据模型（与 flowtary-settings.exe 共用） ----------------
@@ -170,13 +178,16 @@ struct Star {
 };
 
 // ---------------- 数据结构 ----------------
+struct ProgramIconDeleter {
+    void operator()(HICON icon) const noexcept { if (icon) DestroyIcon(icon); }
+};
 struct Program {
     std::wstring name;    // 显示名称
     std::wstring path;    // .lnk 或 .exe 完整路径（执行用）
     std::wstring target;  // 快捷方式解析出的目标（工作目录用）
     std::wstring pinyin; // 名称的拼音（用于拼音搜索）
     bool startMenu = false;
-    HICON icon = nullptr;
+    std::unique_ptr<std::remove_pointer_t<HICON>, ProgramIconDeleter> icon;
     bool iconTried = false;
 };
 
@@ -1033,6 +1044,7 @@ static void BuildProgramsInto(std::vector<Program>& out) {
 static void BuildPrograms() {  // 主线程：原地重建 g.programs
     std::vector<Program> out;
     BuildProgramsInto(out);
+    g.items.clear();   // Program rows borrow pointers into the vector being replaced.
     g.programs = std::move(out);
 }
 
@@ -1044,9 +1056,7 @@ static unsigned __stdcall ScanProgramsThread(void*) {
     auto* out = new (std::nothrow) std::vector<Program>();
     if (out) BuildProgramsInto(*out);
     CoUninitialize();
-    if (g.hwnd && out)
-        PostMessageW(g.hwnd, WM_APP_PROGRAMS_READY, 0, (LPARAM)out);
-    else
+    if (!out || !g.hwnd || !PostMessageW(g.hwnd, WM_APP_PROGRAMS_READY, 0, (LPARAM)out))
         delete out;
     return 0;
 }
@@ -1225,9 +1235,9 @@ static HICON GetProgramIcon(Program* p) {
         p->iconTried = true;
         SHFILEINFOW sfi{};
         if (SHGetFileInfoW(p->path.c_str(), 0, &sfi, sizeof(sfi), SHGFI_ICON | SHGFI_SMALLICON))
-            p->icon = sfi.hIcon;
+            p->icon.reset(sfi.hIcon);
     }
-    return p->icon;
+    return p->icon.get();
 }
 
 // 取任意文件/文件夹的小图标（File/Folder 结果行用）：按路径缓存，首次经 shell 抽取。
@@ -1496,7 +1506,10 @@ struct DfReply {
 static void PostDfReply(DWORD gen, int backend, bool failed, bool finalBatch,
                         std::vector<df::Hit>* hits) {
     DfReply* r = new DfReply{gen, backend, failed, finalBatch, hits};
-    if (!PostMessageW(g.hwnd, WM_APP_DF_READY, 0, (LPARAM)r)) delete r;  // 窗口已亡：不泄漏
+    if (!PostMessageW(g.hwnd, WM_APP_DF_READY, 0, (LPARAM)r)) {
+        delete hits;
+        delete r;
+    }
 }
 
 static void DfWsWorker(DWORD gen, df::Query q) {
@@ -4375,6 +4388,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         case WM_COMMAND:
             switch (LOWORD(wParam)) {
+                case IDM_REFRESH:
+                    BuildPrograms();
+                    TrayBalloon(L"已刷新", std::to_wstring(g.programs.size()) + L" 个应用已重新索引");
+                    return 0;
                 case IDM_SETTINGS:
                     OpenSettings();
                     return 0;
@@ -4414,6 +4431,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             // 工作线程扫描完成：在主线程接管结果（工作线程从不写 g.programs）
             std::vector<Program>* p = (std::vector<Program>*)lParam;
             if (p) {
+                g.items.clear();
                 g.programs = std::move(*p);
                 delete p;
             }
@@ -4461,8 +4479,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 DestroyMenu(menu);
                 if (cmd == IDM_SETTINGS) OpenSettings();
                 else if (cmd == IDM_REFRESH) {
-                    BuildPrograms();
-                    TrayBalloon(L"已刷新", std::to_wstring(g.programs.size()) + L" 个应用已重新索引");
+                    SendMessageW(hwnd, WM_COMMAND, IDM_REFRESH, 0);
                 }
                 else if (cmd == IDM_WAKE_HOTKEY) ToggleWakeHotkey();
                 else if (cmd == IDM_EXIT) DestroyWindow(hwnd);

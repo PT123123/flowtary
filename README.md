@@ -241,13 +241,13 @@ build\evtest.exe     :: Everything IPC 协议冒烟测试工具（控制台）
 | :--- | :--- | :--- | :--- | :--- |
 | ① 内存索引 | flowtary-search 全列用户常用目录 + 注册表 `IndexDirs` 附加目录建库，常驻内存 + ReadDirectoryChangesW 增量维护（**增/删/改名事件即时入 RAM delta，查询时与池合并**——新文件含汉字名 2s 内拼音可搜）；磁盘缓存 `%LOCALAPPDATA%\Flowtary\memindex.dat` 重启即用 | 常用目录内**毫秒级** | 整链 **15–31ms**（饱和）；47–62ms（800 行排序候选窗大查询） | ~45MB（16.3 万条，档位可调） |
 | ② 磁盘索引 | flowtary-search 全盘遍历一次（空闲优先级）→ 小写化 UTF-8 路径 blob（`%LOCALAPPDATA%\Flowtary\diskindex.dat`，数百 MB 磁盘文件）→ mmap 只读 + 首字节 memchr 全 blob 扫描；命中经**目录级大小写缓存**还原真名（暖态零文件系统调用） | **全盘** | 扫描 **15ms**（暖） | **进程私有 ~0**（文件映射页可被系统回收；启动时空闲线程 PrefetchVirtualMemory 预取，首查免冷页） |
-| ③ flowtary-search 现查 | 随包 `flowtary-search.exe`（同目录或 PATH）现场并行遍历，**不建任何索引** | 全部固定盘 | 亚秒~8s | 查询瞬时，空闲 0 |
+| ③ fd 现查 | 随包 `fd.exe`（同目录或 PATH）现场并行遍历，**不建任何索引** | 全部固定盘 | 亚秒~8s | 查询瞬时，空闲 0 |
 | ④ Windows Search | OLE DB 查系统索引 `SystemIndex`（覆盖范围 = 系统「索引选项」） | 索引范围内 | 0.8–1.2s 暖查询 | 0（服务系统已有） |
 
-> 组件说明：`flowtary-search.exe` 即开源组件 [sharkdp/fd](https://github.com/sharkdp/fd) 10.5.0
-> 改名分发（MIT/Apache-2.0 双许可）——任务管理器里与 `flowtary.exe` 同族一目了然；
-> 查找顺序：同目录 `flowtary-search.exe` → 旧名 `fd.exe` → PATH。仅在查询/建库瞬间运行，
-> 空闲时无常驻进程。
+> 组件说明：`flowtary-search.exe --serve` 是 Flowtary 自己的常驻索引守护进程；
+> `fd.exe` 是单独随包分发的 [sharkdp/fd](https://github.com/sharkdp/fd) 10.5.0
+>（MIT/Apache-2.0 双许可），负责遍历，查找顺序为同目录 `fd.exe` → PATH。
+> 部署必须同时带上两者；缺少 `fd.exe` 时已有内存缓存仍可读取，但新索引无法构建。
 
 - **建库/遍历剪枝**（fd `-E`，目录级剪枝=整棵子树不进遍历）：点开头、node_modules、
   `__pycache__`、回收站（`$RECYCLE.BIN`/`RECYCLER`）、`System Volume Information`、

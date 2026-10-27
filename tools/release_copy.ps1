@@ -8,11 +8,13 @@ param(
     [string]$Root,
     [string]$Dist
 )
+$ErrorActionPreference = 'Stop'
 
 if (-not $Root) { $Root = Split-Path -Parent $PSScriptRoot }   # tools\.. = 项目根
 if (-not $Dist) { $Dist = Join-Path $Root 'dist' }
 
 $src  = Join-Path $Root 'build'
+if (-not (Test-Path (Join-Path $src 'fd.exe'))) { throw 'fd.exe missing from build output; search indexes cannot be built' }
 $ver  = '0.0.0.0'
 
 $line = Select-String -Path (Join-Path $Root 'src\version.h') -Pattern '#define FT_VER_DOT' | Select-Object -First 1
@@ -30,7 +32,12 @@ Copy-Item (Join-Path $src 'filedlg_hook64.dll') (Join-Path $Dist 'filedlg_hook64
 Copy-Item (Join-Path $src 'filedlg_hook32.dll') (Join-Path $Dist 'filedlg_hook32.dll') -Force
 Copy-Item (Join-Path $src 'filedlg_agent32.exe')(Join-Path $Dist 'filedlg_agent32.exe') -Force
 if (Test-Path (Join-Path $src 'flowtary-search.exe')) {
-    Copy-Item (Join-Path $src 'flowtary-search.exe') (Join-Path $Dist 'flowtary-search.exe') -Force  # d/f 搜索组件（fd 改名分发）；缺失时 flowtary 自动回退
+    Copy-Item (Join-Path $src 'flowtary-search.exe') (Join-Path $Dist 'flowtary-search.exe') -Force
+}
+Copy-Item (Join-Path $src 'fd.exe') (Join-Path $Dist 'fd.exe') -Force
+Copy-Item (Join-Path $src 'cpp-pinyin.dll') (Join-Path $Dist 'cpp-pinyin.dll') -Force
+if (Test-Path (Join-Path $src 'dict')) {
+    Copy-Item (Join-Path $src 'dict') (Join-Path $Dist 'dict') -Recurse -Force
 }
 
 Write-Host ("[ok] {0}\flowtary-{1}.exe" -f $Dist, $ver)

@@ -16,6 +16,9 @@
 
 #include <string>
 #include <vector>
+#include <cstdio>
+#include <exception>
+#include <cstdlib>
 
 #include "df_search.h"
 
@@ -43,6 +46,21 @@ static std::vector<std::wstring> IndexDirsFromRegistry() {
 }
 
 int wmain(int argc, wchar_t** argv) {
+    std::set_terminate([] {
+        try {
+            if (auto error = std::current_exception()) std::rethrow_exception(error);
+        } catch (const std::exception& error) {
+            fprintf(stderr, "[fatal] unhandled C++ exception: %s\n", error.what());
+        } catch (...) {
+            fprintf(stderr, "[fatal] unhandled non-standard exception\n");
+        }
+        void* frames[32]{};
+        fprintf(stderr, "[fatal] image-base=%p\n", GetModuleHandleW(nullptr));
+        USHORT count = CaptureStackBackTrace(0, 32, frames, nullptr);
+        for (USHORT i = 0; i < count; ++i) fprintf(stderr, "[fatal] frame=%p\n", frames[i]);
+        fflush(stderr);
+        std::abort();
+    });
     bool serve = false;
     for (int i = 1; i < argc; ++i)
         if (wcscmp(argv[i], L"--serve") == 0) serve = true;

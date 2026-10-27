@@ -74,15 +74,23 @@ int wmain(int argc, wchar_t** argv) {
         }
         df::SearchDaemonStart();
         int memReady = 0, memSize = 0, diskReady = 0, diskRecords = 0;
-        df::SearchDaemonStat(memReady, memSize, diskReady, diskRecords);
+        int diskError = 0, diskBuilding = -1;
+        if (!df::SearchDaemonStat(memReady, memSize, diskReady, diskRecords, &diskError, &diskBuilding)) {
+            PrintLine(L"无法读取守护进程状态");
+            return 1;
+        }
         PrintLine(L"内存索引: " + std::wstring(memReady ? L"就绪，" : L"建库中，") +
                   std::to_wstring((long long)memSize) + L" 条");
-        PrintLine(L"磁盘索引: " + std::wstring(diskReady ? L"就绪，" : L"建库中，") +
+        PrintLine(L"磁盘索引: " + std::wstring(diskReady ? L"就绪，" : diskBuilding == 1 ? L"建库中，" : L"未就绪，") +
                   std::to_wstring((long long)diskRecords) + L" 条");
+        if (diskError) PrintLine(diskError == ERROR_FILE_NOT_FOUND
+            ? L"磁盘索引错误: 未找到 fd.exe，请检查部署目录。"
+            : L"磁盘索引上次错误: " + std::to_wstring(diskError));
         if (memReady && diskReady)
             PrintLine(L"== 建库全部完成 ==");
-        else
+        else if (diskBuilding == 1 || !memReady)
             PrintLine(L"== 建库进行中 ==");
+        else PrintLine(L"== 索引未完成，当前没有磁盘建库任务 ==");
         return 0;
     }
     if (check) {

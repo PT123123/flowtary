@@ -106,6 +106,7 @@ size_t DiskIndexRecords();       // 条目数（诊断用）
 int SearchDaemonServe(const std::vector<std::wstring>& extraRoots);
 void SearchDaemonStart();        // 幂等：确保守护进程在跑（不在线则拉起，最多等 ~3s）
 bool SearchDaemonQuery(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD maxRows);
-bool SearchDaemonStat(int& memReady, int& memSize, int& diskReady, int& diskRecords);
+bool SearchDaemonStat(int& memReady, int& memSize, int& diskReady, int& diskRecords,
+                      int* diskError = nullptr, int* diskBuilding = nullptr);
 
 }  // namespace df
