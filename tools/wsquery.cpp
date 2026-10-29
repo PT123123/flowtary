@@ -139,7 +139,22 @@ int wmain(int argc, wchar_t** argv) {
         df::SearchDaemonStart();
         std::vector<df::Hit> hits;
         ULONGLONG t0 = GetTickCount64();
-        bool ok = df::SearchDaemonQuery(q, pathMode, hits, rows > 0 ? rows : 50);
+        int batch = 0;
+        // 分批计时：第一批（内存索引）到屏时刻是「秒出」的真正指标，
+        // 总耗时含磁盘兜底，两者要分开看。
+        auto onBatch = [&](std::vector<df::Hit>&& blk) {
+            ++batch;
+            int inPri = 0;
+            for (const auto& h : blk) {
+                if (h.path.rfind(L"C:\\workshop", 0) == 0 || h.path.rfind(L"C:\\software", 0) == 0)
+                    ++inPri;
+            }
+            PrintLine(L"  [batch" + std::to_wstring(batch) + L"] +" +
+                      std::to_wstring((long long)(GetTickCount64() - t0)) + L" ms, " +
+                      std::to_wstring((long long)blk.size()) + L" rows (pri=" +
+                      std::to_wstring(inPri) + L")\n");
+        };
+        bool ok = df::SearchDaemonQuery(q, pathMode, hits, rows > 0 ? rows : 50, onBatch);
         if (!ok) {
             PrintLine(QueryIndexTier() == 0
                           ? L"守护进程查询失败（极简档不驻留守护进程，属正常；实际查询由主程序落 fd/WS 兜底）"

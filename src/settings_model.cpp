@@ -356,6 +356,23 @@ std::vector<std::wstring> LoadExcludePaths() {
     return parsed.empty() ? DefaultExcludePaths() : parsed;
 }
 
+std::vector<std::wstring> ParseIndexDirs(const std::wstring& text) {
+    std::vector<std::wstring> out;
+    size_t i = 0;
+    while (i < text.size()) {
+        size_t j = text.find_first_of(L"\r\n", i);
+        if (j == std::wstring::npos) j = text.size();
+        std::wstring ln = text.substr(i, j - i);
+        size_t a = ln.find_first_not_of(L" \t");
+        if (a != std::wstring::npos && ln[a] != L'#') {
+            size_t b = ln.find_last_not_of(L" \t");
+            if (b != std::wstring::npos) out.push_back(ln.substr(a, b - a + 1));
+        }
+        i = j + 1;
+    }
+    return out;
+}
+
 // ---------------- weights.dat / learned.dat ----------------
 
 std::wstring FlowtaryDataDir() {
@@ -535,6 +552,8 @@ void Settings::Load() {
     excludePaths = LoadExcludePaths();
     excludeText = ExcludePathsToText(excludePaths);
 
+    indexDirsText = LoadRegText(L"IndexDirs");   // 原文回显：注释与空行留给用户自己维护
+
     v = 1;
     weightEnabled = RegGetDword(L"WeightEnabled", v) ? v != 0 : true;
     v = 1;
@@ -636,6 +655,9 @@ void Settings::Save() {
     auto parsedExcl = ParseExcludePaths(excludeText);
     if (!parsedExcl.empty()) self.excludePaths = parsedExcl;  // 清空不生效：保留旧值（原行为）
     SaveRegText(L"ExcludePaths", ExcludePathsToText(excludePaths));
+
+    // 优先根：原文直写，守护进程下次连接比对指纹后自动重启生效
+    SaveRegText(L"IndexDirs", indexDirsText);
 
     if (shellType == 3) {
         self.shellCustomPath = shellCustomPath;

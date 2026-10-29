@@ -28,6 +28,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <queue>
 #include <set>
 #include <cstdio>
 #include <unordered_set>
@@ -1284,15 +1285,24 @@ void MemIndexStart(const std::vector<std::wstring>& extraRoots) {
         g_memReady = true;   // æ¾å¼å³é­ï¼ç´¢å¼æç©ºï¼è°åº¦é¾ç´æ¥èµ° fd/WS
         return;
     }
-    g_memRootNames = UserDirsRoots();
-    for (const auto& extra : extraRoots) {   // æ³¨åè¡¨ IndexDirs éç½®çé¡¹ç®ç®å½ç­
+    std::vector<std::wstring> userRoots = UserDirsRoots();
+    g_memRootNames.clear();
+    for (auto it = extraRoots.rbegin(); it != extraRoots.rend(); ++it) { const std::wstring& extra = *it;   // æ³¨åè¡¨ IndexDirs éç½®çé¡¹ç®ç®å½ç­
         if (extra.size() < 3 || extra[1] != L':') continue;
         wchar_t driveRoot[4] = { extra[0], L':', L'\\', L'\0' };
         if (GetDriveTypeW(driveRoot) != DRIVE_FIXED) continue;
         bool dup = false;
         for (const auto& e : g_memRootNames)
             if (_wcsicmp(e.c_str(), extra.c_str()) == 0) { dup = true; break; }
-        if (!dup) g_memRootNames.push_back(extra);
+        if (!dup) g_memRootNames.insert(g_memRootNames.begin(), extra);
+    }
+    // 用户常用目录根排在优先根之后：优先根（自研应用发布目录等）条目少且都要命中，
+    // 放前面等于给它们一份「不被大根挤掉」的确定性候选位。
+    for (auto& r : userRoots) {
+        bool dup = false;
+        for (const auto& e : g_memRootNames)
+            if (_wcsicmp(e.c_str(), r.c_str()) == 0) { dup = true; break; }
+        if (!dup) g_memRootNames.push_back(std::move(r));
     }
     for (size_t i = 0; i < g_memRootNames.size(); ++i) {
         auto* arg = new MemWatchArg{i, g_memRootNames[i]};
@@ -1316,6 +1326,52 @@ size_t MemIndexSize() {
     return MemIndexSizeLocked();
 }
 
+// ---------------- 内存索引查询排名 ----------------
+// 单查询全池扫描预算（毫秒，FT_DF_MEM_BUDGET_MS 覆盖）：全池约 30 万条几十毫秒，
+// 超预算就按已收集的部分出榜。优先根排在池序最前，所以预算再紧也不会把它们先丢掉。
+static DWORD MemScanBudgetMs() {
+    wchar_t env[16]{};
+    if (GetEnvironmentVariableW(L"FT_DF_MEM_BUDGET_MS", env, 16) > 0) {
+        DWORD v = (DWORD)_wtoi(env);
+        if (v > 0) return v;
+    }
+    return 60;
+}
+
+// 逐词命中质量（与主程序 RenderDfResults 的打分同一套档位）：
+// 整名=词 8 > 名字前缀 4 > 名字包含 / 拼音 2 > 仅路径层 1；任一词落空返回 0（不命中）。
+static int MemHitScore(const char* name, const char* py, const char* path,
+                       const std::vector<std::string>& wb, bool pathMode) {
+    int s = 0;
+    for (const auto& w : wb) {
+        const char* at = MemFindFoldedBytes(name, w);
+        if (at == name && name[w.size()] == '\0') { s += 8; continue; }
+        if (at == name) { s += 4; continue; }
+        if (at) { s += 2; continue; }
+        if (py && *py && (strstr(py, w.c_str()) ||
+                          (w.size() >= 2 && MemIsSubsequenceBytes(py, w.c_str())))) {
+            s += 2; continue;   // 拼音命中与名字包含同档（与主程序打分一致）
+        }
+        if (pathMode && MemFindFoldedBytes(path, w)) { s += 1; continue; }   // 词落在其他目录层
+        return 0;
+    }
+    return s;
+}
+
+struct MemCand {
+    int score = 0;
+    unsigned long long seq = 0;   // 收集序（= 池序）：同分时保住优先根在前
+    std::wstring path;
+    bool isDir = false;
+};
+// 优先队列的比较：返回真 = a 比 b 更该留下，堆顶因此是「最该丢」的那条
+struct MemCandWorse {
+    bool operator()(const MemCand& a, const MemCand& b) const {
+        if (a.score != b.score) return a.score > b.score;
+        return a.seq < b.seq;
+    }
+};
+
 int MemIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD maxRows) {
     out.clear();
     if (!g_memReady.load()) return -1;
@@ -1334,8 +1390,21 @@ int MemIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD m
     std::lock_guard<std::mutex> lk(g_memMu);
     bool hasDel = false;   // 查询窗口内被监听标记删除的池条目（快照，竞态下轮收敛）
     { std::lock_guard<std::mutex> lk2(g_memDeltaMu); hasDel = !g_memDeltaDel.empty(); }
+    // 命中收集：此前「凑够 maxRows 就停」是在排序前截断——池是遍历序，靠后的根
+    // （注册表 IndexDirs 里的自研应用发布目录）与深层目录的精确命中会被前面的噪声
+    // 挤出候选窗，界面拿到 800 行遍历序噪声再怎么排也无米下锅。
+    // 改为全池扫 + 按命中质量留 top maxRows（同分保持池序 = 优先根天然在前）。
+    const DWORD limit = maxRows ? maxRows : 1;
+    const DWORD budgetMs = MemScanBudgetMs();
+    std::priority_queue<MemCand, std::vector<MemCand>, MemCandWorse> heap;
+    unsigned long long seq = 0, scanned = 0;
+    bool budgetOut = false;
     for (const auto& rd : g_memRoots) {
         for (size_t k = 0; k < rd.offs.size(); ++k) {
+            if (((++scanned) & 2047u) == 0 && GetTickCount64() - t0 > budgetMs) {
+                budgetOut = true;
+                break;
+            }
             const char* path = rd.pool.c_str() + rd.offs[k];
             const uint32_t nf = rd.nameFlags[k];
             const bool isDir = (nf & 0x80000000u) != 0;
@@ -1343,67 +1412,60 @@ int MemIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD m
             const char* name = path + (nf & 0x7FFFFFFFu);
             const char* py = (k < rd.pyOffs.size() && !rd.pyPool.empty())
                                  ? rd.pyPool.c_str() + rd.pyOffs[k] : nullptr;
-            bool ok = true;
-            if (pathMode) {
-                for (const auto& w : wb)
-                    if (!MemFindFoldedBytes(path, w)) { ok = false; break; }
-            } else {
-                for (const auto& w : wb) {
-                    if (MemFindFoldedBytes(name, w)) continue;
-                    if (py && *py) {   // 拼音池为小写 ASCII：strstr 全拼子串 / 字节子序列
-                        if (strstr(py, w.c_str())) continue;
-                        if (w.size() >= 2 && MemIsSubsequenceBytes(py, w.c_str())) continue;
-                    }
-                    ok = false;
-                    break;
-                }
-            }
-            if (!ok) continue;
+            const int sc = MemHitScore(name, py, path, wb, pathMode);
+            if (sc <= 0) continue;
             std::wstring wpath = Utf8ToWide(path);   // 仅命中条目转宽（排除/去重/展示）
             if (!q.excludes.empty() && ContainsAny(ToLower(wpath), q.excludes)) continue;
             if (hasDel) {
                 std::lock_guard<std::mutex> lk2(g_memDeltaMu);
                 if (g_memDeltaDel.count(ToLower(wpath))) continue;
             }
-            out.push_back({std::move(wpath), isDir});
-            if (out.size() >= maxRows) break;
+            heap.push(MemCand{sc, seq++, std::move(wpath), isDir});
+            if (heap.size() > limit) heap.pop();
         }
-        if (out.size() >= maxRows) break;
+        if (budgetOut) break;
     }
     // delta 合并：监听线程即时入库的新增/改名条目（秒级可搜，整根重建换入后折叠），
-    // 匹配规则与池一致（名字 / 全拼子串 / 首字母子序列）
-    {
+    // 匹配规则与池一致（名字 / 全拼子串 / 首字母子序列）；同样进候选堆参与排名
+    if (!budgetOut) {
         std::lock_guard<std::mutex> lk2(g_memDeltaMu);
         for (const auto& kv : g_memDeltaAdd) {
-            if (out.size() >= (size_t)maxRows) break;
             const MemDeltaEntry& de = kv.second;
             if (q.isFile == de.isDir) continue;
             size_t np = de.path.find_last_of(L'\\');
             const wchar_t* name = de.path.c_str() + (np == std::wstring::npos ? 0 : np + 1);
+            int s = 0;
             bool ok = true;
-            if (pathMode) {
-                for (const auto& w : wl)
-                    if (!MemFindFolded(de.path.c_str(), w)) { ok = false; break; }
-            } else {
-                for (const auto& w : wl) {
-                    if (MemFindFolded(name, w)) continue;
-                    if (!de.pinyin.empty()) {
-                        if (MemFindFolded(de.pinyin.c_str(), w)) continue;
-                        if (w.size() >= 2 && MemIsSubsequence(de.pinyin.c_str(), w.c_str())) continue;
-                    }
-                    ok = false;
-                    break;
+            for (const auto& w : wl) {
+                if (MemFindFolded(name, w)) { s += 2; continue; }
+                if (!pathMode && !de.pinyin.empty()) {
+                    if (MemFindFolded(de.pinyin.c_str(), w)) { s += 2; continue; }
+                    if (w.size() >= 2 && MemIsSubsequence(de.pinyin.c_str(), w.c_str())) { s += 2; continue; }
                 }
+                if (pathMode && MemFindFolded(de.path.c_str(), w)) { s += 1; continue; }
+                ok = false;
+                break;
             }
-            if (!ok) continue;
+            if (!ok || s <= 0) continue;
             if (!q.excludes.empty() && ContainsAny(ToLower(de.path), q.excludes)) continue;
-            out.push_back({de.path, de.isDir});
+            heap.push(MemCand{s, seq++, de.path, de.isDir});
+            if (heap.size() > limit) heap.pop();
         }
     }
+    std::vector<MemCand> top;
+    top.reserve(heap.size());
+    for (; !heap.empty(); top.push_back(heap.top()), heap.pop()) {}
+    std::sort(top.begin(), top.end(), [](const MemCand& a, const MemCand& b) {
+        if (a.score != b.score) return a.score > b.score;
+        return a.seq < b.seq;
+    });
+    out.reserve(top.size());
+    for (auto& c : top) out.push_back({std::move(c.path), c.isDir});
     if (GetEnvironmentVariableW(L"FT_DF_DEBUG", nullptr, 0) > 0) {
-        fwprintf(stderr, L"[mems] mode=%s ms=%llu hits=%zu\n",
+        fwprintf(stderr, L"[mems] mode=%s ms=%llu hits=%zu scanned=%llu budgetOut=%d\n",
                  pathMode ? L"path" : L"name",
-                 (unsigned long long)(GetTickCount64() - t0), out.size());
+                 (unsigned long long)(GetTickCount64() - t0), out.size(),
+                 (unsigned long long)scanned, budgetOut ? 1 : 0);
         fflush(stderr);
     }
     return (int)out.size();
@@ -1650,6 +1712,19 @@ bool g_ovOverflow = false;
 constexpr size_t kDiskDeltaMaxEntries = 50000;
 constexpr size_t kDiskDeltaMaxBytes = 16 * 1024 * 1024;
 
+// ---------------- 应用子索引（从磁盘 blob 派生的 exe/lnk 行偏移表）----------------
+// 内存池的条目上限由档位定（默认 30 万条），装不下整台机器：Program Files、
+// %LOCALAPPDATA%\Programs 里的应用 exe 只能等磁盘层扫完（实测 100-650ms）。
+// 但「搜应用」这条主路径其实只关心一小撮可执行入口（本机 C 盘剪枝后 1.6 万条
+// exe/lnk），于是从已有 blob 里派生一张行偏移表：常驻约 70KB，覆盖全盘固定盘，
+// 不受池上限挤压，查询 = 扫这张表（个位数毫秒）。blob 换版（重建/重映射）后
+// 按映射代际自动作废重建，新鲜度与磁盘层同步。
+std::vector<uint32_t> g_appOffs;             // blob 记录区内的行首偏移
+std::mutex g_appMu;                          // 保护 g_appOffs（整表替换）
+std::atomic<bool> g_appReady{false};         // 表已建好，可服务
+std::atomic<bool> g_appBuilding{false};      // 建库线程在跑（去重启动）
+std::atomic<ULONGLONG> g_diMapGen{0};        // blob 映射代际（DiskMapExistingLocked 成功即自增）
+
 size_t DiskDeltaCost(const std::wstring& key, const std::wstring* path = nullptr) {
     return 128 + sizeof(wchar_t) * (key.size() + 1 + (path ? path->size() + 1 : 0));
 }
@@ -1743,72 +1818,46 @@ bool MemContainsBytes(const unsigned char* hay, size_t hl, const char* nd, size_
     return false;
 }
 
-// æ å°å·²æç´¢å¼æä»¶ï¼æ ¡éªçæ¬å¤´ + è§£æ COUNTï¼ï¼æåç½® ready
-// ---------------- 目录级大小写还原缓存 ----------------
-// blob 存小写路径，命中后要还原真实大小写（展示用）。GetLongPathNameW 每路径
-// 一次、Defender 环境实测 6-8ms/次（34 命中 = 250ms，800 行请求最坏秒级）。
-// 改为按目录 FindFirstFileW 枚举一次拿到整目录「小写名→真名」映射并进程级缓存
-// ——暖态查询零文件系统调用。缓存里的名字缺失（新建/改名）时查询侧自愈刷新，
-// 无需监听线程失效同步。
-using CaseMap = std::unordered_map<std::wstring, std::wstring>;
+// ---------------- 组件级大小写还原缓存 ----------------
+// blob 存小写路径，命中后要还原真实大小写（展示用）。原做法是按目录枚举
+// 「小写名→真名」整表缓存，实测两处代价：
+//   · 大目录枚举贵——C:\Windows\System32（5007 项）整目录枚举 1505us，精确名单查
+//     75us，GetLongPathNameW 276us（tools\case_probe.exe 现测；小目录两者接近）；
+//   · 目录映射表很吃私有内存（12MB 上限装不下一趟 800 行查询走过的上千个目录），
+//     超上限就整表清空、同批目录再枚举一遍——实测大小写还原 516ms，比 blob 扫描
+//     （62ms）还贵一个数量级。
+// 改为逐组件精确名查询 + 「真实父路径\小写组件 -> 真实组件」小表缓存：一次探测
+// ~75us、一条缓存 ~200B，大查询几千条也只有几百 KB，不会自我淘汰。探测失败
+// （建库后文件已删，本就没有真名可还原）把小写原样入表，同一代 blob 内不再重复探测。
 std::mutex g_caseMu;
-struct CaseCacheEntry { std::shared_ptr<const CaseMap> map; size_t bytes = 0; };
-std::unordered_map<std::wstring, CaseCacheEntry> g_caseDirCache;
+std::unordered_map<std::wstring, std::wstring> g_caseCompCache;
 size_t g_caseCacheBytes = 0;
-constexpr size_t kCaseCacheMaxBytes = 8 * 1024 * 1024;
+constexpr size_t kCaseCacheMaxBytes = 4 * 1024 * 1024;
 
-// 取目录的名字映射（键=全小写目录，无尾分隔符；盘根为 "c:\"）。refresh 强制重枚举。
-// shared_ptr 保证外层 rehash/清理时已取出的映射仍然有效。
-std::shared_ptr<const CaseMap> DiskDirNameMap(const std::wstring& lowDir, bool refresh = false) {
+// casedParent 必须含尾分隔符（逐段构造时天然满足），lowComp 为小写组件名。
+std::wstring CaseComp(const std::wstring& casedParent, const std::wstring& lowComp) {
+    std::wstring key = casedParent;
+    key += lowComp;
     {
         std::lock_guard<std::mutex> lk(g_caseMu);
-        auto it = g_caseDirCache.find(lowDir);
-        if (it != g_caseDirCache.end() && !refresh)
-            return it->second.map;
+        auto it = g_caseCompCache.find(key);
+        if (it != g_caseCompCache.end()) return it->second;
     }
-    const ULONGLONG tEnum = GetTickCount64();
-    CaseMap m;
-    size_t bytes = 0;
-    bool tooLarge = false;
-    std::wstring pat = lowDir;
-    if (pat.back() != L'\\') pat += L'\\';
-    pat += L'*';
+    std::wstring real = lowComp;
     WIN32_FIND_DATAW fd{};
-    HANDLE h = FindFirstFileW(pat.c_str(), &fd);
-    if (h != INVALID_HANDLE_VALUE) {
-        do {
-            if (wcscmp(fd.cFileName, L".") != 0 && wcscmp(fd.cFileName, L"..") != 0) {
-                bytes += 128 + 2 * (wcslen(fd.cFileName) + 1) * sizeof(wchar_t);
-                if (bytes > kCaseCacheMaxBytes) { tooLarge = true; break; }
-                m.emplace(ToLower(fd.cFileName), fd.cFileName);
-            }
-        } while (FindNextFileW(h, &fd));
-        FindClose(h);
-    }
-    if (GetEnvironmentVariableW(L"FT_DF_DEBUG", nullptr, 0) > 0) {
-        fwprintf(stderr, L"[case] enum ms=%llu dir=%hs n=%zu\n",
-                 (unsigned long long)(GetTickCount64() - tEnum),
-                 WideToUtf8(lowDir).c_str(), m.size());
-        fflush(stderr);
-    }
+    HANDLE h = FindFirstFileW(key.c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) { real = fd.cFileName; FindClose(h); }
     std::lock_guard<std::mutex> lk(g_caseMu);
-    if (g_caseDirCache.size() >= 1024 || g_caseCacheBytes + bytes > kCaseCacheMaxBytes) {
-        g_caseDirCache.clear();
+    if (g_caseCacheBytes > kCaseCacheMaxBytes) {
+        g_caseCompCache.clear();
         g_caseCacheBytes = 0;
     }
-    auto& slot = g_caseDirCache[lowDir];
-    if (!slot.map || refresh) {
-        g_caseCacheBytes -= slot.bytes;
-        slot.map = tooLarge ? nullptr : std::make_shared<const CaseMap>(std::move(m));
-        slot.bytes = tooLarge ? 0 : bytes;
-        g_caseCacheBytes += slot.bytes;
-    }
-    return slot.map;
+    const auto res = g_caseCompCache.emplace(std::move(key), std::move(real));
+    g_caseCacheBytes += 160 + 2 * (res.first->first.size() + res.first->second.size());
+    return res.first->second;
 }
 
-// blob 小写路径（fd 风格反斜杠已归一）→ 真实大小写。逐段查**父目录**的映射表
-// （该目录枚举出的「子名→真名」）；目录不存在/缓存缺失该名（新建、改名）时
-// 重枚举一次，仍缺则保留小写。
+// blob 小写路径（fd 风格反斜杠已归一）-> 真实大小写：自盘根逐段拼接，每段查上表。
 std::wstring DiskRealCasePath(const std::wstring& lowPath) {
     if (lowPath.size() < 4 || lowPath[1] != L':' || lowPath[2] != L'\\') return lowPath;
     std::wstring real;
@@ -1818,29 +1867,11 @@ std::wstring DiskRealCasePath(const std::wstring& lowPath) {
     while (pos < lowPath.size() && real.size() < 1024) {
         size_t slash = lowPath.find(L'\\', pos);
         if (slash == std::wstring::npos) slash = lowPath.size();
-        const std::wstring comp = lowPath.substr(pos, slash - pos);
-        if (!comp.empty()) {
-            // 父目录 = 当前组件之前的路径（首个组件的父是盘根 "c:\"，键保留尾分隔符）
-            std::wstring lowDir = lowPath.substr(0, pos);
-            if (lowDir.size() > 3 && lowDir.back() == L'\\') lowDir.pop_back();
-            auto m = DiskDirNameMap(lowDir);
-            if (!m) {   // Oversized directories use a direct lookup instead of a huge cached map.
-                std::vector<wchar_t> buf(32768);
-                DWORD n = GetLongPathNameW(lowPath.c_str(), buf.data(), (DWORD)buf.size());
-                return n > 0 && n < buf.size() ? std::wstring(buf.data(), n) : lowPath;
-            }
-            std::wstring realComp = comp;
-            auto it = m ? m->find(comp) : CaseMap::iterator();
-            if (m && it == m->end()) {   // 父目录表里没有该名：可能有新条目 → 刷新一次
-                m = DiskDirNameMap(lowDir, /*refresh=*/true);
-                it = m ? m->find(comp) : CaseMap::iterator();
-            }
-            if (m && it != m->end()) realComp = it->second;
-            if (real.back() != L'\\') real += L'\\';
-            real += realComp;
-        }
+        if (slash > pos) real += CaseComp(real, lowPath.substr(pos, slash - pos));
+        real += L'\\';
         pos = slash + 1;
     }
+    if (!real.empty() && real.back() == L'\\') real.pop_back();
     return real;
 }
 
@@ -1933,6 +1964,8 @@ bool DiskMapExistingLocked() {
     g_diView = view + g_diDataOff;
     g_diSize = (unsigned long long)sz.QuadPart - g_diDataOff;
     g_diReady = true;
+    { std::lock_guard<std::mutex> lkc(g_caseMu); g_caseCompCache.clear(); g_caseCacheBytes = 0; }
+    ++g_diMapGen;   // 应用子索引据此判定旧偏移表作废并重建
     dbg2(L"map ok, records:", n);
     return true;
 }
@@ -2310,7 +2343,10 @@ int DiskIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD 
     for (const auto& e : q.excludes) ex.push_back(Utf8LowerAscii(WideToUtf8(e)));
 
     std::unordered_set<std::string> seen;              // å»éï¼fd å¯¹ junction å¯è½éå¤æä¸¾ï¼
-    std::vector<std::pair<std::wstring, bool>> found;   // 锁内先收集小写路径
+    // 候选堆：blob 是建库遍历序，此前「凑够 maxRows 就停」等于在排序前截断——几百万条里
+    // 排在后面的应用 exe 会被前面的噪声挤出候选窗。改为全 blob 扫 + 按命中质量留 top。
+    std::priority_queue<MemCand, std::vector<MemCand>, MemCandWorse> heap;
+    unsigned long long seq = 0;
     {   // GetLongPathNameW 属文件系统调用（个别路径会挂死），绝不持 g_diMu 调用
         std::lock_guard<std::mutex> lk(g_diMu);
         if (!g_diView || !g_diReady) return -1;
@@ -2319,7 +2355,7 @@ int DiskIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD 
         const unsigned long long total = g_diSize;
         const std::string& w0 = wl[0];
         const unsigned char c0 = (unsigned char)w0[0];
-        for (const unsigned char* p = base; found.size() < (size_t)maxRows; ++p) {
+        for (const unsigned char* p = base; ; ++p) {
             if ((unsigned long long)(p - base) + w0.size() > total) break;
             p = (const unsigned char*)memchr(p, c0, (size_t)(total - (p - base)));
             if (!p) break;
@@ -2350,25 +2386,25 @@ int DiskIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD 
             }
         }
         // åæ¨¡å¼ï¼è¯å¿é»å¨æåä¸æ®µï¼åæ®µï¼å ï¼è·¯å¾æ¨¡å¼ï¼æ´æ¡è·¯å¾
-        const unsigned char* seg = rec;
-        size_t segLen = pathLen;
-        if (!pathMode) {
-            for (size_t i = pathLen; i > 0; --i)
-                if (rec[i - 1] == '/') { seg = rec + i; segLen = pathLen - i; break; }
-        }
+        const unsigned char* nameSeg = rec;   // basename 始终算出：打分要分清「命中名字」与「只命中路径其他层」
+        size_t nameLen = pathLen;
+        for (size_t i = pathLen; i > 0; --i)
+            if (rec[i - 1] == '/') { nameSeg = rec + i; nameLen = pathLen - i; break; }
         // 名字模式：词落在名字段，或落在该条目的拼音段（全拼子串，与 memchr 候选枚举
         // 相容——非连续的首字母子序列无法被候选扫描发现，仅内存层支持）；路径模式：词落在路径段
-        auto wordHit = [&](const std::string& w) -> bool {
-            if (MemContainsBytes(seg, segLen, w.data(), w.size())) return true;
-            if (!pathMode && pyLen > 0)
-                return MemContainsBytes(pySeg, pyLen, w.data(), w.size()) != 0;
-            return false;
-        };
-        if (!wordHit(w0)) continue;
+        // 逐词命中质量（与内存层同档）：整名=词 8 > 名字前缀 4 > 名字/拼音包含 2 > 仅路径层 1
+        int sc = 0;
         bool ok = true;
-        for (size_t i = 1; i < wl.size(); ++i)
-            if (!wordHit(wl[i])) { ok = false; break; }
-        if (!ok) continue;
+        for (const auto& w : wl) {
+            if (w.size() == nameLen && memcmp(nameSeg, w.data(), w.size()) == 0) { sc += 8; continue; }
+            if (nameLen >= w.size() && memcmp(nameSeg, w.data(), w.size()) == 0) { sc += 4; continue; }
+            if (MemContainsBytes(nameSeg, nameLen, w.data(), w.size())) { sc += 2; continue; }
+            if (pyLen > 0 && MemContainsBytes(pySeg, pyLen, w.data(), w.size())) { sc += 2; continue; }
+            if (pathMode && MemContainsBytes(rec, pathLen, w.data(), w.size())) { sc += 1; continue; }
+            ok = false;
+            break;
+        }
+        if (!ok || sc <= 0) continue;
         for (const auto& e : ex)
             if (!e.empty() && MemContainsBytes(rec, pathLen, e.data(), e.size())) { ok = false; break; }
         if (!ok) continue;
@@ -2383,21 +2419,31 @@ int DiskIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD 
             if (g_ovDel.count(key)) continue;
             if (g_ovAdd.count(key)) continue;
         }
-        found.push_back({std::move(path), isDir});
+        heap.push(MemCand{sc, seq++, std::move(path), isDir});
+        if (heap.size() > (size_t)maxRows) heap.pop();
         }
     }   // g_diMu 释放
+    const ULONGLONG tBlobScan = GetTickCount64();
     // blob 存的是小写路径：还原真实大小写（目录级映射缓存，暖态零文件系统调用；
     // 文件已删时保留小写）。fd 风格正斜杠先归一为反斜杠，与其他层/UI 一致
-    for (auto& f : found) {
+    std::vector<MemCand> top;
+    top.reserve(heap.size());
+    for (; !heap.empty(); top.push_back(heap.top()), heap.pop()) {}
+    std::sort(top.begin(), top.end(), [](const MemCand& a, const MemCand& b) {
+        if (a.score != b.score) return a.score > b.score;
+        return a.seq < b.seq;
+    });
+    for (auto& c : top) {
         if (out.size() >= (size_t)maxRows) break;
-        for (auto& c : f.first)
-            if (c == L'/') c = L'\\';
-        f.first = DiskRealCasePath(f.first);
-        if (f.first.size() >= 2 && f.first[1] == L':' &&
-            f.first[0] >= L'a' && f.first[0] <= L'z')
-            f.first[0] -= L'a' - L'A';   // 盘符兜底大写（DiskRealCasePath 已做）
-        out.push_back({std::move(f.first), f.second});
+        for (auto& ch : c.path)
+            if (ch == L'/') ch = L'\\';
+        c.path = DiskRealCasePath(c.path);
+        if (c.path.size() >= 2 && c.path[1] == L':' &&
+            c.path[0] >= L'a' && c.path[0] <= L'z')
+            c.path[0] -= L'a' - L'A';   // 盘符兜底大写（DiskRealCasePath 已做）
+        out.push_back({std::move(c.path), c.isDir});
     }
+    const ULONGLONG tCase = GetTickCount64();
     // å»ºåºåæ°å¢æ¡ç®ï¼RAM deltaï¼ï¼æ°éå°ï¼å®½å­ç¬¦çº¿æ§è¿æ»¤
     std::lock_guard<std::mutex> lk2(g_ovMu);
     for (const auto& kv : g_ovAdd) {
@@ -2429,7 +2475,205 @@ int DiskIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD 
         out.push_back({real, kv.second.isDir});
     }
     dbg(L"scan ms:", (unsigned long long)(GetTickCount64() - t0));
+    if (GetEnvironmentVariableW(L"FT_DF_DEBUG", nullptr, 0) > 0) {
+        fwprintf(stderr, L"[disks] split blobscan=%llu ms case=%llu ms rows=%zu\n",
+                 (unsigned long long)(tBlobScan - t0),
+                 (unsigned long long)(tCase - tBlobScan), out.size());
+        fflush(stderr);
+    }
     return (int)out.size();
+}
+
+// ---------------- 应用子索引：建表 / 查询 ----------------
+// blob 行形如「F<小写路径>[|小写全拼]」，路径用正斜杠（fd 输出原样落盘）。
+static bool AppExtHit(const char* s, size_t n) {
+    static const struct { const char* text; size_t len; } kExts[] = {
+        {".exe", 4}, {".lnk", 4}, {".appref-ms", 10}, {".msi", 4},
+    };
+    for (const auto& e : kExts)
+        if (n >= e.len && memcmp(s + n - e.len, e.text, e.len) == 0) return true;
+    return false;
+}
+
+// 分块建表：每块 8MB 持锁、块间让锁，查询最多等一块（几十毫秒），不会被一次
+// 375MB 全扫顶到后台。块尾若停在残行上，pos 退回该行行首，下一块从整行接手。
+unsigned __stdcall AppIndexBuildThread(void*) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
+    std::vector<uint32_t> offs;
+    offs.reserve(20000);
+    const unsigned long long chunk = 8ull << 20;
+    unsigned long long pos = 0;
+    ULONGLONG gen = 0;
+    bool done = false;
+    while (!g_diQuit.load()) {
+        std::unique_lock<std::mutex> lk(g_diMu);
+        if (!g_diReady.load() || !g_diView) break;
+        if (gen == 0) {
+            gen = g_diMapGen.load();
+        } else if (g_diMapGen.load() != gen) {   // blob 换版：旧偏移全部作废，从头重扫
+            gen = g_diMapGen.load();
+            offs.clear();
+            pos = 0;
+        }
+        const unsigned long long size = g_diSize;
+        if (size > 0xFFFFFFFFull) break;   // 偏移用 uint32：超大 blob 不建表（磁盘层照常服务）
+        if (pos >= size) { done = true; break; }
+        const unsigned char* p = g_diView + pos;
+        const unsigned char* blockEnd = g_diView + ((size - pos > chunk) ? pos + chunk : size);
+        while (p < blockEnd) {
+            const unsigned char* nl =
+                (const unsigned char*)memchr(p, '\n', (size_t)(blockEnd - p));
+            const unsigned char* le = nl ? nl : blockEnd;
+            const size_t len = (size_t)(le - p);
+            if (p[0] == 'F' && len >= 6) {
+                const char* rec = (const char*)(p + 1);
+                size_t pathLen = len - 1;
+                const char* pipe = (const char*)memchr(rec, '|', pathLen);
+                if (pipe) pathLen = (size_t)(pipe - rec);
+                if (AppExtHit(rec, pathLen))
+                    offs.push_back((uint32_t)(p - g_diView));
+            }
+            if (!nl) break;             // 残行：从这一行重扫（下一块拿整行）
+            p = nl + 1;
+        }
+        pos = (unsigned long long)(p - g_diView);
+        lk.unlock();
+        if (done) break;
+        Sleep(2);
+    }
+    if (done) {
+        std::lock_guard<std::mutex> lka(g_appMu);
+        g_appOffs = std::move(offs);
+        g_appReady = true;
+        if (GetEnvironmentVariableW(L"FT_DF_DEBUG", nullptr, 0) > 0) {
+            fwprintf(stderr, L"[appidx] built rows=%zu\n", g_appOffs.size());
+            fflush(stderr);
+        }
+    }
+    g_appBuilding = false;
+    return 0;
+}
+
+void AppIndexKick() {
+    if (g_appReady.load() || g_diMapGen.load() == 0) return;
+    bool expect = false;
+    if (!g_appBuilding.compare_exchange_strong(expect, true)) return;
+    HANDLE th = (HANDLE)_beginthreadex(nullptr, 0, AppIndexBuildThread, nullptr, 0, nullptr);
+    if (th) CloseHandle(th);
+    else g_appBuilding = false;
+}
+
+// 名字模式匹配（应用层只按名字/拼音命中，路径兜底交给磁盘层）；打分档位与
+// 内存池、磁盘 blob 一致，保证三层合到一块排序时可比。
+int AppIndexSearch(const Query& q, std::vector<Hit>& out, DWORD maxRows) {
+    out.clear();
+    if (!g_appReady.load() || q.words.empty() || !q.isFile) return -1;
+    const ULONGLONG t0 = GetTickCount64();
+    std::vector<std::string> wl;
+    for (const auto& w : q.words) wl.push_back(Utf8LowerAscii(WideToUtf8(w)));
+    std::vector<std::string> ex;
+    for (const auto& e : q.excludes) ex.push_back(Utf8LowerAscii(WideToUtf8(e)));
+    std::priority_queue<MemCand, std::vector<MemCand>, MemCandWorse> heap;
+    unsigned long long seq = 0;
+    {
+        std::lock_guard<std::mutex> lka(g_appMu);
+        std::lock_guard<std::mutex> lk(g_diMu);
+        if (!g_diView || !g_diReady.load()) return -1;
+        const unsigned char* end = g_diView + g_diSize;
+        for (uint32_t off : g_appOffs) {
+            const unsigned char* p = g_diView + off;
+            if (p >= end) continue;
+            const unsigned char* nl = (const unsigned char*)memchr(p, '\n', (size_t)(end - p));
+            const unsigned char* le = nl ? nl : end;
+            const size_t len = (size_t)(le - p);
+            const unsigned char* rec = p + 1;
+            size_t pathLen = len - 1;
+            const unsigned char* pySeg = nullptr;
+            size_t pyLen = 0;
+            if (g_diskHasPinyin) {
+                const unsigned char* pipe = (const unsigned char*)memchr(rec, '|', pathLen);
+                if (pipe) { pySeg = pipe + 1; pyLen = pathLen - (size_t)(pipe - rec) - 1; pathLen = (size_t)(pipe - rec); }
+            }
+            const unsigned char* nameSeg = rec;
+            size_t nameLen = pathLen;
+            for (size_t i = pathLen; i > 0; --i)
+                if (rec[i - 1] == '/') { nameSeg = rec + i; nameLen = pathLen - i; break; }
+            int sc = 0;
+            bool ok = true;
+            for (const auto& w : wl) {
+                if (w.size() == nameLen && memcmp(nameSeg, w.data(), w.size()) == 0) { sc += 8; continue; }
+                if (nameLen >= w.size() && memcmp(nameSeg, w.data(), w.size()) == 0) { sc += 4; continue; }
+                if (MemContainsBytes(nameSeg, nameLen, w.data(), w.size())) { sc += 2; continue; }
+                if (pyLen > 0 && MemContainsBytes(pySeg, pyLen, w.data(), w.size())) { sc += 2; continue; }
+                ok = false;
+                break;
+            }
+            if (!ok || sc <= 0) continue;
+            for (const auto& e : ex)
+                if (!e.empty() && MemContainsBytes(rec, pathLen, e.data(), e.size())) { ok = false; break; }
+            if (!ok) continue;
+            heap.push(MemCand{sc, seq++, Utf8ToWide(std::string((const char*)rec, pathLen)), false});
+            if (heap.size() > (size_t)maxRows) heap.pop();
+        }
+    }
+    std::vector<MemCand> top;
+    top.reserve(heap.size());
+    for (; !heap.empty(); top.push_back(heap.top()), heap.pop()) {}
+    std::sort(top.begin(), top.end(), [](const MemCand& a, const MemCand& b) {
+        if (a.score != b.score) return a.score > b.score;
+        return a.seq < b.seq;
+    });
+    const ULONGLONG tScan = GetTickCount64();
+    // 首块只还原前 64 行的真实大小写。还原是每行若干次目录枚举（冷态 ~0.2ms/行，
+    // 实测 167 行 = 32ms、151 行 = 94ms），而主程序首屏只显示 10 行——多出来的行
+    // 留在小写态反而比把它们推给磁盘块更糟（去重后磁盘块就不会再补真名）。
+    // 因此超出部分直接不并进首块：同一批路径磁盘层随后会带着真实大小写送到。
+    const size_t rowCap = (std::min)((size_t)maxRows, (size_t)64);
+    for (auto& c : top) {
+        if (out.size() >= rowCap) break;
+        for (auto& ch : c.path)
+            if (ch == L'/') ch = L'\\';
+        c.path = DiskRealCasePath(c.path);
+        out.push_back({std::move(c.path), false});
+    }
+    if (GetEnvironmentVariableW(L"FT_DF_DEBUG", nullptr, 0) > 0) {
+        fwprintf(stderr, L"[appidx] rows=%zu scan=%llu ms case=%llu ms\n",
+                 out.size(), (unsigned long long)(tScan - t0),
+                 (unsigned long long)(GetTickCount64() - tScan));
+        fflush(stderr);
+    }
+    return (int)out.size();
+}
+
+// 合块前按文本命中质量重排（与主程序 scoreOf 同档）：两侧各自排过序，直接拼接
+// 会让「池里 800 条包含命中」把应用层的精确同名挤出首屏。
+static void RankHitsByText(const Query& q, std::vector<Hit>& v) {
+    if (q.words.empty() || v.size() < 2) return;
+    std::vector<std::wstring> wl;
+    for (const auto& w : q.words) wl.push_back(ToLower(w));
+    std::vector<std::pair<int, size_t>> keys(v.size());
+    for (size_t i = 0; i < v.size(); ++i) {
+        const std::wstring low = ToLower(v[i].path);
+        size_t cut = low.find_last_of(L'\\');
+        const std::wstring name = cut == std::wstring::npos ? low : low.substr(cut + 1);
+        int s = 0;
+        for (const auto& w : wl) {
+            if (name == w) s += 8;
+            else if (name.size() >= w.size() && name.compare(0, w.size(), w) == 0) s += 4;
+            else if (name.find(w) != std::wstring::npos) s += 2;
+            else if (low.find(w) != std::wstring::npos) s += 1;
+            else s += 2;   // 拼音命中（名字与路径都不含词）
+        }
+        keys[i] = {s, i};
+    }
+    std::stable_sort(keys.begin(), keys.end(),
+                     [](const std::pair<int, size_t>& a, const std::pair<int, size_t>& b) {
+                         return a.first > b.first;
+                     });
+    std::vector<Hit> sorted;
+    sorted.reserve(v.size());
+    for (const auto& k : keys) sorted.push_back(std::move(v[k.second]));
+    v = std::move(sorted);
 }
 
 // ---------------- 守护进程协议 I/O（客户端/服务端共用） ----------------
@@ -2539,42 +2783,64 @@ void DaemonHandleConn(SOCKET s) {
     if (!readLines(nexcl, q.excludes)) return;
 
     std::vector<Hit> hits;
+    const ULONGLONG tConn0 = GetTickCount64();
     if (MemIndexSearch(q, false, hits, (DWORD)maxRows) == 0)
         MemIndexSearch(q, true, hits, (DWORD)maxRows);           // 名字零命中 → 路径兜底
-    std::vector<Hit> diskHits;
-    if ((int)hits.size() < maxRows) {   // mem 已拿满：磁盘层条目合并时必然全部丢弃，跳过 90MB blob 扫描
-        if (DiskIndexSearch(q, false, diskHits, (DWORD)maxRows) == 0)
-            DiskIndexSearch(q, true, diskHits, (DWORD)maxRows);
-    }
-    // åå¹¶å»éï¼å°å UTF-8 é®ï¼ï¼mem ä¼å
-    std::unordered_set<std::string> seen;
-    std::vector<Hit> merged;
-    for (Hit& h : hits) {
-        if (!seen.insert(WideToUtf8(ToLower(h.path))).second) continue;
-        merged.push_back(std::move(h));
-        if (merged.size() >= (size_t)maxRows) break;
-    }
-    if (merged.size() < (size_t)maxRows) {
-        for (Hit& h : diskHits) {
-            if (!seen.insert(WideToUtf8(ToLower(h.path))).second) continue;
-            merged.push_back(std::move(h));
-            if (merged.size() >= (size_t)maxRows) break;
+    const ULONGLONG tConnMem = GetTickCount64();
+    const size_t memN = hits.size();
+    // 应用子索引并入首块：Program Files / %LOCALAPPDATA%\Programs 里的应用 exe 不在
+    // 内存池（池上限被用户目录吃掉了），但它只有几万条、扫一遍个位数毫秒——
+    // 「搜应用」因此和 workshop 一样首屏即达，不用等磁盘层几百毫秒。
+    AppIndexKick();
+    {
+        std::vector<Hit> appHits;
+        if (AppIndexSearch(q, appHits, (DWORD)maxRows) > 0) {
+            hits.reserve(hits.size() + appHits.size());
+            for (auto& h : appHits) hits.push_back(std::move(h));
+            RankHitsByText(q, hits);   // 两侧各排过序，合起来必须重排才可比
         }
     }
-
-    // 响应整体拼一块一次 send：此前逐条 send（200 命中 = 200+ 小包）叠加客户端
-    // 逐字节 recv，是扫描之外最大的延迟项（扫描 35ms vs 整链 78-250ms）
-    std::string resp;
-    char head[64];
-    snprintf(head, sizeof(head), "N %d\n", (int)merged.size());
-    resp += head;
-    for (const auto& h : merged) {
-        resp += h.isFolder ? 'D' : 'F';
-        resp += WideToUtf8(h.path);
-        resp += '\n';
+    if (GetEnvironmentVariableW(L"FT_DF_DEBUG", nullptr, 0) > 0) {
+        fwprintf(stderr, L"[conn] mem=%llu ms (%zu) app+rank=%llu ms (%zu)\n",
+                 (unsigned long long)(tConnMem - tConn0), memN,
+                 (unsigned long long)(GetTickCount64() - tConnMem), hits.size());
+        fflush(stderr);
     }
-    resp += "END\n";
-    SendAll(s, resp.data(), (int)resp.size());
+    // mem 已拿满：磁盘层条目合并时必然全部丢弃，跳过几百 MB 的 blob 扫描
+    const bool diskRun = (int)hits.size() < maxRows;
+
+    // 分两块回：内存层（毫秒）先发、块尾标 MORE，磁盘层（百毫秒~秒）随后、块尾标 END。
+    // 客户端按批上屏——自研应用（优先根全部在内存层）的首屏不再被磁盘扫描拖住。
+    std::unordered_set<std::string> seen;   // 小写 UTF-8 键，跨块去重（mem 优先）
+    int sent = 0;
+    auto sendBlock = [&](std::vector<Hit>& blk, bool more) {
+        std::string rows;
+        int cnt = 0;
+        for (auto& h : blk) {
+            if (sent >= maxRows) break;
+            if (!seen.insert(WideToUtf8(ToLower(h.path))).second) continue;
+            rows += h.isFolder ? 'D' : 'F';
+            rows += WideToUtf8(h.path);
+            rows += '\n';
+            ++cnt;
+            ++sent;
+        }
+        // 响应整体拼一块一次 send：逐条 send 叠加客户端逐字节 recv 是扫描之外
+        // 最大的延迟项（扫描 35ms vs 整链 78-250ms）
+        std::string resp;
+        char head[64];
+        snprintf(head, sizeof(head), "N %d\n", cnt);
+        resp += head;
+        resp += rows;
+        resp += more ? "MORE\n" : "END\n";
+        SendAll(s, resp.data(), (int)resp.size());
+    };
+    if (!diskRun) { sendBlock(hits, false); return; }
+    sendBlock(hits, true);
+    std::vector<Hit> diskHits;
+    if (DiskIndexSearch(q, false, diskHits, (DWORD)maxRows) == 0)
+        DiskIndexSearch(q, true, diskHits, (DWORD)maxRows);
+    sendBlock(diskHits, false);
 }
 
 namespace dfdaemon {
@@ -2609,7 +2875,7 @@ void DaemonMemoryReply(SOCKET s) {
       add("disk_delta_overflow", g_ovOverflow); }
     { std::lock_guard<std::mutex> lk(g_caseMu);
       add("case_cache_bytes", g_caseCacheBytes);
-      add("case_cache_dirs", g_caseDirCache.size()); }
+      add("case_cache_entries", g_caseCompCache.size()); }
     add("disk_ready", g_diReady.load());
     add("disk_rebuilding", g_diRebuilding.load());
     add("disk_needs_rebuild", g_diNeedsRebuild.load());
@@ -2684,6 +2950,7 @@ int Serve(const std::vector<std::wstring>& extraRoots) {
     }
     MemIndexStart(extraRoots);
     DiskIndexStart();
+    AppIndexKick();   // 应用子索引在空闲优先级后台建表；不等首查触发，开机后前几十秒也能命中
 
     // 每连接一个短命线程：STAT/诊断连接不再排队在长查询（全 blob 扫描可达 1-3s+）
     // 后面——否则 UI 线程的建库状态轮询会被 2s 收包超时整个卡住。连接间不共享
@@ -2732,6 +2999,7 @@ int Serve(const std::vector<std::wstring>& extraRoots) {
 struct DfTierConfig {
     int tier = 2;        // 0=极简 1=轻量 2=均衡 3=极速
     bool pinyin = true;
+    std::wstring indexDirs;   // 优先根（IndexDirs）原文：变了必须重启守护进程，新根才进内存池
 };
 DfTierConfig DfTierFromReg() {
     DfTierConfig c;
@@ -2743,6 +3011,16 @@ DfTierConfig DfTierFromReg() {
     if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"DfPinyin",
                      RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS)
         c.pinyin = v != 0;
+    DWORD dcsz = 0;   // 变长读：固定缓冲会在列表超量时静默返回 ERROR_MORE_DATA，优先根整体消失
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"IndexDirs",
+                     RRF_RT_REG_SZ, nullptr, nullptr, &dcsz) == ERROR_SUCCESS &&
+        dcsz > sizeof(WCHAR)) {
+        std::vector<WCHAR> dcs(dcsz / sizeof(WCHAR) + 1);
+        DWORD cb = (DWORD)dcs.size() * sizeof(WCHAR);
+        if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"IndexDirs",
+                         RRF_RT_REG_SZ, nullptr, dcs.data(), &cb) == ERROR_SUCCESS)
+            c.indexDirs = dcs.data();
+    }
     return c;
 }
 
@@ -2760,15 +3038,18 @@ void ApplyTierCaps(int tier) {
 bool DfTierChanged() {
     static int s_tier = -1;
     static bool s_pinyin = false;
+    static std::wstring s_dirs;
     DfTierConfig c = DfTierFromReg();
     if (s_tier < 0) {
         s_tier = c.tier;
         s_pinyin = c.pinyin;
+        s_dirs = c.indexDirs;
         return false;
     }
-    if (c.tier == s_tier && c.pinyin == s_pinyin) return false;
+    if (c.tier == s_tier && c.pinyin == s_pinyin && c.indexDirs == s_dirs) return false;
     s_tier = c.tier;
     s_pinyin = c.pinyin;
+    s_dirs = c.indexDirs;
     return true;
 }
 
@@ -2820,7 +3101,8 @@ void SearchDaemonStart() {
 }
 
 // å®¢æ·ç«¯æ¥è¯¢ï¼è¿æ¥ â ååè®® â æ¶ç»æãå¤±è´¥è¿å falseï¼è°ç¨æ¹è½ fd/WS å±ï¼
-bool SearchDaemonQuery(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD maxRows) {
+bool SearchDaemonQuery(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD maxRows,
+                       const std::function<void(std::vector<Hit>&&)>& onBatch) {
     out.clear();
     auto dbg = [](const wchar_t* m, unsigned long long v) {
         if (GetEnvironmentVariableW(L"FT_DF_DEBUG", nullptr, 0) > 0) {
@@ -2863,32 +3145,47 @@ bool SearchDaemonQuery(const Query& q, bool pathMode, std::vector<Hit>& out, DWO
         // 头部和结果行各建一个 reader 的话，头部 reader 析构时缓冲里已收到的
         // 结果行会全部丢失（服务端整包 send 后，剩余数据只在对端 FIN 才醒）
         LineReader in(s);
+        std::unordered_set<std::string> seen;
         std::string acc;
-        int n = -1;
-        if (in.next(acc, 64)) {   // 读 "N count"。读不到合法头 = 协议错位/守护进程异常：整体按失败处理，
-                                  // 调用方落 fd/WS 兜底（原先把垃圾当 0 命中且 ok=true，兜底被吞）
-            int v = -1;
-            if (sscanf(acc.c_str(), "N %d", &v) == 1 && v >= 0) n = v;
+        bool badHeader = false, anyBlock = false;
+        for (;;) {   // 分块读：内存层块尾 MORE，磁盘层块尾 END（旧守护进程只有一块 + END，同样走得通）
+            acc.clear();
+            int n = -1;
+            if (in.next(acc, 64)) {   // 读 "N count"。读不到合法头 = 协议错位/守护进程异常：整体按失败处理，
+                                      // 调用方落 fd/WS 兜底（原先把垃圾当 0 命中且 ok=true，兜底被吞）
+                int v = -1;
+                if (sscanf(acc.c_str(), "N %d", &v) == 1 && v >= 0) n = v;
+            }
+            if (n < 0) { badHeader = !anyBlock; break; }
+            std::vector<Hit> blk;
+            bool eof = false;
+            for (int i = 0; i < n; ++i) {   // 行数读满 n 才碰得到块尾标记：中途不读会把尾行当结果
+                std::string ln;
+                if (!in.next(ln)) { eof = true; break; }
+                if (ln.size() < 2) continue;
+                if (out.size() + blk.size() >= (size_t)maxRows) continue;   // 已满：读而不收，保持同步
+                bool isFolder = ln[0] == 'D';
+                std::wstring path = Utf8ToWide(ln.substr(1));
+                if (path.size() < 3 || path[1] != L':') continue;   // 守护进程只回 X:\ 绝对路径
+                if (!seen.insert(ln.substr(1)).second) continue;
+                blk.push_back({std::move(path), isFolder});
+            }
+            std::string tail;
+            const bool more = !eof && in.next(tail) && tail == "MORE";
+            anyBlock = true;
+            if (onBatch && !blk.empty()) {
+                std::vector<Hit> copy = blk;
+                onBatch(std::move(copy));
+            }
+            for (auto& h : blk) out.push_back(std::move(h));
+            if (!more) break;
         }
-        if (n < 0) {
+        if (badHeader) {
             dbg(L"bad header, bytes:", acc.size());
             closesocket(s);
             break;   // ok 保持 false
         }
-        int got = 0;
-        std::unordered_set<std::string> seen;
-        for (int i = 0; i < n && got < (int)maxRows; ++i) {
-            std::string ln;
-            if (!in.next(ln)) break;   // 对端断开/超时：收多少算多少
-            if (ln.size() < 2) continue;
-            bool isFolder = ln[0] == 'D';
-            std::wstring path = Utf8ToWide(ln.substr(1));
-            if (path.size() < 3 || path[1] != L':') continue;   // 守护进程只回 X:\ 绝对路径
-            if (!seen.insert(ln.substr(1)).second) continue;
-            out.push_back({path, isFolder});
-            ++got;
-        }
-        ok = true;
+        ok = anyBlock;
         closesocket(s);
     } while (false);
     WSACleanup();

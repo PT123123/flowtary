@@ -157,6 +157,10 @@ else()
     add_executable(file_url_path_test tests/file_url_path_test.cpp)
     target_link_libraries(file_url_path_test PRIVATE shlwapi)
     add_test(NAME file_url_path COMMAND file_url_path_test)
+    add_executable(index_dirs_test tests/index_dirs_test.cpp src/settings_model.cpp)
+    target_include_directories(index_dirs_test PRIVATE src)
+    target_link_libraries(index_dirs_test PRIVATE shell32)
+    add_test(NAME index_dirs COMMAND index_dirs_test)
   endif()
 
   add_executable(flowtary WIN32
@@ -194,6 +198,20 @@ else()
   add_executable(evtest tools/evtest.cpp)
   set_target_properties(evtest PROPERTIES OUTPUT_NAME evtest)
   target_link_libraries(evtest PRIVATE user32 shell32)
+
+  # 应用版本目录解析的断言（结果排序把最新版抬到前面；规则见 src/app_ver.h）
+  add_executable(appver_test tools/appver_test.cpp)
+  set_target_properties(appver_test PROPERTIES OUTPUT_NAME appver_test)
+
+  # 大小写还原三通道实测（整目录枚举 / 精确名 FindFirstFile / GetLongPathNameW）
+  add_executable(case_probe tools/case_probe.cpp)
+  set_target_properties(case_probe PROPERTIES OUTPUT_NAME case_probe)
+  target_link_libraries(case_probe PRIVATE shell32)
+
+  # 路径副标题省略号取证：同宽同字体画 PATH/END 两种省略方式到 BMP
+  add_executable(path_ellipsis_probe tools/path_ellipsis_probe.cpp)
+  set_target_properties(path_ellipsis_probe PROPERTIES OUTPUT_NAME path_ellipsis_probe)
+  target_link_libraries(path_ellipsis_probe PRIVATE gdi32 user32 shell32)
 
   # d/f 搜索后端冒烟工具（Windows Search OLE DB + fd），与 src/main.cpp 共用 df_search
   # （df_search 内含拼音索引代码路径，需链接 cpp-pinyin；运行时无 dict/ 自动降级）

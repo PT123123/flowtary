@@ -24,11 +24,16 @@
 
 static std::vector<std::wstring> IndexDirsFromRegistry() {
     std::vector<std::wstring> out;
-    wchar_t buf[4096]{};
-    DWORD cb = sizeof(buf);
+    DWORD cb = 0;   // 变长读，理由同 df_search.cpp：固定缓冲超量会让优先根整体消失
     if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"IndexDirs",
-                     RRF_RT_REG_SZ, nullptr, buf, &cb) == ERROR_SUCCESS) {
-        std::wstring text(buf);
+                     RRF_RT_REG_SZ, nullptr, nullptr, &cb) == ERROR_SUCCESS &&
+        cb > sizeof(WCHAR)) {
+        std::vector<WCHAR> buf(cb / sizeof(WCHAR) + 1);
+        DWORD cb2 = (DWORD)buf.size() * sizeof(WCHAR);
+        if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"IndexDirs",
+                         RRF_RT_REG_SZ, nullptr, buf.data(), &cb2) != ERROR_SUCCESS)
+            return out;
+        std::wstring text(buf.data());
         size_t i = 0;
         while (i < text.size()) {
             size_t j = text.find_first_of(L"\r\n", i);
@@ -66,8 +71,12 @@ int wmain(int argc, wchar_t** argv) {
         if (wcscmp(argv[i], L"--serve") == 0) serve = true;
     if (!serve) return 2;   // 本 exe 仅 --serve 模式；遍历由随包 fd.exe 承担
 
-    // 单实例：已有守护进程在跑则静默退出（互斥体随进程消失，无僵尸锁）
-    HANDLE mtx = CreateMutexW(nullptr, TRUE, L"Local\\Flowtary.SearchDaemon");
+    // 单实例：已有守护进程在跑则静默退出（互斥体随进程消失，无僵尸锁）。
+    // FT_DF_DAEMON_MUTEX 可换名（配合 FT_DF_DAEMON_PORT 做 A/B：不抢常驻实例的槽）。
+    wchar_t mtxEnv[128]{};
+    const wchar_t* mtxName = L"Local\\Flowtary.SearchDaemon";
+    if (GetEnvironmentVariableW(L"FT_DF_DAEMON_MUTEX", mtxEnv, 128) > 0) mtxName = mtxEnv;
+    HANDLE mtx = CreateMutexW(nullptr, TRUE, mtxName);
     if (mtx && GetLastError() == ERROR_ALREADY_EXISTS) return 0;
 
     return df::SearchDaemonServe(IndexDirsFromRegistry());

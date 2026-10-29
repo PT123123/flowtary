@@ -105,7 +105,10 @@ size_t DiskIndexRecords();       // 条目数（诊断用）
 // 守护进程服务主循环（flowtary-search --serve 进程入口调用，阻塞直至空闲退出）
 int SearchDaemonServe(const std::vector<std::wstring>& extraRoots);
 void SearchDaemonStart();        // 幂等：确保守护进程在跑（不在线则拉起，最多等 ~3s）
-bool SearchDaemonQuery(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD maxRows);
+// 守护进程分两块回：内存层（毫秒）先到、块尾 MORE，磁盘层（百毫秒~秒）随后、块尾 END。
+// onBatch 非空时每块增量投递一次（首屏秒出，磁盘层到达后合并刷新）；out 仍收全量。
+bool SearchDaemonQuery(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD maxRows,
+                       const std::function<void(std::vector<Hit>&&)>& onBatch = {});
 bool SearchDaemonStat(int& memReady, int& memSize, int& diskReady, int& diskRecords,
                       int* diskError = nullptr, int* diskBuilding = nullptr);
 

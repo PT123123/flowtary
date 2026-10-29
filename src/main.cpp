@@ -15,6 +15,7 @@
 #include "settings_ipc.h"  // sidecar ↔ 主进程消息协议
 #include "settings_model.h"  // 设置项的唯一真源：注册表值名、编辑器语法、默认文本
 #include "df_search.h"  // d/f 搜索后端：Windows Search（OLE DB）+ fd（现查遍历），不建全盘索引
+#include "app_ver.h"    // 「<应用名>-<版本号>」发布目录解析（结果排序把最新版抬到前面）
 #include <imm.h>
 #include <dwmapi.h>
 #include <uxtheme.h>
@@ -1528,7 +1529,12 @@ static void DfWsWorker(DWORD gen, df::Query q) {
 // 守护进程崩溃时查询失败 → fd/WS 层自然接管
 static void DfDaemonWorker(DWORD gen, df::Query q) {
     auto* hits = new std::vector<df::Hit>();
-    bool ok = df::SearchDaemonQuery(q, false, *hits, 800);
+    // 守护进程分两块回（内存层 → 磁盘层）：每块到达即上屏，界面不等磁盘扫描。
+    // 中间批 finalBatch=false，收尾由下面这条空回复给出（全量 hits 兜底去重）。
+    auto sink = [gen](std::vector<df::Hit>&& batch) {
+        PostDfReply(gen, BkMem, false, false, new std::vector<df::Hit>(std::move(batch)));
+    };
+    bool ok = df::SearchDaemonQuery(q, false, *hits, 800, sink);
     PostDfReply(gen, BkMem, ok ? FALSE : TRUE, true, hits);
 }
 
@@ -1616,7 +1622,7 @@ static void StartDfSearch() {
     // 可用性探测不放在主线程（避免主线程碰 COM）；失败由 failed 回复在 handler 里落定
     const bool wsOk = g.dfWsAvail >= 0;
     const bool fdOk = !g.dfFdExe.empty();
-    g.dfMemDone = !daemonLayer;   // 守护层一批即收尾（失败时 fd 层兜底）；极简档无守护层
+    g.dfMemDone = !daemonLayer;   // 守护层按块收尾（最后一块才置位）；极简档无守护层，直接算完
     g.dfDiskDone = true;          // 磁盘索引已并入守护层
     g.dfWsDone = !wsOk;
     g.dfFdDone = !fdOk;
@@ -1646,6 +1652,13 @@ static void RerankDfByWeight() {
                      [&rowW](const Row& a, const Row& b) { return rowW(a) > rowW(b); });
 }
 
+// ---------------- 应用版本目录排序 ----------------
+// 发布目录（workshop / software 等）的布局是「<应用名>-<版本>」，同一应用常有多版并存，
+// 外加 -backup-<日期>-xxx / -verifyfix 这类快照副本。搜「aura」时第一行必须是最新版的
+// 正式目录：文本命中质量同分时，按解析出的版本号降序，快照沉到同版本正式版之后。
+// 解析规则在 src/app_ver.h（与 tools/appver_test.cpp 共用，规则只写一遍）。
+using appver::Info;
+
 static void RenderDfResults() {
     g.items = g.dfBaseRows;
     // 基础排序：逐词按文件名命中质量（精确 > 前缀 > 包含 > 拼音/仅路径）——
@@ -1668,9 +1681,35 @@ static void RenderDfResults() {
         }
         return s;
     };
-    if (!words.empty() && g.items.size() > 1)
-        std::stable_sort(g.items.begin(), g.items.end(),
-                         [&scoreOf](const Row& a, const Row& b) { return scoreOf(a) > scoreOf(b); });
+    if (!words.empty() && g.items.size() > 1) {
+        // 排序键一次算好（文本分 + 版本档）：比较器里现算路径解析会被排序放大几倍。
+        struct DfKey { int score; int vrank; unsigned long long ver; int plain; size_t idx; };
+        std::vector<DfKey> keys(g.items.size());
+        std::vector<Info> av(g.items.size());
+        appver::Table tab;
+        for (size_t i = 0; i < g.items.size(); ++i) {
+            keys[i].score = scoreOf(g.items[i]);
+            keys[i].idx = i;
+            av[i] = appver::Parse(g.items[i].action);
+            tab.Feed(av[i]);
+        }
+        for (size_t i = 0; i < g.items.size(); ++i) {
+            keys[i].vrank = tab.Rank(av[i]);
+            keys[i].plain = av[i].has ? (av[i].plain ? 1 : 0) : 1;
+            keys[i].ver = av[i].ver;
+        }
+        std::stable_sort(keys.begin(), keys.end(), [](const DfKey& a, const DfKey& b) {
+            if (a.score != b.score) return a.score > b.score;
+            if (a.vrank != b.vrank) return a.vrank < b.vrank;
+            if (a.ver != b.ver) return a.ver > b.ver;
+            if (a.plain != b.plain) return a.plain > b.plain;
+            return a.idx < b.idx;   // 同键保持收行序（内存索引优先根在前）
+        });
+        std::vector<Row> sorted;
+        sorted.reserve(g.items.size());
+        for (const auto& k : keys) sorted.push_back(std::move(g.items[k.idx]));
+        g.items = std::move(sorted);
+    }
     RerankDfByWeight();
     // f/d 自学习置顶（与 Everything 展示路径同一套：摘出与结果重复的学习行后插到最前）
     PrependLearnedRows(g.evTermKey);
@@ -1701,7 +1740,7 @@ static void HandleDfReply(DfReply* r) {
     } else if (r->backend == BkFd) {
         g.dfFdDone = r->finalBatch;        // fd 流式：中间批次不算收尾
     } else if (r->backend == BkMem) {
-        g.dfMemDone = true;                // 内存索引：单批即收尾
+        g.dfMemDone = r->finalBatch;       // 守护进程流式：内存层块不算收尾
     } else {
         g.dfDiskDone = true;               // 磁盘索引：单批即收尾
     }
@@ -3877,14 +3916,22 @@ static void Paint(HDC hdc) {
         // 副标题（右侧灰色；有徽章时让位）
         int subReserved = 0;
         if (!row.sub.empty()) {
-            SIZE sz{};
+            SIZE sz{}, tsz{};
             GetTextExtentPoint32W(mem, row.sub.c_str(), (int)row.sub.size(), &sz);
-            int maxSub = (W - pad - hkReserved) / 2;
-            int subW = (std::min)((int)sz.cx, maxSub);
+            GetTextExtentPoint32W(mem, row.title.c_str(), (int)row.title.size(), &tsz);
+            // 路径栏宽度按「标题完整显示后剩多少」给，上限 3/4、下限 1/4：
+            // 标题短时深路径能整条看完，标题长时也不会把路径压成几个字。
+            const int budget = W - pad - hkReserved - S(12);
+            int room = budget - (std::min)((int)tsz.cx, budget * 3 / 4) - S(12);
+            if (room > budget * 3 / 4) room = budget * 3 / 4;
+            if (room < budget / 4) room = budget / 4;
+            int subW = (std::min)((int)sz.cx + 2, room);
             RECT sr{W - pad - hkReserved - subW, y, W - pad - hkReserved, y + rowH};
             SetTextColor(mem, t.textSec);
+            // DT_PATH_ELLIPSIS（需配 DT_LEFT）：放不下时省略中段、保住最深一层目录——
+            // 应用版本号就在那一层，尾部截断等于把最有用的信息裁掉
             DrawTextW(mem, row.sub.c_str(), (int)row.sub.size(), &sr,
-                      DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_PATH_ELLIPSIS);
             subReserved = subW + S(8);
         }
         // 标题

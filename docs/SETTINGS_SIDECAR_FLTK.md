@@ -165,3 +165,32 @@ BGR→RGB，最后 `fl_write_png()`；同时把控件树几何（窗口子控件
 - 主窗对「透明度」几乎无感（契约 R12），预览时看不出差别属预期。
 - 美化开关在主进程侧只影响弹出菜单深浅；设置窗自身的标题栏/圆角由 sidecar 施加。
 - `dist\` 里若还是旧版单 exe，升级安装需带上 `flowtary-settings.exe`。
+
+---
+
+## 8. 2026-10-29：第 11 个 Tab「索引目录」+ §7.1 取证通道修正
+
+### 新增内容
+
+| 位置 | 改动 |
+|------|------|
+| `src/settings_model.h/.cpp` | `Settings::indexDirsText` 字段；`Load()` 用 `LoadRegText(L"IndexDirs")` **原文回显**（不重序列化，注释与空行保留，与契约 R10 的不对称一致）；`Save()` 用 `SaveRegText(L"IndexDirs", …)` 原文直写；新增 `ft::ParseIndexDirs()`（逐行、丢空行、`#` 当注释、两端去空白），与守护进程侧 `tools/ft_search_main.cpp` 的解析规则一致 |
+| `src/settings_main.cpp` | `kTabCount` 10 → 11，侧栏在「排除路径」后插入「索引目录」（其后各 Tab 下标 +1，`ShowTab` 里截图页判据 `tab == 8` → `9`）；面板 4 个控件：标题、多行编辑器（`FL_WHEN_CHANGED` 实时刷条数）、条数标签、说明；`SyncEditorsToSettings()` 与 `OnEnterKey` 的编辑器白名单各加一项 |
+| `src/df_search.cpp`、`tools/ft_search_main.cpp` | 读 `IndexDirs` 由固定 `wchar_t[4096]` 改为**先探长度再分配**：固定缓冲在列表超量时 `RegGetValueW` 返回 `ERROR_MORE_DATA`，会被当成「没配目录」，优先根整体消失 |
+| `tests/index_dirs_test.cpp` | ctest `index_dirs` 门：CRLF/LF 混用、`#` 注释、空行、首尾空白、末行无换行、空文本 |
+
+生效链路无需新增 IPC：守护进程 `DfTierChanged()` 的指纹里已含 `indexDirs` 原文，
+保存后下一次查询（或 60s 轮询）发现变了就自杀退出，主程序按新根重新拉起。
+
+### 取证（不用人工点测的部分）
+
+- `--dump-ui` 临时通道按 §7.1 重搭了一次，11 张图 + `tree.txt` 到手后**已删除**，不进交付物。
+- **§7.1 的通道要修正**：`GetDC(自己窗口) + BitBlt` 这次拍到的是**同一帧内容**（11 张图 MD5 完全相同），
+  把窗口挪到屏幕外 `(0,4000)` 时更是整张纯白 —— DWM 不合成屏幕外的窗，窗口 DC 里只剩擦背景。
+  能用的组合是：窗口放在屏内 → 每个 Tab `ShowTab(t)` 后**空转事件循环**（`for(10) Fl::wait(0.02)`，
+  让 FLTK 自己收 `WM_PAINT` 重画）→ `make_current()` + `Fl::flush()` → `fl_read_image(buf,0,0,w,h)`
+  （返回 `uchar*`，失败为 `nullptr`）→ 自己写 24bpp 顶向下 BMP。
+  手动 `g_win->draw()` 替代事件循环是这次踩的第二个坑：画是画了，读回来的仍是旧帧。
+- 侧车冒烟（无 `--dump-ui` 的常规路径）：`Start-Process` 带 `--ipc <WinForms 假主窗句柄>` →
+  4s 后进程存活、`MainWindowHandle` 非 0 → `PostMessage(WM_CLOSE)` → 退出码 0。
+  假句柄的 `SendToMain` 只会 3s 超时，不写任何注册表。

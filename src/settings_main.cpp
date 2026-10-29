@@ -55,7 +55,7 @@ static const int kContentY = 8;
 static const int kPW = kW - kContentX - 16;  // 内容面板宽
 static const int kPH = kH - kContentY - 52;  // 内容面板高（底部留给按钮行）
 static const int kRowH = 24;
-static const int kTabCount = 10;
+static const int kTabCount = 11;
 
 // ---------------- 全局状态 ----------------
 static ft::Settings g_s;          // 界面上的当前值（未保存）
@@ -90,6 +90,8 @@ static Fl_Multiline_Input* g_edtRules = nullptr;
 static Fl_Multiline_Input* g_edtLaunch = nullptr;
 static Fl_Multiline_Input* g_edtKill = nullptr;
 static Fl_Multiline_Input* g_edtExclude = nullptr;
+static Fl_Multiline_Input* g_edtIndexDirs = nullptr;
+static Fl_Box* g_lblIndexDirsCount = nullptr;
 
 // Shell 页的「自定义路径 / 启动参数」两行只在自定义 Shell 下出现。FLTK 的 hide() 不回收
 // 空间，所以下面这些行各自登记「显示/隐藏」两个 y，切换时整体上下挪，不留空白带。
@@ -533,6 +535,7 @@ static void SyncEditorsToSettings() {
     g_s.launchText = editorText(g_edtLaunch);
     g_s.killText = editorText(g_edtKill);
     g_s.excludeText = editorText(g_edtExclude);
+    g_s.indexDirsText = editorText(g_edtIndexDirs);
     g_s.shellCustomPath = wu8(g_edtShellPath ? g_edtShellPath->value() : "");
     g_s.shellCustomArgs = wu8(g_edtShellArgs ? g_edtShellArgs->value() : "");
 }
@@ -694,7 +697,7 @@ static void ShowTab(int tab) {
         if (g_side[i]) g_side[i]->value(i == tab ? 1 : 0);
     }
     SetVis(g_btnReset, tab == 1);
-    if (tab == 8) UpdateCaptureStatus();
+    if (tab == 9) UpdateCaptureStatus();
     if (tab == 2) RefreshTuneLabels();
     ft::RegSetDword(L"SettingsTab", (DWORD)tab);
     g_win->redraw();
@@ -737,7 +740,8 @@ static int OnEnterKey(int ev) {
     if (Fl::event_key() != FL_Enter) return 0;
     Fl_Widget* f = Fl::focus();
     if (f == (Fl_Widget*)g_edtRules || f == (Fl_Widget*)g_edtLaunch ||
-        f == (Fl_Widget*)g_edtKill || f == (Fl_Widget*)g_edtExclude)
+        f == (Fl_Widget*)g_edtKill || f == (Fl_Widget*)g_edtExclude ||
+        f == (Fl_Widget*)g_edtIndexDirs)
         return 0;
     onSave(nullptr, nullptr);
     return 1;
@@ -769,7 +773,7 @@ static LRESULT CALLBACK SubProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 // ---------------- 界面构建 ----------------
 static const WCHAR* kTabNames[kTabCount] = {
     L"常规", L"网页规则", L"主题", L"一键", L"搜索权重", L"排除路径",
-    L"Shell 与窗口", L"命令", L"截图工具", L"自学习",
+    L"索引目录", L"Shell 与窗口", L"命令", L"截图工具", L"自学习",
 };
 
 // 面板创建后会成为「当前组」，后续控件自动挂到它上面；建完必须 end()。
@@ -916,8 +920,30 @@ static void BuildTabExclude() {
     p->end();
 }
 
-static void BuildTabShell() {
+static void UpdateIndexDirsCount() {
+    size_t n = ft::ParseIndexDirs(editorText(g_edtIndexDirs)).size();
+    g_lblIndexDirsCount->copy_label(
+        u8(L"当前 " + std::to_wstring(n) + L" 个优先根").c_str());
+}
+static void onIndexDirsChanged(Fl_Widget*, void*) { UpdateIndexDirsCount(); }
+static void BuildTabIndexDirs() {
     Fl_Group* p = NewPanel(6);
+    AddLabel(p, 0, 4, kPW, 20, L"索引目录（优先根，每行一个路径）：");
+    g_edtIndexDirs = AddMultiline(p, 28, kPW, kPH - 112);
+    FillEditor(g_edtIndexDirs, g_s.indexDirsText);
+    g_edtIndexDirs->when(FL_WHEN_CHANGED);
+    g_edtIndexDirs->callback(onIndexDirsChanged);
+    g_lblIndexDirsCount = AddLabel(p, 0, kPH - 72, kPW, kRowH, L"", 10);
+    UpdateIndexDirsCount();
+    AddHint(p, 0, kPH - 42, kPW, 42,
+            L"这些目录排到索引最前面先扫，保存后守护进程自动重启生效——自研应用发布目录"
+            L"（如 C:\\workshop、C:\\software）填在这里，搜 exe 才会秒出且版本号大的排前。\n"
+            L"# 开头为注释；不填也能搜到（走全盘索引层），只是不在第一块结果里。保存后生效。");
+    p->end();
+}
+
+static void BuildTabShell() {
+    Fl_Group* p = NewPanel(7);
     AddChoiceRow(p, 4, L"Shell 程序：", ft::ShellTypeOptions(), &g_s.shellType, 1);
     // 只有「自定义 Shell」才出现的三行
     g_lblShellPath = AddLabel(p, 0, 36, 160, 20, L"自定义 Shell 路径：");
@@ -954,7 +980,7 @@ static void BuildTabShell() {
 }
 
 static void BuildTabCmd() {
-    Fl_Group* p = NewPanel(7);
+    Fl_Group* p = NewPanel(8);
     AddCheck(p, 0, 4, kPW, L"top 命令（空格+top 回车，置顶/取消置顶当前窗口）", &g_s.topEnabled);
     AddCheck(p, 0, 34, kPW, L"cmd 命令（空格+cmd 执行 Shell 命令，原 “> 命令”）", &g_s.cmdEnabled);
     AddCheck(p, 0, 64, kPW, L"w 命令（空格+w 切换窗口，原 “< 关键词”）", &g_s.winEnabled);
@@ -964,7 +990,7 @@ static void BuildTabCmd() {
 }
 
 static void BuildTabCapture() {
-    Fl_Group* p = NewPanel(8);
+    Fl_Group* p = NewPanel(9);
     g_lblCaptureStatus = AddLabel(p, 0, 4, kPW, 22, L"", 11);
     g_btnDlSC = AddButton(p, 0, 34, 300, L"下载 ScreenCapture.exe（约 1MB）");
     g_btnDlIR = AddButton(p, 0, 66, 300, L"下载 ImageReader.exe（约 25MB，文字识别必需）");
@@ -995,7 +1021,7 @@ static void OpenLearnDir(Fl_Widget*) {
     ShellExecuteW(g_hSelf, L"open", dir.c_str(), nullptr, nullptr, SW_SHOW);
 }
 static void BuildTabLearn() {
-    Fl_Group* p = NewPanel(9);
+    Fl_Group* p = NewPanel(10);
     AddCheck(p, 0, 4, kPW, L"启用自学习（f/d 搜索打开过的条目自动记忆，下次同词搜索置顶）",
              &g_s.learnEnabled);
     AddChoiceRow(p, 36, L"记录范围：", ft::LearnScopeOptions(), &g_s.learnScope);
@@ -1039,6 +1065,7 @@ static void BuildBottomRow() {
 }
 
 // ---------------- 命令行 ----------------
+
 static void ParseArgs() {
     int wc = 0;
     LPWSTR* wl = CommandLineToArgvW(GetCommandLineW(), &wc);
@@ -1074,6 +1101,7 @@ static int AppMain() {
     BuildTabGroup();
     BuildTabWeight();
     BuildTabExclude();
+    BuildTabIndexDirs();
     BuildTabShell();
     BuildTabCmd();
     BuildTabCapture();
@@ -1099,6 +1127,7 @@ static int AppMain() {
 
     UpdateExcludeCount();
     ShowTab(g_tab);
+
 
     ipc::Header hdr{g_hSelf};
     SendToMain(ipc::MsgHello, &hdr, sizeof(hdr));

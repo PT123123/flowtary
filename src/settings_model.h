@@ -80,6 +80,12 @@ bool HasExcludePattern(const std::vector<std::wstring>& patterns, const std::wst
 // 读注册表并做首启落盘 / 旧版默认项迁移；返回「生效的原文条目列表」。
 std::vector<std::wstring> LoadExcludePaths();
 
+// ---------------- 索引目录（优先根，注册表 IndexDirs） ----------------
+// 每行一个目录路径，# 开头为注释。守护进程把这些目录插到内存池遍历序最前，
+// 所以自研应用目录（如 C:\workshop）的命中总在第一块结果里。
+// 解析规则与守护进程侧（df_search.cpp / ft_search_main.cpp）保持一致。
+std::vector<std::wstring> ParseIndexDirs(const std::wstring& text);
+
 // ---------------- weights.dat / learned.dat ----------------
 // 行内字段分隔符 0x1F；文件为裸 UTF-16LE，全量重写，行尾 \r\n
 constexpr WCHAR kEntrySep = L'\x1f';
@@ -120,6 +126,7 @@ struct Settings {
     std::vector<CmdGroup> groupsLaunch, groupsKill;
     std::wstring excludeText;
     std::vector<std::wstring> excludePaths;
+    std::wstring indexDirsText;   // IndexDirs 原文（优先根列表，编辑器直写注册表）
     bool skipDotFolders = true;
     int dfBackend = 0;              // d/f 搜索后端：0=新方案（内置索引） 1=Everything 旧链路
     int dfIndexTier = 2;            // 搜索索引档位：0=极简 1=轻量 2=均衡 3=极速（内存↔速度权衡；守护进程自读注册表）

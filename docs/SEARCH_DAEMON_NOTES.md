@@ -428,3 +428,90 @@ delta 估算字节、大小写缓存、当前构建状态和 `fd_found`。`FT_DF
   语法、完整搜索依赖打包、缺失 fd 时拒绝部分发布均验证。
 - 最终安装目录与 build 中主程序、守护进程 SHA256 分别一致；保留旧程序备份，
   关闭本轮详细调试日志后重新拉起，缓存加载后两层仍立即就绪。
+
+## 十四、第八轮：自研应用（workshop）秒出 + 应用 exe 全覆盖 + 路径显示（2026-10-29）
+
+需求原话拆成四件事：workshop 里的 exe 要按版本号从大到小排、搜 workshop exe 要秒出、
+chatgpt/software 这类应用 exe 搜得慢而且有时根本不出现、行尾路径显示不全。
+
+### 根因
+
+1. 内存池按「Desktop → 用户目录 → 注册表 IndexDirs」的顺序遍历，30 万条上限被
+   桌面目录（本机 96 万条）先吃掉，`C:\workshop`、`C:\software` 拿到零额度；
+   磁盘层和内存层都是「凑够 maxRows 就停」，截断发生在排序之前——几百万条里排在
+   后面的应用 exe 被前面的噪声挤出候选窗。守护进程在内存层填满时直接跳过磁盘层。
+2. workshop 的版本号目录（`aura-1.2.25`、`Flowtary-1.1.23.10`、`*-backup-20261028-1755`）
+   以前只按文本命中分数排，快照备份和旧版本会压在最新版上面。
+3. 行尾 sub 是父目录全路径，用 `DT_END_ELLIPSIS` 尾部截断——裁掉的正好是最深一层
+   目录，也就是版本号所在的那一段。
+
+### 改动
+
+- 优先根（`IndexDirs`）插到池序最前，用户目录根排其后；内存层与磁盘层改为全量扫描
+  + 按命中质量的排名堆（整名 8 / 前缀 4 / 名字或拼音包含 2 / 仅路径 1），预算
+  `FT_DF_MEM_BUDGET_MS`（默认 60ms）只截「同分里的靠后根」，不再截掉优先根。
+- 守护进程分两块回：首块 = 内存层 + 应用子索引（块尾 `MORE`），次块 = 磁盘层
+  （块尾 `END`）；客户端按批上屏，首屏不再等几百毫秒的 blob 扫描。
+- 应用子索引：从磁盘 blob 派生的 exe/lnk/appref-ms/msi 行偏移表（本机 18,689 条，
+  约 73 KB），idle 优先级分块建表、blob 换版自动重建，守护进程启动即开始建。
+  它补的是「池上限装不下的 Program Files / %LOCALAPPDATA%\Programs 里的应用」，
+  首块只并入前 64 行（大小写还原按行付目录探测成本，超出部分交给磁盘层带真名送到）。
+- `src/app_ver.h`：从路径里解析「应用名 + 点分版本号」（拒绝 `HWiNFO64`、`20261028`、
+  `DirectX 9.0c` 这类假版本段），UI 排序先按文本分、再按「最新版 0 / 无版本信息 1 /
+  旧版本 2」三档、再按版本降序；`*-backup-*`、`*-snapshot-*` 快照目录整条降级。
+  断言在 `tools/appver_test.cpp`。
+- 大小写还原从「整目录枚举 + 目录映射缓存」改成「逐组件精确名 FindFirstFile +
+  组件小表缓存」。`tools/case_probe.exe` 现测：`C:\Windows\System32`（5007 项）整目录
+  枚举 1505µs、精确名单查 75µs、`GetLongPathNameW` 276µs。旧缓存 12 MiB 上限装不下一趟
+  800 行查询走过的上千个目录，超上限就整表清空、同批目录再枚举一遍——实测磁盘块
+  大小写还原 516ms（blob 扫描本身 62ms）。新实现同一条查询：冷 63ms、暖 0ms，
+  缓存上限也从 12 MiB 降到 4 MiB（每条 ~200B，不再自我淘汰）。
+  探测失败（建库后文件已删）把小写原样入表，同一代 blob 内不重复探测；blob 换版清表。
+- 行尾路径改 `DT_PATH_ELLIPSIS`（中段省略、保住最深一层目录），宽度按「标题显示后
+  剩多少」给，上限 3/4、下限 1/4，另加 2px 余量避免刚好放得下却被省略。
+  取证图：`build/path_ellipsis_160.png`、`build/path_ellipsis_260.png`
+  （`tools/path_ellipsis_probe.exe`，同一批真实 workshop 路径、同字体同宽对比两种省略）。
+
+### 实机 A/B（`wsquery --mem --rows 800`，多词按空格拆成独立参数）
+
+首块耗时 = 用户看到的「秒出」指标。对照跑的是已装的 1.1.23.10 守护进程（单块协议），
+`IndexDirs` 注册表值是共享的，对照也因此收进了优先根条目，只是旧构建不调整遍历顺序。
+
+| 查询 | 对照 1.1.23.10 | 本轮构建 首块 | 本轮构建 次块 |
+| --- | --- | --- | --- |
+| `aura exe` | 296ms / 58 行（workshop 12） | 16–31ms / 53 行（workshop 14） | — |
+| `chrome exe` | 328ms / 216 行 | 16–47ms / 43 行 | 219–266ms / 190 行 |
+| `quire` | 578ms / 800 行（workshop 5） | 15–47ms / 231 行（workshop 34） | 62–282ms / 569 行 |
+| `screenpipe exe` | 312ms / 179 行 | 31–47ms / 65 行 | 250–266ms / 114 行 |
+| `bitwarden exe` | 234ms / 7 行 | 78ms / 7 行 | — |
+| `v2rayn` | 47ms / 800 行 | 15–32ms / 10 行 | 78–157ms / 790 行 |
+
+`bitwarden exe` 的 78ms 全部花在内存层的路径兜底扫描（名字模式零命中 → 路径模式扫
+满 30 万条到 60ms 预算），与应用子索引无关。
+
+### 已知边界（未在本轮处理）
+
+- Microsoft Store（MSIX）应用不在文件系统枚举范围内：本机 ChatGPT 桌面版是
+  `OpenAI.Codex_2p2nqsd0c76g0!App`，实体在 `C:\Program Files\WindowsApps`（普通进程
+  列目录即 `Permission denied`），且开始菜单里没有对应 `.lnk`，所以 fd/内存/磁盘/应用
+  子索引四层都看不见它。要搜到必须走 `shell:AppsFolder` 枚举 + AUMID 启动。
+- 内存档位与 30 万条池上限没动：非优先根（Documents/Downloads/Program Files 等）
+  仍可能被上限挤掉，应用子索引只补 exe/lnk 这一类。
+  「索引目录」编辑器已在同日落到设置侧车（第 11 个 Tab，见 `SETTINGS_SIDECAR_FLTK.md` §8），
+  但**上限本身没调**。
+- 末段目录名本身长到放不下时，`DT_PATH_ELLIPSIS` 会硬裁右边缘（无省略号），
+  例如 `C:\workshop\aura-1.2.25-backup-20261028-1755` 在 160px 下显示到 `-backup-2`。
+
+### 验证与工具
+
+- `appver_test`（版本解析断言）、`case_probe`（三种大小写还原通道耗时）、
+  `path_ellipsis_probe`（省略号取证图）为新增目标。
+- 同日补齐设置侧车「索引目录」页（`IndexDirs` 可视化编辑，第 11 个 Tab）：解析函数
+  `ft::ParseIndexDirs` 由 ctest `index_dirs` 钉住；`IndexDirs` 的注册表读取从固定
+  `wchar_t[4096]` 改成先探长度再分配（固定缓冲超量时 `RegGetValueW` 返回
+  `ERROR_MORE_DATA`，会被静默当成「没配目录」）。详见 `SETTINGS_SIDECAR_FLTK.md` §8。
+- A/B 用隔离守护进程：`tools/run_ab_daemon_dbg.ps1`（独立端口 47782、独立 mutex、
+  独立 `FT_DF_CACHE_DIR`、`FT_DF_DEBUG=1` 落 `build/ab_daemon.log`），不碰已装版本。
+- `wsquery --mem` 现在逐块打印 `[batchN] +X ms, Y 行 (pri=K)`，`pri` 是落在
+  `C:\workshop`/`C:\software` 的行数——首块时间和优先根命中数一起看，才不会被
+  「总命中数」骗到。
