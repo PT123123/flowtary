@@ -77,14 +77,6 @@ int wmain(int argc, wchar_t** argv) {
         worker.join();
     }
     Check(comScopesBalanced, "short-lived and nested COM scopes balance before thread teardown");
-    df::g_dfPinyinEnabled = true;
-    df::MemPinyinStart();
-    Check(df::g_py != nullptr, "real pinyin dictionary loaded");
-    auto mixedPinyin = df::MemNameToPinyin(L"\u5FAE\u4FE1\U0001F445\u65E5\u62A5.txt");
-    Check(mixedPinyin.find(L"weixin") != std::wstring::npos && mixedPinyin.find(L"ribao") != std::wstring::npos,
-          "Chinese plus emoji converts without crashing");
-    Check(ft::PinyinBmpText(std::wstring{L'a', 0xD800, L'b', 0xDC00}) == L"ab", "unpaired surrogates removed from phonetic text");
-
     // A change flood must invalidate the disk layer and fall back, rather than accumulate forever.
     df::DiskDeltaClearLocked();
     df::g_ovOverflow = false;
@@ -130,8 +122,13 @@ int wmain(int argc, wchar_t** argv) {
     df::Query emojiQuery;
     emojiQuery.words = {L"weixinribao"};
     std::vector<df::Hit> emojiHits;
-    Check(df::DiskIndexSearch(emojiQuery, false, emojiHits, 20) == 1 &&
-          emojiHits[0].path.find(L"\U0001F445") != std::wstring::npos, "phonetic lookup retains original emoji path");
+    Check(df::DiskIndexSearch(emojiQuery, false, emojiHits, 20) == 0,
+          "full pinyin no longer converts (matching is name/path text only)");
+    emojiQuery.words = {L"\u5FAE\u4FE1"};
+    std::vector<df::Hit> cjkHits;
+    Check(df::DiskIndexSearch(emojiQuery, false, cjkHits, 20) == 1 &&
+          cjkHits[0].path.find(L"\U0001F445") != std::wstring::npos,
+          "Chinese name lookup retains original emoji path");
     std::ofstream(root / L"second-build-probe.txt") << "second";
     df::DiskBuildThread(nullptr);
     Check(df::g_diReady && !df::g_diLastBuildError && df::g_diRecords == 11, "replace an already mapped disk index");

@@ -37,6 +37,7 @@
 
 #include "settings_ipc.h"
 #include "settings_model.h"
+#include "search_history.h"
 
 #pragma comment(lib, "wininet.lib")
 #pragma comment(lib, "dwmapi.lib")
@@ -55,7 +56,7 @@ static const int kContentY = 8;
 static const int kPW = kW - kContentX - 16;  // 内容面板宽
 static const int kPH = kH - kContentY - 52;  // 内容面板高（底部留给按钮行）
 static const int kRowH = 24;
-static const int kTabCount = 11;
+static const int kTabCount = 12;
 
 // ---------------- 全局状态 ----------------
 static ft::Settings g_s;          // 界面上的当前值（未保存）
@@ -92,6 +93,9 @@ static Fl_Multiline_Input* g_edtKill = nullptr;
 static Fl_Multiline_Input* g_edtExclude = nullptr;
 static Fl_Multiline_Input* g_edtIndexDirs = nullptr;
 static Fl_Box* g_lblIndexDirsCount = nullptr;
+// 搜索历史页（只读展示 + 直接操作台账文件，无内存态，不需要 IPC）
+static Fl_Multiline_Input* g_edtHistory = nullptr;
+static Fl_Box* g_lblHistoryInfo = nullptr;
 
 // Shell 页的「自定义路径 / 启动参数」两行只在自定义 Shell 下出现。FLTK 的 hide() 不回收
 // 空间，所以下面这些行各自登记「显示/隐藏」两个 y，切换时整体上下挪，不留空白带。
@@ -147,6 +151,7 @@ static void ApplyTitlebarStyle();
 static void ApplyGhostStyle();
 static void PushPreview();
 static void ShowTab(int tab);
+static void RefreshHistoryView();
 static void UpdateCaptureStatus();
 static void WeightCountLabel(unsigned long long n);
 static void LearnCountLabel(unsigned long long n);
@@ -369,14 +374,11 @@ static ChoiceCtl* AddChoice(Fl_Group* p, int x, int y, int w, std::vector<ft::Op
     return ctl;
 }
 
-// 搜索索引档位/拼音开关只在「内置搜索」后端下有效——选 Everything 旧链路时置灰，
-// 与实际行为一致（后端=Everything 时守护进程不启动，这两个设置不产生任何效果）
+// 搜索索引档位只在「内置搜索」后端下有效——选 Everything 旧链路时置灰。
 static ChoiceCtl* s_tierCtl = nullptr;
-static Fl_Check_Button* s_pinyinChk = nullptr;
 static void ApplySearchCtlGating() {
     const bool on = g_s.dfBackend == 0;
     if (s_tierCtl) on ? s_tierCtl->w->activate() : s_tierCtl->w->deactivate();
-    if (s_pinyinChk) on ? s_pinyinChk->activate() : s_pinyinChk->deactivate();
 }
 
 static ChoiceCtl* AddChoiceRow(Fl_Group* p, int y, const WCHAR* label,
@@ -446,7 +448,7 @@ static void onChoice(Fl_Widget*, void* v) {
         ApplyShellLayout();
         g_win->redraw();
     }
-    if (ctl->kind == 2) ApplySearchCtlGating();  // d/f 搜索后端：Everything 时档位/拼音置灰
+    if (ctl->kind == 2) ApplySearchCtlGating();  // d/f 搜索后端：Everything 时索引档位置灰
     PushPreview();
 }
 
@@ -699,6 +701,7 @@ static void ShowTab(int tab) {
     SetVis(g_btnReset, tab == 1);
     if (tab == 9) UpdateCaptureStatus();
     if (tab == 2) RefreshTuneLabels();
+    if (tab == 11) RefreshHistoryView();   // 台账是主进程在写，进页现读才不撒谎
     ft::RegSetDword(L"SettingsTab", (DWORD)tab);
     g_win->redraw();
 }
@@ -773,7 +776,7 @@ static LRESULT CALLBACK SubProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 // ---------------- 界面构建 ----------------
 static const WCHAR* kTabNames[kTabCount] = {
     L"常规", L"网页规则", L"主题", L"一键", L"搜索权重", L"排除路径",
-    L"索引目录", L"Shell 与窗口", L"命令", L"截图工具", L"自学习",
+    L"索引目录", L"Shell 与窗口", L"命令", L"截图工具", L"自学习", L"搜索历史",
 };
 
 // 面板创建后会成为「当前组」，后续控件自动挂到它上面；建完必须 end()。
@@ -809,14 +812,12 @@ static void BuildTabGeneral() {
     AddCheck(p, 0, 116, kPW, L"文件对话框跳转（在文件对话框中直接定位文件夹）", &g_s.fdjEnabled);
     AddChoiceRow(p, 150, L"d/f 搜索后端：", ft::DfBackendOptions(), &g_s.dfBackend, 2);
     s_tierCtl = AddChoiceRow(p, 184, L"搜索索引档位：", ft::DfIndexTierOptions(), &g_s.dfIndexTier);
-    s_pinyinChk = AddCheck(p, 0, 218, kPW, L"拼音搜索（汉字文件名按全拼或首字母检索，如 wxcs → 微信测试）",
-                           &g_s.dfPinyin);
-    ApplySearchCtlGating();   // 初始状态：Everything 旧链路时档位/拼音置灰
-    AddHint(p, 0, 244, kPW, 60,
+    ApplySearchCtlGating();   // 初始状态：Everything 旧链路时索引档位置灰
+    AddHint(p, 0, 218, kPW, 60,
             L"索引档位是「内存 ↔ 速度」的权衡：极简=不建索引每次实时搜（秒级、守护进程不驻留）；"
             L"轻量/均衡/极速逐级加大索引覆盖（毫秒级），内存占用随之上升。\n"
-            L"两项仅对内置搜索生效；保存后守护进程自动按新档重启（首次切档需重新建库）。");
-    AddHint(p, 0, 308, kPW, 46,
+            L"仅对内置搜索生效；保存后守护进程自动按新档重启（首次切档需重新建库）。");
+    AddHint(p, 0, 282, kPW, 46,
             L"d/f 搜索后端：新方案=内置索引+fd（不依赖 Everything，后台自动建索引）；"
             L"Everything=旧链路（需 Everything 正在运行）。\n"
             L"唤起快捷键（Alt+Space）在托盘菜单里开关；结果项快捷键改动立即生效。");
@@ -1045,6 +1046,89 @@ static void BuildTabLearn() {
     p->end();
 }
 
+// ---------------- 搜索历史（诊断台账：只读展示 + 直接管文件，无内存态所以不走 IPC） ----------------
+static const size_t kHistoryViewLines = 400;   // 一次画几千行会拖住 UI，只画最近这些
+
+static size_t CountLines(const std::wstring& text) {
+    size_t n = 0;
+    for (WCHAR c : text)
+        if (c == L'\n') ++n;
+    return n;
+}
+
+static void RefreshHistoryView() {
+    if (!g_edtHistory) return;
+    std::wstring all = ft::hist::ReadTail((size_t)g_s.historyMaxLines + 1000);
+    std::wstring shown = ft::hist::TakeTail(all, kHistoryViewLines);
+    g_edtHistory->value(u8(shown).c_str());
+    std::wstring info = L"台账共 " + std::to_wstring(CountLines(all)) + L" 行，这里显示最近 " +
+                        std::to_wstring(CountLines(shown)) + L" 行";
+    if (all.empty()) info += L"（还没有记录：搜一次再回来看）";
+    g_lblHistoryInfo->copy_label(u8(info).c_str());
+}
+
+static void onHistRefresh(Fl_Widget*) { RefreshHistoryView(); }
+
+static void OpenHistoryFile(Fl_Widget*) {
+    std::wstring path = ft::hist::FilePath();
+    // 台账还没被写过就没有文件可开：先落一行说明，避免「点了没反应」
+    if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES)
+        ft::hist::Write(L"# 台账由设置页创建（此后每轮查询一行 Q、每次打开一行 O）",
+                        (size_t)g_s.historyMaxLines);
+    ShellExecuteW(g_hSelf, L"open", path.c_str(), nullptr, nullptr, SW_SHOW);
+}
+
+struct HistWipeCtl {
+    Fl_Button* btn;
+    std::string idle;
+    bool armed;
+};
+static void DisarmHistWipe(void* v) {
+    HistWipeCtl* hc = (HistWipeCtl*)v;
+    hc->armed = false;
+    hc->btn->copy_label(hc->idle.c_str());
+}
+static void onHistWipe(Fl_Widget*, void* v) {
+    HistWipeCtl* hc = (HistWipeCtl*)v;
+    if (!hc->armed) {
+        hc->armed = true;
+        hc->btn->copy_label(CL(L"再次点击确认清空"));
+        Fl::add_timeout(3.0, DisarmHistWipe, hc);
+        return;
+    }
+    Fl::remove_timeout(DisarmHistWipe, hc);
+    hc->armed = false;
+    hc->btn->copy_label(hc->idle.c_str());
+    if (!ft::hist::RemoveFile()) g_lblHistoryInfo->copy_label(CL(L"清空失败：文件正被编辑器占用"));
+    RefreshHistoryView();
+}
+
+static void BuildTabHistory() {
+    Fl_Group* p = NewPanel(11);
+    AddCheck(p, 0, 4, kPW, L"记录搜索历史（每轮查询写一条：耗时、各层给了几条、第一行结果）",
+             &g_s.historyEnabled);
+    AddChoiceRow(p, 36, L"保留行数：", ft::HistoryMaxOptions(), &g_s.historyMaxLines);
+    Fl_Button* rf = AddButton(p, 0, 70, 70, L"刷新");
+    rf->callback(onHistRefresh);
+    Fl_Button* op = AddButton(p, 82, 70, 140, L"打开台账文件");
+    op->callback(OpenHistoryFile);
+    Fl_Button* wipe = AddButton(p, 234, 70, 140, L"清空台账…");
+    HistWipeCtl* hc = new HistWipeCtl();
+    hc->btn = wipe;
+    hc->idle = u8(L"清空台账…");
+    hc->armed = false;
+    wipe->callback(onHistWipe, hc);
+    g_lblHistoryInfo = AddLabel(p, 0, 104, kPW, 18, L"", 10, kSub);
+    g_edtHistory = AddMultiline(p, 128, kPW, kPH - 128 - 60);
+    g_edtHistory->readonly(1);
+    AddHint(p, 0, kPH - 56, kPW, 56,
+            L"文件：%APPDATA%\\Flowtary\\search_history.log（UTF-8，一行一条，超出保留行数只留尾部）\n"
+            L"Q=一轮查询（打完字 4 秒后落一条，逐字打字不重复记）：first=首屏上屏延迟 total=各层报齐的总耗时 "
+            L"rows=结果条数 src=索引/fd/WS 各层给几条 未回=到落盘还没报齐的层；O=实际打开了哪条。"
+            L"搜不出东西时先看这里：rows=0 和带「未回」的行就是现场。记录只在本机，不参与排序，也不进 git。");
+    p->end();
+}
+
 static void RestoreRulesDefault(Fl_Widget*) {
     FillEditor(g_edtRules, ft::DefaultRulesText());
     g_s.rulesText = ft::DefaultRulesText();
@@ -1106,6 +1190,7 @@ static int AppMain() {
     BuildTabCmd();
     BuildTabCapture();
     BuildTabLearn();
+    BuildTabHistory();
     BuildBottomRow();
 
     // 居中到主窗所在显示器的工作区：入参是物理像素，FLTK 返回的是逻辑坐标

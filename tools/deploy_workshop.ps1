@@ -68,7 +68,6 @@ if (Test-Path (Join-Path $src 'flowtary-settings.exe')) {
     # Settings window lives in this sidecar; without it the tray "Settings" entry can only warn.
     Write-Warning 'flowtary-settings.exe missing - run tools\build-fltk.bat then make build'
 }
-Copy-Item (Join-Path $src 'cpp-pinyin.dll')      (Join-Path $dest 'cpp-pinyin.dll') -Force
 Copy-Item (Join-Path $src 'filedlg_hook64.dll')  (Join-Path $dest 'filedlg_hook64.dll') -Force
 Copy-Item (Join-Path $src 'filedlg_hook32.dll')  (Join-Path $dest 'filedlg_hook32.dll') -Force
 Copy-Item (Join-Path $src 'filedlg_agent32.exe') (Join-Path $dest 'filedlg_agent32.exe') -Force
@@ -78,9 +77,6 @@ if (Test-Path (Join-Path $src 'flowtary-search.exe')) {
     Copy-Item (Join-Path $src 'flowtary-search.exe') (Join-Path $dest 'flowtary-search.exe') -Force
 }
 Copy-Item (Join-Path $src 'fd.exe') (Join-Path $dest 'fd.exe') -Force
-if (Test-Path (Join-Path $src 'dict')) {
-    Copy-Item (Join-Path $src 'dict') (Join-Path $dest 'dict') -Recurse -Force
-}
 
 Write-Host ("[ok] deployed to {0}" -f $dest)
 exit 0

@@ -194,3 +194,28 @@ BGR→RGB，最后 `fl_write_png()`；同时把控件树几何（窗口子控件
 - 侧车冒烟（无 `--dump-ui` 的常规路径）：`Start-Process` 带 `--ipc <WinForms 假主窗句柄>` →
   4s 后进程存活、`MainWindowHandle` 非 0 → `PostMessage(WM_CLOSE)` → 退出码 0。
   假句柄的 `SendToMain` 只会 3s 超时，不写任何注册表。
+
+## 9. 2026-10-30：第 12 个 Tab「搜索历史」
+
+### 新增内容
+
+| 位置 | 改动 |
+|---|---|
+| `src/settings_main.cpp` | `kTabCount` 11→12、`BuildTabHistory()`：开关 + 保留条数下拉（500/2000/10000）+ 只读台账视图（进页现读，最多画最近 400 行）+「刷新」/「打开台账文件」/「清空台账…」 |
+| `src/settings_model.{h,cpp}` | `historyEnabled`/`historyMaxLines` 两个字段，注册表值 `SearchHistory`/`SearchHistoryMaxLines`（越界回 2000），`ft::HistoryMaxOptions()` |
+| `src/search_history.{h,cpp}` | 行格式与读写实现，主程序与侧车共用一份 |
+| `tests/search_history_test.cpp` | ctest `search_history` 门（44 条断言） |
+
+**这一页不需要 IPC**：台账是主进程写的纯文本，侧车只读文件、只删文件；改完点底部的保存写注册表，
+主进程在 `ApplySettingsToRuntime` 里回灌开关与条数。清空与主进程追加撞车时 `Write` 返回 false，
+页面直接写「清空失败：文件正被编辑器占用」，不重试、不静默。
+
+「清空台账…」用两次点击确认（3s 不点第二次自动解除），因为这文件是用户自己攒的诊断记录，
+删了不能重生——与「可重生成的删除一点就执行」的例外一致。
+
+### 取证
+
+- 台账视图与主进程写入不打照面：实测由 `tools/hist_probe.ps1` 往真窗口发消息驱动真查询，
+  再用同一份 `ft::hist::ReadTail` 读回（见 `SEARCH_DAEMON_NOTES.md` 第十五节的实测表）。
+- 展示行的截取（`kHistoryViewLines=400`）与「台账共 N 行」计数走 `TakeTail`/`CountLines`，
+  由 ctest 的 `TakeTail` 断言钉住；未做人工点测。

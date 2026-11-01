@@ -35,9 +35,4 @@ if (Test-Path (Join-Path $src 'flowtary-search.exe')) {
     Copy-Item (Join-Path $src 'flowtary-search.exe') (Join-Path $Dist 'flowtary-search.exe') -Force
 }
 Copy-Item (Join-Path $src 'fd.exe') (Join-Path $Dist 'fd.exe') -Force
-Copy-Item (Join-Path $src 'cpp-pinyin.dll') (Join-Path $Dist 'cpp-pinyin.dll') -Force
-if (Test-Path (Join-Path $src 'dict')) {
-    Copy-Item (Join-Path $src 'dict') (Join-Path $Dist 'dict') -Recurse -Force
-}
-
 Write-Host ("[ok] {0}\flowtary-{1}.exe" -f $Dist, $ver)

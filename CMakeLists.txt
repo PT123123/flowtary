@@ -9,71 +9,6 @@ include(CTest)
 include(cmake/msvc-include.cmake)
 
 # =====================================================================
-# vcpkg 集成（cpp-pinyin 拼音库）
-# =====================================================================
-# vcpkg 根目录候选列表。
-# 注意：不能只信 $ENV{VCPKG_ROOT} —— VS 的 vcvars64.bat 会把它劫持为 VS 内置 vcpkg
-# （如 .../VC/vcpkg），而 cpp-pinyin 实际装在 C:/vcpkg，导致后续头文件/库全部找不到。
-# 因此改为「候选列表逐个校验」，命中真正含 cpp-pinyin 的那个根。
-set(_VCPKG_CANDIDATES "")
-if(DEFINED ENV{VCPKG_ROOT} AND NOT "$ENV{VCPKG_ROOT}" STREQUAL "")
-  list(APPEND _VCPKG_CANDIDATES "$ENV{VCPKG_ROOT}")
-endif()
-list(APPEND _VCPKG_CANDIDATES
-  "C:/vcpkg"
-  "${CMAKE_SOURCE_DIR}/../vcpkg"
-  "$ENV{USERPROFILE}/vcpkg")
-list(REMOVE_DUPLICATES _VCPKG_CANDIDATES)
-
-# 布局优先级：installed/x64-windows（标准安装布局）> packages/cpp-pinyin_x64-windows（构建中间产物）
-set(_CPP_PINYIN_LAYOUTS "installed/x64-windows" "packages/cpp-pinyin_x64-windows")
-
-set(VCPKG_ROOT "")
-set(CPP_PINYIN_INCLUDE_DIR "")
-set(CPP_PINYIN_LIBRARY "")
-set(CPP_PINYIN_DLL "")
-set(CPP_PINYIN_DICT "")
-foreach(_root IN LISTS _VCPKG_CANDIDATES)
-  foreach(_layout IN LISTS _CPP_PINYIN_LAYOUTS)
-    set(_base "${_root}/${_layout}")
-    if(EXISTS "${_base}/include/cpp-pinyin/Pinyin.h" AND
-       EXISTS "${_base}/lib/cpp-pinyin.lib")
-      set(VCPKG_ROOT "${_root}")
-      set(CPP_PINYIN_INCLUDE_DIR "${_base}/include")
-      set(CPP_PINYIN_LIBRARY "${_base}/lib/cpp-pinyin.lib")
-      if(EXISTS "${_base}/bin/cpp-pinyin.dll")
-        set(CPP_PINYIN_DLL "${_base}/bin/cpp-pinyin.dll")
-      endif()
-      if(EXISTS "${_base}/share/cpp-pinyin/dict")
-        set(CPP_PINYIN_DICT "${_base}/share/cpp-pinyin/dict")
-      endif()
-      break()
-    endif()
-  endforeach()
-  if(CPP_PINYIN_LIBRARY)
-    break()
-  endif()
-endforeach()
-unset(_VCPKG_CANDIDATES)
-unset(_CPP_PINYIN_LAYOUTS)
-
-# vcpkg toolchain is disabled to avoid Windows SDK include path conflicts
-# if(VCPKG_ROOT AND EXISTS "${VCPKG_ROOT}/vcpkg")
-#   set(CMAKE_TOOLCHAIN_FILE "${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" CACHE FILEPATH "vcpkg toolchain")
-#   set(VCPKG_MANIFEST_MODE ON)
-#   message(STATUS "Using vcpkg from: ${VCPKG_ROOT}")
-# endif()
-
-# =====================================================================
-# cpp-pinyin 拼音库
-# =====================================================================
-if(CPP_PINYIN_LIBRARY)
-  message(STATUS "cpp-pinyin: ${CPP_PINYIN_LIBRARY} (vcpkg root: ${VCPKG_ROOT})")
-else()
-  message(STATUS "cpp-pinyin not found; searched vcpkg roots: C:/vcpkg, ../vcpkg, %USERPROFILE%/vcpkg")
-endif()
-
-# =====================================================================
 # Flowtary — CMake 构建定义
 #   取代旧的 build.bat / release.bat（原为手写 cl/rc 命令的批处理）。
 #
@@ -111,13 +46,6 @@ set(FLOWTARY_LIBS
   user32 gdi32 shell32 ole32 imm32 dwmapi advapi32 uxtheme msimg32
   oleaut32 uuid shlwapi)
 
-# cpp-pinyin 拼音库
-if(CPP_PINYIN_LIBRARY)
-  list(APPEND FLOWTARY_LIBS ${CPP_PINYIN_LIBRARY})
-endif()
-if(CPP_PINYIN_INCLUDE_DIR)
-  include_directories(${CPP_PINYIN_INCLUDE_DIR})
-endif()
 
 # =====================================================================
 # FLTK（设置窗 sidecar 的 UI 库）
@@ -161,12 +89,18 @@ else()
     target_include_directories(index_dirs_test PRIVATE src)
     target_link_libraries(index_dirs_test PRIVATE shell32)
     add_test(NAME index_dirs COMMAND index_dirs_test)
+    add_executable(search_history_test tests/search_history_test.cpp src/search_history.cpp
+      src/settings_model.cpp)
+    target_include_directories(search_history_test PRIVATE src)
+    target_link_libraries(search_history_test PRIVATE shell32)
+    add_test(NAME search_history COMMAND search_history_test)
   endif()
 
   add_executable(flowtary WIN32
     src/main.cpp
     src/filedlg_jump.cpp
     src/settings_model.cpp
+    src/search_history.cpp
     src/df_search.cpp
     src/flowtary.rc
     src/flowtary.ico)
@@ -179,21 +113,6 @@ else()
   #   （ImageReader 由 vendor 的 ImageReader 目标直接产出，无需复制）。
   add_subdirectory(vendor)
 
-  # 复制 cpp-pinyin DLL 和字典文件到输出目录
-  if(CPP_PINYIN_DLL)
-    add_custom_command(TARGET flowtary POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CPP_PINYIN_DLL}"
-        "$<TARGET_FILE_DIR:flowtary>/cpp-pinyin.dll"
-      COMMENT "Copying cpp-pinyin.dll to output directory")
-  endif()
-  if(CPP_PINYIN_DICT)
-    add_custom_command(TARGET flowtary POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
-        "${CPP_PINYIN_DICT}"
-        "$<TARGET_FILE_DIR:flowtary>/dict"
-      COMMENT "Copying cpp-pinyin dictionary files to output directory")
-  endif()
 
   add_executable(evtest tools/evtest.cpp)
   set_target_properties(evtest PROPERTIES OUTPUT_NAME evtest)
@@ -214,14 +133,11 @@ else()
   target_link_libraries(path_ellipsis_probe PRIVATE gdi32 user32 shell32)
 
   # d/f 搜索后端冒烟工具（Windows Search OLE DB + fd），与 src/main.cpp 共用 df_search
-  # （df_search 内含拼音索引代码路径，需链接 cpp-pinyin；运行时无 dict/ 自动降级）
+  # （df_search 只按文件名/路径文本匹配）
   add_executable(wsquery tools/wsquery.cpp src/df_search.cpp)
   set_target_properties(wsquery PROPERTIES OUTPUT_NAME wsquery)
   target_include_directories(wsquery PRIVATE src)
   target_link_libraries(wsquery PRIVATE ole32 shell32 uuid)
-  if(CPP_PINYIN_LIBRARY)
-    target_link_libraries(wsquery PRIVATE ${CPP_PINYIN_LIBRARY})
-  endif()
 
   # 搜索守护进程：内存/磁盘索引宿主 + TCP 查询服务（flowtary-search --serve）
   add_executable(flowtary-search tools/ft_search_main.cpp src/df_search.cpp)
@@ -235,27 +151,9 @@ else()
   if(BUILD_TESTING)
     add_executable(search_memory_test tests/search_memory_test.cpp)
     target_include_directories(search_memory_test PRIVATE src)
-    target_link_libraries(search_memory_test PRIVATE ole32 shell32 uuid ws2_32 user32 ${CPP_PINYIN_LIBRARY})
+    target_link_libraries(search_memory_test PRIVATE ole32 shell32 uuid ws2_32 user32)
     add_test(NAME search_memory COMMAND search_memory_test)
     set_tests_properties(search_memory PROPERTIES TIMEOUT 120)
-  endif()
-  if(CPP_PINYIN_LIBRARY)
-    target_link_libraries(flowtary-search PRIVATE ${CPP_PINYIN_LIBRARY})
-  endif()
-  # 拼音词典部署（守护进程与 flowtary.exe 同目录运行，共用同一份 dict/ 与 dll）
-  if(CPP_PINYIN_DLL)
-    add_custom_command(TARGET flowtary-search POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CPP_PINYIN_DLL}"
-        "$<TARGET_FILE_DIR:flowtary-search>/cpp-pinyin.dll"
-      COMMENT "Copying cpp-pinyin.dll to flowtary-search output directory")
-  endif()
-  if(CPP_PINYIN_DICT)
-    add_custom_command(TARGET flowtary-search POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
-        "${CPP_PINYIN_DICT}"
-        "$<TARGET_FILE_DIR:flowtary-search>/dict"
-      COMMENT "Copying cpp-pinyin dictionary to flowtary-search output directory")
   endif()
 
   add_library(filedlg_hook64 SHARED src/hookdlg.cpp)
@@ -269,6 +167,7 @@ else()
     add_executable(flowtary-settings WIN32
       src/settings_main.cpp
       src/settings_model.cpp
+      src/search_history.cpp
       src/settings.rc)
     set_target_properties(flowtary-settings PROPERTIES OUTPUT_NAME flowtary-settings)
     target_link_libraries(flowtary-settings PRIVATE

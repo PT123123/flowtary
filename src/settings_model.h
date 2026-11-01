@@ -130,7 +130,6 @@ struct Settings {
     bool skipDotFolders = true;
     int dfBackend = 0;              // d/f 搜索后端：0=新方案（内置索引） 1=Everything 旧链路
     int dfIndexTier = 2;            // 搜索索引档位：0=极简 1=轻量 2=均衡 3=极速（内存↔速度权衡；守护进程自读注册表）
-    bool dfPinyin = true;           // 拼音搜索：汉字文件名按全拼/首字母检索（转拼音表占少量内存）
     // 搜索权重
     bool weightEnabled = true;
     int weightFlush = 1;
@@ -149,6 +148,9 @@ struct Settings {
     bool shellShowWindow = true;
     bool winGroupProc = true, winShowUwp = true, winShowProc = true;
     int winCacheSec = 5;
+    // 搜索历史台账（诊断用纯文本，见 src/search_history.h）
+    bool historyEnabled = true;
+    int historyMaxLines = 2000;
 
     void Load();     // 读注册表 + 解析文本
     void Save();  // 全量写回（含 ThemeTune blob），并回灌解析结果
@@ -202,6 +204,9 @@ inline std::vector<Option> ShellCwdOptions() {
 inline std::vector<Option> WinCacheOptions() {
     return {{L"1 秒", 1}, {L"2 秒", 2}, {L"5 秒", 5},
             {L"10 秒", 10}, {L"30 秒", 30}, {L"60 秒", 60}};
+}
+inline std::vector<Option> HistoryMaxOptions() {
+    return {{L"500 条", 500}, {L"2000 条", 2000}, {L"10000 条", 10000}};
 }
 
 // 下拉定位：给定存储值找到最贴近的档位下标；

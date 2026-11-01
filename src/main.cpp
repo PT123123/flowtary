@@ -14,6 +14,7 @@
 #include "themes.h"  // struct Theme / kThemes / ThemeTune（与设置 sidecar 共用）
 #include "settings_ipc.h"  // sidecar ↔ 主进程消息协议
 #include "settings_model.h"  // 设置项的唯一真源：注册表值名、编辑器语法、默认文本
+#include "search_history.h"  // 搜索历史台账（诊断用纯文本，行格式与落盘都在这一份）
 #include "df_search.h"  // d/f 搜索后端：Windows Search（OLE DB）+ fd（现查遍历），不建全盘索引
 #include "app_ver.h"    // 「<应用名>-<版本号>」发布目录解析（结果排序把最新版抬到前面）
 #include <imm.h>
@@ -83,52 +84,6 @@ struct List {
 #pragma pack(pop)
 }  // namespace ev
 
-// ---------------- 汉字拼音转换（使用 cpp-pinyin 库） ----------------
-#include <cpp-pinyin/Pinyin.h>
-#include <type_traits>
-#include "pinyin_text.h"
-#include <cpp-pinyin/ManTone.h>
-#include <cpp-pinyin/G2pglobal.h>
-
-static std::unique_ptr<Pinyin::Pinyin> g_pinyin;
-
-static std::string WStringToUtf8(const std::wstring& wstr) {
-    if (wstr.empty()) return {};
-    int size = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int)wstr.size(), nullptr, 0, nullptr, nullptr);
-    std::string result(size, 0);
-    WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int)wstr.size(), result.data(), size, nullptr, nullptr);
-    return result;
-}
-
-static std::wstring Utf8ToWString(const std::string& str) {
-    if (str.empty()) return {};
-    int size = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), nullptr, 0);
-    std::wstring result(size, 0);
-    MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), result.data(), size);
-    return result;
-}
-
-static std::wstring ToPinyin(const std::wstring& hanzi) {
-    if (!g_pinyin) return hanzi;
-    try {
-        std::string utf8 = WStringToUtf8(ft::PinyinBmpText(hanzi));
-        auto res = g_pinyin->hanziToPinyin(utf8, Pinyin::ManTone::Style::NORMAL, Pinyin::Error::Default, false, false, false);
-        std::string pinyin;
-        for (const auto& r : res) {
-            if (!r.error && !r.pinyin.empty()) {
-                pinyin += r.pinyin;
-            } else if (!r.hanzi.empty()) {
-                pinyin += r.hanzi;
-            }
-        }
-        return Utf8ToWString(pinyin);
-    } catch (const std::bad_alloc&) {
-        throw;
-    } catch (const std::exception&) {
-        return hanzi;
-    }
-}
-
 // ---------------- 设置数据模型（与 flowtary-settings.exe 共用） ----------------
 // 文本工具、通配符匹配、四个编辑器的解析/序列化、注册表原语、weights/learned 文件路径
 // 都在 settings_model.cpp 里实现一份；下面把这些名字引回本文件的全局作用域，
@@ -186,7 +141,6 @@ struct Program {
     std::wstring name;    // 显示名称
     std::wstring path;    // .lnk 或 .exe 完整路径（执行用）
     std::wstring target;  // 快捷方式解析出的目标（工作目录用）
-    std::wstring pinyin; // 名称的拼音（用于拼音搜索）
     bool startMenu = false;
     std::unique_ptr<std::remove_pointer_t<HICON>, ProgramIconDeleter> icon;
     bool iconTried = false;
@@ -280,6 +234,21 @@ struct App {
     std::unordered_map<std::wstring, std::unordered_map<std::wstring, LearnVal>> learned;
     size_t learnCount = 0;     // learned 中（词,路径）对总数
     bool learnedDirty = false; // 有未写盘的学习变更
+    // ---- 搜索历史台账（诊断：一轮查询写一条 Q，一次打开写一条 O；设置「搜索历史」页）----
+    bool historyEnabled = true;    // 总开关（默认开）
+    int historyMaxLines = 2000;    // 文件保留行数（超出只留尾部）
+    std::wstring qText;            // 本轮查询的输入原文（Q/O 行都记这一份）
+    std::wstring qLayer;           // 本轮层标签：D / F / P（程序搜索）/ EV（Everything 旧链路）
+    ULONGLONG qT0 = 0;             // 本轮派发时刻
+    int qFirstMs = -1;             // 首屏上屏延迟（-1=结果还没上屏）
+    bool qLogged = false;          // 本轮 Q 行已成型（先攒着，编辑会话结束才落盘）
+    std::wstring qPendingLine;     // 攒着还没写的 Q 行原文（空=没有）
+    std::wstring qPendingText;     // 攒着那条的输入，用来判断「还在接着打字」
+    std::wstring qPendingLayer;
+    std::wstring qMissed;          // 本轮到最近一次上屏为止还没报齐的层（空=报齐）
+    int qDaemonRows = 0;           // 守护进程层（内存+磁盘索引）最后一块行数
+    int qFdRows = 0;               // fd 实时遍历层最后一块行数
+    int qWsRows = 0;               // Windows Search 层行数
     bool startingUp = true;    // 程序扫描尚未完成：托盘提示/右键菜单显示「正在启动中」
     Theme* theme = nullptr;
     std::vector<Star> stars;   // 星空主题星点坐标
@@ -387,6 +356,8 @@ constexpr UINT_PTR kTimerWeightSave = 4;   // 点击权重延迟合并写盘
 constexpr UINT_PTR kTimerTween = 5;        // 补间动画（与光标闪烁 kTimerBlink 区分，互不干扰）
 constexpr UINT_PTR kTimerHotkeyRetry = 6;  // 唤起快捷键被占用时定时重试回收
 constexpr UINT_PTR kTimerIndexStat = 7;    // 索引建库状态轮询（托盘提示/d/f 提示行用，仅新方案）
+constexpr UINT_PTR kTimerHistFlush = 8;    // 搜索历史：编辑静置后把攒着的 Q 行落盘
+constexpr UINT kHistFlushMs = 4000;        // 静置 4s 视为这一轮打完了（程序搜索逐字同步出结果，不落盘会一行一个前缀）
 constexpr int kDebounceMs = 120;
 constexpr int kWeightSaveDelayMs = 3000;   // 延迟合并写盘的等待时间
 constexpr int WM_APP_TRAY = WM_APP + 1;
@@ -445,6 +416,14 @@ static void SaveLearnedNow();
 static void LoadLearned();
 static void ClearLearned();
 static std::wstring LearnedDirPath();
+// 搜索历史台账（定义在「点击权重」小节末尾，落盘实现在 src/search_history.cpp）
+static void ArmHistoryClock(const WCHAR* layer);
+static std::wstring HistoryMissingLayers();
+static void LogHistoryQuery();
+static void SnapshotHistoryPending();
+static void FlushHistoryQuery();
+static void LogHistoryOpen(const Row& r);
+static void NoteHistoryFirstPaint();
 static void TrayBalloon(const std::wstring& title, const std::wstring& msg);
 static HWND TopTargetWindow();  // top 命令的目标窗口（唤醒前的前台窗口）
 static void ShowTopToast(HWND target, const std::wstring& text);  // 屏幕居中半透明 toast（打开提示/top 命令共用）
@@ -1022,10 +1001,6 @@ static void BuildProgramsInto(std::vector<Program>& out) {
     if (GetEnvironmentVariableW(L"ProgramFiles", pf, MAX_PATH)) EnumProgramFiles(pf, raw);
     if (GetEnvironmentVariableW(L"ProgramFiles(x86)", pf, MAX_PATH)) EnumProgramFiles(pf, raw);
 
-    for (auto& p : raw) {
-        p.pinyin = ToPinyin(ToLowerW(p.name));
-    }
-
     // 按显示名称去重（保留优先级更高的来源）
     for (auto& p : raw) {
         std::wstring k = ToLowerW(p.name);
@@ -1092,14 +1067,6 @@ static int MatchScore(const std::wstring& name, const std::wstring& ql) {
     if (name.size() >= ql.size() && wcsncmp(name.c_str(), ql.c_str(), ql.size()) == 0) return 3;
     if (name.find(ql) != std::wstring::npos) return 2;
     if (IsSubsequence(name, ql)) return 1;
-    return 0;
-}
-
-static int MatchScoreWithPinyin(const std::wstring& name, const std::wstring& pinyin, const std::wstring& ql) {
-    int nameScore = MatchScore(name, ql);
-    if (nameScore > 0) return nameScore;
-    if (ql.size() >= 2 && pinyin.find(ql) != std::wstring::npos) return 1;
-    if (ql.size() >= 2 && IsSubsequence(pinyin, ql)) return 1;
     return 0;
 }
 
@@ -1200,13 +1167,13 @@ static void SearchPrograms(const std::wstring& query) {
     // 有历史权重的条目例外：是用户此前真实点击过的，属于自适应推荐，不算噪音。
     const bool prefixOnly = (ql.size() < 2);
     for (auto& p : g.programs) {
-        int s = MatchScoreWithPinyin(ToLowerW(p.name), p.pinyin, ql);
+        int s = MatchScore(ToLowerW(p.name), ql);
         int hw = 0;
         auto hit = hist.find(p.path);
         if (hit != hist.end()) hw = hit->second;
         if (!(s > 0 && !(prefixOnly && s < 3)) && hw <= 0) continue;
-        if (hasEx) {  // -关键字：名称/路径/拼音任一含排除词即丢弃
-            std::wstring hay = ToLowerW(p.name) + L' ' + ToLowerW(p.path) + L' ' + p.pinyin;
+        if (hasEx) {  // -关键字：名称/路径任一含排除词即丢弃
+            std::wstring hay = ToLowerW(p.name) + L' ' + ToLowerW(p.path);
             if (HasExcludeTerm(hay)) continue;
         }
         int w = g.weightEnabled ? GetClickWeight(ql, p.path) + hw : 0;
@@ -1406,6 +1373,7 @@ static void ExecuteEverythingQuery() {
     cds.lpData = buf.data();
 
     DWORD_PTR res = 0;
+    ArmHistoryClock(L"EV");   // 旧链路：一问一答，派发即本轮计时起点（兜底重查另起一轮）
     LRESULT lr = SendMessageTimeoutW(evw, WM_COPYDATA, (WPARAM)g.hwnd, (LPARAM)&cds,
                                      SMTO_ABORTIFHUNG, 1500, &res);
     if (lr == 0 || res == 0) { UseEverythingFallback(); return; }
@@ -1456,6 +1424,7 @@ static void HandleEverythingReply(const COPYDATASTRUCT* cds) {
         g.evQuery = g.evFallbackQuery;
         g.evFallbackQuery.clear();
         g.evFallbackPending = true;
+        LogHistoryQuery();   // 主查询零结果先落一条台账，再排期路径级兜底（兜底算新一轮）
         PostMessageW(g.hwnd, WM_APP_EV_FALLBACK, 0, 0);
         AddHint(L"正在搜索…");
         g.sel = 0;
@@ -1480,6 +1449,8 @@ static void HandleEverythingReply(const COPYDATASTRUCT* cds) {
     // f/d 自学习：命中的学习项摘出原行后置顶（exe 优先）；有学习结果时不再显示「无结果」
     PrependLearnedRows(g.evTermKey);
     if (g.items.empty()) AddHint(g.startingUp ? L"正在启动中…" : L"无结果");
+    NoteHistoryFirstPaint();
+    LogHistoryQuery();
     g.sel = 0;
     LayoutAndRepaint();
 }
@@ -1630,6 +1601,7 @@ static void StartDfSearch() {
     if (!wsOk && !fdOk && g.dfMemDone) { ExecuteEverythingQuery(); return; }   // 全后端无：旧链路兜底
     const df::Query q = g.dfQuery;
     const DWORD budget = df::DefaultFdDeadlineMs();
+    ArmHistoryClock(q.isFile ? L"F" : L"D");   // 本轮时间基准：防抖到期、真正派发的那一刻
     if (daemonLayer) std::thread(DfDaemonWorker, gen, q).detach();
     if (wsOk) WsEnqueue(gen, q);
     if (fdOk) std::thread(DfFdWorker, gen, q, g.dfFdExe, g.skipDotFolders, budget).detach();
@@ -1661,7 +1633,7 @@ using appver::Info;
 
 static void RenderDfResults() {
     g.items = g.dfBaseRows;
-    // 基础排序：逐词按文件名命中质量（精确 > 前缀 > 包含 > 拼音/仅路径）——
+    // 基础排序：逐词按文件名命中质量（精确 > 前缀 > 包含 > 仅路径）——
     // 两个后端的原始顺序都是遍历序，不重排会让深层目录的包含命中压过浅层的精确命中。
     // 权重重排随后再叠加（点过的条目最前）。
     const std::vector<std::wstring>& words = g.dfQuery.words;
@@ -1675,9 +1647,6 @@ static void RenderDfResults() {
             else if (name.size() >= wl.size() && name.compare(0, wl.size(), wl) == 0) s += 4;
             else if (name.find(wl) != std::wstring::npos) s += 2;
             else if (path.find(wl) != std::wstring::npos) s += 1;
-            else s += 2;   // 词在名字与路径里都不存在 = 守护进程拼音命中（文本过滤的
-                           // WS/fd 后端不可能产出这种行）：与名字包含同档，
-                           // 否则拼音结果会压在仅路径命中（1 分）之下
         }
         return s;
     };
@@ -1713,6 +1682,7 @@ static void RenderDfResults() {
     RerankDfByWeight();
     // f/d 自学习置顶（与 Everything 展示路径同一套：摘出与结果重复的学习行后插到最前）
     PrependLearnedRows(g.evTermKey);
+    NoteHistoryFirstPaint();
     // 守护进程索引建库中：结果行尾部挂一条状态提示（完成后自动消失）
     bool indexBuilding = g.dfBackend == 0 && g.dfIndexTier > 0 &&
                     (g.indexMemReady == 0 || g.indexDiskReady == 0);   // 极简档无索引不提示
@@ -1726,6 +1696,14 @@ static void RenderDfResults() {
     } else if (indexBuilding) {
         AddHint(L"索引建库中…完成后 d/f 全盘毫秒级");
     }
+    // 三个后端都回报了才写 Q 行（一轮一次）：中途写会把「fd 还没到」记成总耗时
+    if (g.dfMemDone && g.dfWsDone && g.dfFdDone) {
+        g.qMissed.clear();
+        LogHistoryQuery();
+    } else {
+        g.qMissed = HistoryMissingLayers();   // 本轮还开着：把此刻的现场攒着，换查询/退出时落盘
+        SnapshotHistoryPending();
+    }
     g.sel = 0;
     LayoutAndRepaint();
 }
@@ -1737,10 +1715,13 @@ static void HandleDfReply(DfReply* r) {
     if (r->backend == BkWs) {
         if (r->failed) g.dfWsAvail = -1;   // 本次起停用 WS（fd 单后端，或全无时走旧链路）
         g.dfWsDone = true;
+        g.qWsRows = r->hits ? (int)r->hits->size() : 0;
     } else if (r->backend == BkFd) {
         g.dfFdDone = r->finalBatch;        // fd 流式：中间批次不算收尾
+        if (r->finalBatch) g.qFdRows = r->hits ? (int)r->hits->size() : 0;
     } else if (r->backend == BkMem) {
         g.dfMemDone = r->finalBatch;       // 守护进程流式：内存层块不算收尾
+        if (r->finalBatch) g.qDaemonRows = r->hits ? (int)r->hits->size() : 0;
     } else {
         g.dfDiskDone = true;               // 磁盘索引：单批即收尾
     }
@@ -2142,7 +2123,9 @@ static void Refresh() {
                 g.mode = Mode::Programs;
                 ParsedQuery pq = ParseExcludes(body);
                 g.excludes = pq.excludes;
+                ArmHistoryClock(L"P");
                 SearchPrograms(pq.positive);
+                LogHistoryQuery();   // 程序搜索在主线程同步完成，派发即有结果
             }
         } else if (tok == L"d" || tok == L"f") {
             g.mode = Mode::Everything;
@@ -2207,12 +2190,14 @@ static void Refresh() {
             };
             addGroup(FindGroup(g.groupsLaunch, key), false);
             addGroup(FindGroup(g.groupsKill, key), true);
-            ParsedQuery pq = ParseExcludes(t);      // -关键字：本地过滤程序名/路径/拼音
+            ParsedQuery pq = ParseExcludes(t);      // -关键字：本地过滤程序名/路径
             g.excludes = pq.excludes;
             std::wstring term = NormalizeSearchTerm(pq.positive);
+            ArmHistoryClock(L"P");
             SearchPrograms(pq.positive);
             // 自学习结果同样参与普通搜索（覆盖不在程序索引里的条目）
             PrependLearnedRows(term);
+            LogHistoryQuery();   // 程序搜索在主线程同步完成，派发即有结果
         }
     }
     LayoutAndRepaint();
@@ -2387,6 +2372,7 @@ static void ExecuteSelected(ExecKind ek = ExecKind::Normal) {
     RecordClickWeight(g.items[g.sel]);  // 点击/回车/快捷键选中即记权重（内部过滤非本地条目与不保存的前缀）
     if (ExecuteRow(g.items[g.sel], ek)) {
         RecordLearned(g.items[g.sel]);  // f/d 打开成功 → 记为自学习条目（含 .lnk 快捷方式）
+        LogHistoryOpen(g.items[g.sel]); // 台账记「这次实际点了哪条」，与权重分开：关了权重也留痕
         // 打开成功的轻量提示：贴在启动器原位顶部，淡入淡出自动消失（不抢焦点、不阻塞）
         std::wstring toast = OpenedToastText(g.items[g.sel]);
         if (!toast.empty()) ShowTopToast(g.hwnd, toast);
@@ -2568,6 +2554,7 @@ static void ShowRowMenu(HWND hwnd) {
             RecordClickWeight(r);  // 右键打开同样记权重
             if (ExecuteRow(r)) {
                 RecordLearned(r);  // 右键打开成功同样记自学习
+                LogHistoryOpen(r);
                 std::wstring toast = OpenedToastText(r);
                 if (!toast.empty()) ShowTopToast(g.hwnd, toast);
             }
@@ -2661,7 +2648,7 @@ static int SelectionEndWidth(HDC hdc) {
 
 static void EnsureCaretVisible() {
     HDC hdc = GetDC(g.hwnd);
-    int cw = CaretTextWidth(hdc) + CompTextWidth(hdc);  // 含组合串，长拼音时保持整段可见
+    int cw = CaretTextWidth(hdc) + CompTextWidth(hdc);  // 含输入法组合串，保持整段可见
     ReleaseDC(g.hwnd, hdc);
     RECT rc;
     GetClientRect(g.hwnd, &rc);
@@ -3022,6 +3009,8 @@ static void ApplySettingsToRuntime(const ft::Settings& s) {
     g.winShowUwp = s.winShowUwp;
     g.winShowProc = s.winShowProc;
     g.winCacheSec = s.winCacheSec;
+    g.historyEnabled = s.historyEnabled;
+    g.historyMaxLines = s.historyMaxLines;
 }
 static void LoadSettings() {
     sSnap.Load();
@@ -3286,6 +3275,124 @@ static void ClearClickWeights() {
     g.weightCount = 0;
     g.weightsDirty = true;
     SaveClickWeightsNow();
+}
+
+// ---------------- 搜索历史台账 ----------------
+// 一轮查询（防抖后真正派发的那一轮）攒一条 Q 行：首屏延迟、各层给了几条、总耗时、第一行结果；
+// 每次成功打开本地条目写一条 O 行。打完字静置 kHistFlushMs 才落盘，逐字打字不重复记。
+// 台账只用于事后检查，不参与排序；rows=0 和带「未回」的行最值钱——搜不出来的现场只有这里留得下来。
+static size_t HistoryRowCount() {
+    size_t n = 0;
+    for (const auto& r : g.items)
+        if (r.kind == Row::File || r.kind == Row::Folder || r.kind == Row::Prog) ++n;
+    return n;
+}
+
+static std::wstring HistoryTopPath() {
+    for (const auto& r : g.items)
+        if (r.kind == Row::File || r.kind == Row::Folder || r.kind == Row::Prog) return r.action;
+    return std::wstring();
+}
+
+static bool IsPrefixOf(const std::wstring& a, const std::wstring& b) {
+    return a.size() <= b.size() && std::equal(a.begin(), a.end(), b.begin());
+}
+
+// 派发时刻复位本轮计数（Q 行的时间基准从这里起算）
+static void ArmHistoryClock(const WCHAR* layer) {
+    if (!g.qPendingLine.empty()) {
+        // 同层、且新旧输入互为前缀 = 用户还在接着打字：上一条作废，
+        // 只留他真正看到结果的最后一轮（程序搜索逐字同步出结果，否则一个字落一行）。
+        bool cont = g.qPendingLayer == layer &&
+                    (IsPrefixOf(g.qPendingText, g.text) || IsPrefixOf(g.text, g.qPendingText));
+        // 没报齐、又不足 1 秒：他还在打字，这轮不值得留（卡住的那类交给下面的落盘时机）
+        bool draft = !g.qLogged && GetTickCount64() - g.qT0 < 1000;
+        if (cont || draft) {
+            g.qPendingLine.clear();
+            KillTimer(g.hwnd, kTimerHistFlush);
+        } else {
+            FlushHistoryQuery();   // 换了查询：上一轮先写完再起新一轮，文件里顺序不颠倒
+        }
+    }
+    g.qLayer = layer;
+    g.qText = g.text;
+    g.qT0 = GetTickCount64();
+    g.qFirstMs = -1;
+    g.qLogged = false;
+    g.qMissed.clear();
+    g.qDaemonRows = g.qFdRows = g.qWsRows = 0;
+}
+
+// 结果第一次上屏：记下首屏延迟（「秒出」要的就是这个数，不是总耗时）
+static void NoteHistoryFirstPaint() {
+    if (g.qFirstMs >= 0 || HistoryRowCount() == 0) return;
+    g.qFirstMs = (int)(GetTickCount64() - g.qT0);
+}
+
+// 本轮还没报齐的层（只有 d/f 这条路是分层的；其余模式返回空）
+static std::wstring HistoryMissingLayers() {
+    if (g.mode != Mode::Everything) return std::wstring();
+    std::wstring m;
+    if (!g.dfMemDone) m += L"索引";
+    if (!g.dfFdDone) m += (m.empty() ? L"fd" : L"+fd");
+    if (!g.dfWsDone) m += (m.empty() ? L"WS" : L"+WS");
+    return m;
+}
+
+// 用「此刻的现场」拼一行：rows/top 必须在结果上屏时就拍快照，
+// 等落盘时再读 g.items 会读到下一轮的空列表。
+static std::wstring BuildHistoryLine(const std::wstring& missed) {
+    ft::hist::QueryLine q;
+    q.ts = ft::hist::NowText();
+    q.layer = g.qLayer;
+    q.query = g.qText;
+    q.firstMs = g.qFirstMs;
+    q.totalMs = (int)(GetTickCount64() - g.qT0);
+    q.rows = (int)HistoryRowCount();
+    q.daemonRows = g.qDaemonRows;
+    q.fdRows = g.qFdRows;
+    q.wsRows = g.qWsRows;
+    q.top = HistoryTopPath();
+    q.missed = missed;
+    return ft::hist::FormatQueryLine(q);
+}
+
+// 本轮成型：先攒着，静置 kHistFlushMs 后落盘（时间戳取成型那一刻，不是落盘那一刻）
+static void LogHistoryQuery() {
+    if (!g.historyEnabled || g.qLogged) return;
+    g.qLogged = true;
+    NoteHistoryFirstPaint();
+    g.qPendingLine = BuildHistoryLine(g.qMissed);
+    g.qPendingText = g.qText;
+    g.qPendingLayer = g.qLayer;
+    SetTimer(g.hwnd, kTimerHistFlush, kHistFlushMs, nullptr);
+}
+
+// 层还没报齐：每次上屏都把现场重攒一遍（不 arm 计时器——一轮真正打完字才值得落一条），
+// 换查询（ArmHistoryClock）或退出（WM_DESTROY）时由 FlushHistoryQuery 把最后这版写出去。
+static void SnapshotHistoryPending() {
+    if (!g.historyEnabled || g.qLogged) return;
+    g.qPendingLine = BuildHistoryLine(g.qMissed);
+    g.qPendingText = g.qText;
+    g.qPendingLayer = g.qLayer;
+}
+
+static void FlushHistoryQuery() {
+    if (g.qPendingLine.empty()) return;
+    std::wstring line = g.qPendingLine;
+    g.qPendingLine.clear();
+    KillTimer(g.hwnd, kTimerHistFlush);
+    if (!g.historyEnabled) return;   // 关掉了就把攒着的丢掉，不留到下次开机
+    ft::hist::Write(line, (size_t)g.historyMaxLines);
+}
+
+// 与 RecordClickWeight 同一批调用点：只记本地文件/文件夹/程序条目
+static void LogHistoryOpen(const Row& r) {
+    if (!g.historyEnabled) return;
+    if (r.kind != Row::File && r.kind != Row::Folder && r.kind != Row::Prog) return;
+    FlushHistoryQuery();   // Q 行先落，O 行紧跟：事后读台账才看得出「这条是哪一轮搜出来的」
+    ft::hist::Write(ft::hist::FormatOpenLine(ft::hist::NowText(), g.qLayer, g.qText, r.action),
+                    (size_t)g.historyMaxLines);
 }
 
 // ---------------- f/d 自学习（打开即记忆，下次同词搜索直接置顶） ----------------
@@ -4258,6 +4365,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         case WM_DESTROY:
             KillTimer(hwnd, kTimerBlink);
+            FlushHistoryQuery();    // 退出前把攒着的最后一轮查询落盘（含没报齐就退出的那类现场）
             SaveClickWeightsNow();  // 退出前把未写盘的点击权重落盘（含「仅退出时写入」模式）
             SaveLearnedNow();       // 自学习数据同样落盘
             TrayRemove();
@@ -4390,6 +4498,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 KillTimer(hwnd, kTimerWeightSave);
                 SaveClickWeightsNow();  // 延迟合并写盘到期：一次写出全部权重
                 SaveLearnedNow();       // 自学习数据同步落盘
+            } else if (wParam == kTimerHistFlush) {
+                KillTimer(hwnd, kTimerHistFlush);
+                FlushHistoryQuery();   // 编辑静置到期：把这一轮的 Q 行落盘
             } else if (wParam == kTimerBlink) {
                 g.caretOn = !g.caretOn;
                 RECT r{0, 0, S(kBaseW), S(kBaseInputH)};
@@ -5367,17 +5478,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     LoadLearned();       // f/d 自学习数据（learned.dat + learned\*.lnk 双向同步）
     EnableDarkMenus();  // 按主题深浅强制弹出菜单（托盘/右键） 绘制
 
-    // 初始化拼音库
-    {
-        WCHAR exePath[MAX_PATH]{};
-        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-        std::wstring dir(exePath);
-        size_t pos = dir.find_last_of(L"\\/");
-        if (pos != std::wstring::npos) dir.resize(pos + 1);
-        std::wstring dictPath = dir + L"dict";
-        Pinyin::setDictionaryPath(dictPath);
-        g_pinyin = std::make_unique<Pinyin::Pinyin>();
-    }
     g.msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
 
     // 注册窗口类

@@ -20,7 +20,6 @@
 #include <oledberr.h>
 
 #include "df_search.h"
-#include "pinyin_text.h"
 
 #include <algorithm>
 #include <atomic>
@@ -35,10 +34,6 @@
 #include <string>
 #include <vector>
 
-// cpp-pinyin 拼音引擎（内存索引拼音搜索；仅守护进程运行时启用，见 MemPinyinStart）
-#include <cpp-pinyin/Pinyin.h>
-#include <cpp-pinyin/ManTone.h>
-#include <cpp-pinyin/G2pglobal.h>
 
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "ws2_32.lib")
@@ -439,56 +434,7 @@ void CancelAll() {
 // åç§»/åå­åç§»/æ¯å¦ç®å½ââæ¯ vector<wstring> çä¸åä»¥ä¸åå­ï¼æ éä¸²åéå¼éï¼ã
 // å¢éæ´æ° = æ´æ ¹æ¿æ¢ï¼fd éåè¯¥æ ¹åæ´ä½ swapï¼ï¼æ éè·¨æ ¹æªå¨ä¸æ ã
 
-// ---------------- 拼音索引（仅守护进程启用：SearchDaemonServe 调 MemPinyinStart） ----------------
-// 每条目名字转全拼（小写）存入拼音池；查询时词条可命中「名字 / 全拼子串 / 首字母子序列」。
-// 主程序自带一份 Pinyin 实例，这里只在守护进程内启用，避免 UI 进程重复加载词典；
-// exe 同目录无 dict/（或转换失败）时保持空指针，功能静默降级为纯名字匹配。
-std::unique_ptr<Pinyin::Pinyin> g_py;
-std::mutex g_pyMu;   // 建库线程与维护线程可能并发转换
-bool g_dfPinyinEnabled = true;   // 设置「拼音搜索」开关（守护进程自读注册表；仅守护进程路径存在）
-
-void MemPinyinStart() {
-    if (!g_dfPinyinEnabled) return;
-    if (g_py) return;
-    WCHAR exePath[MAX_PATH]{};
-    if (!GetModuleFileNameW(nullptr, exePath, MAX_PATH)) return;
-    std::wstring dir(exePath);
-    size_t p = dir.find_last_of(L"\\/");
-    if (p == std::wstring::npos) return;
-    std::wstring dict = dir.substr(0, p + 1) + L"dict";
-    if (GetFileAttributesW(dict.c_str()) == INVALID_FILE_ATTRIBUTES) return;
-    Pinyin::setDictionaryPath(dict);
-    g_py = std::make_unique<Pinyin::Pinyin>();
-}
-
-// 名字 → 全拼（小写）。未启用或名字不含汉字时返回空（调用方不存，查询回退名字匹配）。
-std::wstring MemNameToPinyin(const wchar_t* name) {
-    if (!g_py || !name || !*name) return L"";
-    bool hasHan = false;
-    for (const wchar_t* p = name; *p; ++p)
-        if (*p >= 0x4E00 && *p <= 0x9FFF) { hasHan = true; break; }
-    if (!hasHan) return L"";
-    std::lock_guard<std::mutex> lk(g_pyMu);
-    try {
-        auto res = g_py->hanziToPinyin(WideToUtf8(ft::PinyinBmpText(name)), Pinyin::ManTone::Style::NORMAL,
-                                   Pinyin::Error::Default, false, false, false);
-        std::string py;
-        for (const auto& r : res) {
-            if (!r.error && !r.pinyin.empty()) py += r.pinyin;
-            else if (!r.hanzi.empty()) py += r.hanzi;
-        }
-        if (py.empty()) return L"";
-        return ToLower(Utf8ToWide(py));
-    } catch (const std::bad_alloc&) {
-        throw;
-    } catch (const std::exception& error) {
-        if (GetEnvironmentVariableW(L"FT_DF_DEBUG", nullptr, 0) > 0)
-            fprintf(stderr, "[pinyin] skipped unsupported name: %s\n", error.what());
-        return L"";   // Original-name matching remains available for this entry.
-    }
-}
-
-// q 是否为 s 的子序列（首字母匹配：wxltjl ⊆ weixinliaotianjilu）；空 q 视为不匹配
+// q 是否为 s 的子序列；空 q 视为不匹配
 bool MemIsSubsequence(const wchar_t* s, const wchar_t* q) {
     if (!*q) return false;
     while (*s) {
@@ -526,13 +472,12 @@ std::condition_variable g_dirtyCv;
 std::set<size_t> g_dirty;
 
 // ---------------- 内存索引 delta（监听事件即时入库，查询时与池合并） ----------------
-// 池的增量粒度是「整根重扫」（大根 113s 级）：新文件从落盘到可拼音搜要等整根
-// 重建。监听线程把增/删/改名事件即时写进 delta 表，查询层与池合并——新条目
+// 池的增量粒度是「整根重扫」（大根 113s 级）：新文件从落盘到可搜要等整根重建。
+// 监听线程把增/删/改名事件即时写进 delta 表，查询层与池合并——新条目
 // 秒级可搜；防抖后的整根重建照旧进行，换入时按根前缀折叠清表。
 struct MemDeltaEntry {
     bool isDir = false;
     std::wstring path;     // 真实大小写（展示）
-    std::wstring pinyin;   // 全拼小写；空 = 无拼音（纯 ASCII 名 / 未启用）
 };
 std::mutex g_memDeltaMu;
 std::unordered_map<std::wstring, MemDeltaEntry> g_memDeltaAdd;   // 键=小写反斜杠全路径
@@ -724,13 +669,6 @@ void MemPoolAttachPinyin(MemRootData& rd, const std::string& py) {
 // 建库路径：入池 + 汉字名字转拼音（仅守护进程启用时生效）
 void MemPoolAdd(MemRootData& rd, const std::string& path, bool isDir) {
     MemPoolAddRaw(rd, path, isDir);
-    if (!g_py) return;
-    const size_t nameOff = path.find_last_of('\\');
-    std::wstring wname = Utf8ToWide(
-        path.substr(nameOff == std::string::npos ? 0 : nameOff + 1));
-    std::wstring py = MemNameToPinyin(wname.c_str());
-    if (!py.empty() && _wcsicmp(py.c_str(), wname.c_str()) != 0)
-        MemPoolAttachPinyin(rd, WideToUtf8(py));   // MemNameToPinyin 已小写
 }
 
 // ç´¢å¼ç¼å­è½çï¼UTF-8 ææ¬ï¼é¦è¡çæ¬æ è®°ï¼R\tæ ¹ç®å½ ä¸ºåèæ è®°ï¼D/F\tpath ä¸ºæ¡ç®ï¼ã
@@ -1113,7 +1051,6 @@ void MemDeltaIngest(const std::wstring& root, const char* buf, DWORD bytes) {
             MemDeltaEntry de;
             de.isDir = kv.second != 0;
             de.path = std::move(kv.first);
-            de.pinyin = MemNameToPinyin(de.path.c_str() + (np == std::wstring::npos ? 0 : np + 1));
             g_memDeltaAdd[key] = std::move(de);
             g_memDeltaDel.erase(key);
         }
@@ -1348,10 +1285,6 @@ static int MemHitScore(const char* name, const char* py, const char* path,
         if (at == name && name[w.size()] == '\0') { s += 8; continue; }
         if (at == name) { s += 4; continue; }
         if (at) { s += 2; continue; }
-        if (py && *py && (strstr(py, w.c_str()) ||
-                          (w.size() >= 2 && MemIsSubsequenceBytes(py, w.c_str())))) {
-            s += 2; continue;   // 拼音命中与名字包含同档（与主程序打分一致）
-        }
         if (pathMode && MemFindFoldedBytes(path, w)) { s += 1; continue; }   // 词落在其他目录层
         return 0;
     }
@@ -1438,10 +1371,6 @@ int MemIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD m
             bool ok = true;
             for (const auto& w : wl) {
                 if (MemFindFolded(name, w)) { s += 2; continue; }
-                if (!pathMode && !de.pinyin.empty()) {
-                    if (MemFindFolded(de.pinyin.c_str(), w)) { s += 2; continue; }
-                    if (w.size() >= 2 && MemIsSubsequence(de.pinyin.c_str(), w.c_str())) { s += 2; continue; }
-                }
                 if (pathMode && MemFindFolded(de.path.c_str(), w)) { s += 1; continue; }
                 ok = false;
                 break;
@@ -2004,15 +1933,13 @@ unsigned __stdcall DiskBuildThread(void*) {
             }
             return true;
         };
-        const bool pyBuild = g_dfPinyinEnabled && g_py != nullptr;   // 拼音可用：行尾写 "|全拼"
-        if (!writeAll(pyBuild ? "FTDISKIDX3\nCOUNT\t0000000000\nPY\t1\n"
-                              : "FTDISKIDX3\nCOUNT\t0000000000\nPY\t0\n", 33)) {
+        if (!writeAll("FTDISKIDX3\nCOUNT\t0000000000\nPY\t0\n", 33)) {
             buildError = ERROR_WRITE_FAULT;
             CloseHandle(h);
             DeleteFileW(tmp.c_str());
             break;
         }
-        dbg(L"header written:", pyBuild ? 1 : 0);
+        dbg(L"header written:", 0);
         ULONGLONG foldThrough;
         {
             std::lock_guard<std::mutex> lk(g_ovMu);
@@ -2062,16 +1989,6 @@ unsigned __stdcall DiskBuildThread(void*) {
                         if (count >= DiskCap()) return true;
                         chunk += pass == 0 ? "D" : "F";
                         chunk += low;
-                        if (pyBuild) {   // basename 全拼后缀（仅汉字名；路径不含 '|'——Windows 文件名非法字符）
-                            const size_t bp = low.find_last_of('/');
-                            std::wstring wbase = Utf8ToWide(
-                                low.substr(bp == std::wstring::npos ? 0 : bp + 1));
-                            std::wstring wp = MemNameToPinyin(wbase.c_str());
-                            if (!wp.empty()) {
-                                chunk += '|';
-                                chunk += WideToUtf8(wp);
-                            }
-                        }
                         chunk += "\n";
                         ++count;
                         if (chunk.size() >= 4 * 1024 * 1024) {
@@ -2301,8 +2218,6 @@ void DiskIndexStart() {
         }
     }
     if (g_diReady) DiskPrefetchAsync();   // 冷页预热：首查的 218-500ms 页缓存回填挪到后台
-    if (g_diReady && g_dfPinyinEnabled && !g_diskHasPinyin)
-        DiskMaybeStartRebuild();   // 拼音开启但缓存是 PY0（关拼音期间建的）：后台重建补上，旧映射照常服务
     if (!g_diReady) { g_diNeedsRebuild = true; DiskMaybeStartRebuild(); }
     for (const auto& r : DriveRoots()) {
         CloseHandle((HANDLE)_beginthreadex(nullptr, 0, DiskWatchThread,
@@ -2399,7 +2314,6 @@ int DiskIndexSearch(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD 
             if (w.size() == nameLen && memcmp(nameSeg, w.data(), w.size()) == 0) { sc += 8; continue; }
             if (nameLen >= w.size() && memcmp(nameSeg, w.data(), w.size()) == 0) { sc += 4; continue; }
             if (MemContainsBytes(nameSeg, nameLen, w.data(), w.size())) { sc += 2; continue; }
-            if (pyLen > 0 && MemContainsBytes(pySeg, pyLen, w.data(), w.size())) { sc += 2; continue; }
             if (pathMode && MemContainsBytes(rec, pathLen, w.data(), w.size())) { sc += 1; continue; }
             ok = false;
             break;
@@ -2604,7 +2518,6 @@ int AppIndexSearch(const Query& q, std::vector<Hit>& out, DWORD maxRows) {
                 if (w.size() == nameLen && memcmp(nameSeg, w.data(), w.size()) == 0) { sc += 8; continue; }
                 if (nameLen >= w.size() && memcmp(nameSeg, w.data(), w.size()) == 0) { sc += 4; continue; }
                 if (MemContainsBytes(nameSeg, nameLen, w.data(), w.size())) { sc += 2; continue; }
-                if (pyLen > 0 && MemContainsBytes(pySeg, pyLen, w.data(), w.size())) { sc += 2; continue; }
                 ok = false;
                 break;
             }
@@ -2916,6 +2829,46 @@ unsigned __stdcall ConnThreadProc(void* p) {
     return 0;
 }
 
+// 空闲回吐：查询会线扫整块 blob，映射页全部进工作集（磁盘索引 ~350MB——本质是
+// 索引文件本身流经进程，standby 可回收、系统内存紧张时自动让路，但任务管理器的
+// 数字不回落，观感上就是「占用三四百 MB」）。查询静默 2 分钟后 EmptyWorkingSet
+// 把工作集整体退到 standby/页文件，再把内存池预取回来（首块 mem+app 的秒出指标
+// 不受影响；blob 页下次查询补软故障，成本落在异步次块）。select 每 60s 醒一次，
+// 回吐粒度即此；30 分钟空闲退出前通常已回吐一轮。
+constexpr ULONGLONG kWsTrimIdleMs = 2ULL * 60 * 1000;
+std::atomic<ULONGLONG> g_lastWsTrim{0};
+
+// Win8.1+ PrefetchVirtualMemory（KernelBase 运行时解析；失败无害——只是回吐后
+// 首查多付一次软故障）。与 DiskPrefetchThread 各自解析，均为低频路径。
+static void PrefetchRange(const void* base, size_t bytes) {
+    if (!base || !bytes) return;
+    struct MemRangeEntry { void* addr; SIZE_T bytes; };   // == MEMORY_RANGE_ENTRY
+    using PrefetchFn = BOOL(WINAPI*)(HANDLE, ULONG_PTR, MemRangeEntry*, ULONG);
+    HMODULE kb = GetModuleHandleW(L"KernelBase.dll");
+    PrefetchFn fn = kb ? (PrefetchFn)GetProcAddress(kb, "PrefetchVirtualMemory") : nullptr;
+    if (!fn) return;
+    MemRangeEntry e{const_cast<void*>(base), bytes};
+    fn(GetCurrentProcess(), 1, &e, 0);
+}
+
+void DaemonIdleTrim() {
+    g_lastWsTrim.store(GetTickCount64());
+    SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);   // == EmptyWorkingSet
+    size_t poolBytes = 0;
+    {   // 池回取：首块扫描数据，不能把秒出换成回吐后的软故障；锁内只拿地址（数据
+        // 在建库/重建时整体替换——回吐窗口内无查询，竞态面与 MemIndexSave 快照同）
+        std::lock_guard<std::mutex> lk(g_memMu);
+        for (const auto& r : g_memRoots) {
+            if (!r.pool.empty()) { PrefetchRange(r.pool.data(), r.pool.size()); poolBytes += r.pool.size(); }
+            if (!r.pyPool.empty()) { PrefetchRange(r.pyPool.data(), r.pyPool.size()); poolBytes += r.pyPool.size(); }
+        }
+    }
+    if (GetEnvironmentVariableW(L"FT_DF_DEBUG", nullptr, 0) > 0) {
+        fwprintf(stderr, L"[ws] idle trim, pool prefetched %llu bytes\n", (unsigned long long)poolBytes);
+        fflush(stderr);
+    }
+}
+
 int Serve(const std::vector<std::wstring>& extraRoots) {
     WSADATA wsa{};
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return 1;
@@ -2965,7 +2918,10 @@ int Serve(const std::vector<std::wstring>& extraRoots) {
         int r = select((int)ls + 1, &rs, nullptr, nullptr, &tv);
         if (r <= 0) {
             if (DfTierChanged()) break;   // 设置变更：退出，等主程序按新档重拉
-            if (GetTickCount64() - lastActive.load() > kDaemonIdleExitMs) break;   // 空闲退出
+            const ULONGLONG idleMs = GetTickCount64() - lastActive.load();
+            if (idleMs > kDaemonIdleExitMs) break;   // 空闲退出
+            if (idleMs > kWsTrimIdleMs && GetTickCount64() - g_lastWsTrim.load() > kWsTrimIdleMs)
+                DaemonIdleTrim();   // 空闲回吐：任务管理器数字回落（blob 页退 standby）
             continue;
         }
         sockaddr_in cli{};
@@ -2998,7 +2954,6 @@ int Serve(const std::vector<std::wstring>& extraRoots) {
 // 主程序下轮查询自动以新档拉起（SearchDaemonStart 拉起限频 3s 兜底）。
 struct DfTierConfig {
     int tier = 2;        // 0=极简 1=轻量 2=均衡 3=极速
-    bool pinyin = true;
     std::wstring indexDirs;   // 优先根（IndexDirs）原文：变了必须重启守护进程，新根才进内存池
 };
 DfTierConfig DfTierFromReg() {
@@ -3007,10 +2962,6 @@ DfTierConfig DfTierFromReg() {
     if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"DfIndexTier",
                      RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS && v <= 3)
         c.tier = (int)v;
-    sz = sizeof(v);
-    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"DfPinyin",
-                     RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS)
-        c.pinyin = v != 0;
     DWORD dcsz = 0;   // 变长读：固定缓冲会在列表超量时静默返回 ERROR_MORE_DATA，优先根整体消失
     if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flowtary", L"IndexDirs",
                      RRF_RT_REG_SZ, nullptr, nullptr, &dcsz) == ERROR_SUCCESS &&
@@ -3037,18 +2988,15 @@ void ApplyTierCaps(int tier) {
 // 与启动基线相比档位/拼音开关是否变化（首次调用登记基线）。
 bool DfTierChanged() {
     static int s_tier = -1;
-    static bool s_pinyin = false;
     static std::wstring s_dirs;
     DfTierConfig c = DfTierFromReg();
     if (s_tier < 0) {
         s_tier = c.tier;
-        s_pinyin = c.pinyin;
         s_dirs = c.indexDirs;
         return false;
     }
-    if (c.tier == s_tier && c.pinyin == s_pinyin && c.indexDirs == s_dirs) return false;
+    if (c.tier == s_tier && c.indexDirs == s_dirs) return false;
     s_tier = c.tier;
-    s_pinyin = c.pinyin;
     s_dirs = c.indexDirs;
     return true;
 }
@@ -3057,12 +3005,6 @@ int SearchDaemonServe(const std::vector<std::wstring>& extraRoots) {
     DfTierConfig cfg = DfTierFromReg();
     if (cfg.tier == 0) return 0;   // 极简档：不建索引不驻留（fd/WS 实时兜底）
     ApplyTierCaps(cfg.tier);
-    g_dfPinyinEnabled = cfg.pinyin;
-    if (GetEnvironmentVariableW(L"FT_DF_DEBUG", nullptr, 0) > 0) {
-        fwprintf(stderr, L"[tier] %d pinyin=%d\n", cfg.tier, cfg.pinyin ? 1 : 0);
-        fflush(stderr);
-    }
-    MemPinyinStart();   // 毫秒层拼音索引（exe 同目录无 dict/ 时静默降级为纯名字匹配）
     return dfdaemon::Serve(extraRoots);
 }
 
