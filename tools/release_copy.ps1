@@ -14,7 +14,6 @@ if (-not $Root) { $Root = Split-Path -Parent $PSScriptRoot }   # tools\.. = é¡¹ç
 if (-not $Dist) { $Dist = Join-Path $Root 'dist' }
 
 $src  = Join-Path $Root 'build'
-if (-not (Test-Path (Join-Path $src 'fd.exe'))) { throw 'fd.exe missing from build output; search indexes cannot be built' }
 $ver  = '0.0.0.0'
 
 $line = Select-String -Path (Join-Path $Root 'src\version.h') -Pattern '#define FT_VER_DOT' | Select-Object -First 1
@@ -34,5 +33,7 @@ Copy-Item (Join-Path $src 'filedlg_agent32.exe')(Join-Path $Dist 'filedlg_agent3
 if (Test-Path (Join-Path $src 'flowtary-search.exe')) {
     Copy-Item (Join-Path $src 'flowtary-search.exe') (Join-Path $Dist 'flowtary-search.exe') -Force
 }
-Copy-Item (Join-Path $src 'fd.exe') (Join-Path $Dist 'fd.exe') -Force
+if (Test-Path (Join-Path $src 'flowtary-indexer.exe')) {
+    Copy-Item (Join-Path $src 'flowtary-indexer.exe') (Join-Path $Dist 'flowtary-indexer.exe') -Force
+}
 Write-Host ("[ok] {0}\flowtary-{1}.exe" -f $Dist, $ver)

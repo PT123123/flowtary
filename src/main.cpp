@@ -1,6 +1,6 @@
 // ============================================================
 // Flowtary — Windows 极简全局搜索启动器
-//   Alt+Space 唤醒 | d/f Everything 搜索 | 网页前缀跳转 | 程序启动
+//   Alt+Space 唤醒 | d/f 本地索引搜索 | 网页前缀跳转 | 程序启动
 //   纯 Win32 + GDI，零第三方依赖
 // ============================================================
 #define WIN32_LEAN_AND_MEAN
@@ -15,8 +15,15 @@
 #include "settings_ipc.h"  // sidecar ↔ 主进程消息协议
 #include "settings_model.h"  // 设置项的唯一真源：注册表值名、编辑器语法、默认文本
 #include "search_history.h"  // 搜索历史台账（诊断用纯文本，行格式与落盘都在这一份）
-#include "df_search.h"  // d/f 搜索后端：Windows Search（OLE DB）+ fd（现查遍历），不建全盘索引
+#include <atomic>
+#include "search_policy.h"
+#include "df_search.h"  // d/f 搜索后端：已有 Windows Search 索引查询
+#include "indexer_client.h"
 #include "app_ver.h"    // 「<应用名>-<版本号>」发布目录解析（结果排序把最新版抬到前面）
+#include "app_catalog.h"
+#include "app_icons.h"
+#include "app_catalog_watch.h"
+#include "workshop_catalog.h"
 #include <imm.h>
 #include <dwmapi.h>
 #include <uxtheme.h>
@@ -53,36 +60,7 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #pragma comment(lib, "uxtheme.lib")
 #pragma comment(lib, "msimg32.lib")
 
-// ---------------- Everything IPC（官方 SDK 协议，Everything 1.3+） ----------------
-namespace ev {
-constexpr DWORD kCopyDataQueryW = 2;  // EVERYTHING_IPC_COPYDATAQUERYW
-constexpr DWORD kReplyBase      = 0x46540000;  // 回复消息基值，低 16 位放查询序号
-constexpr DWORD kFlagFolder     = 0x1;
-constexpr DWORD kMaxResults     = 10;   // 展示上限：过滤后最多保留的结果行数
-constexpr DWORD kMaxFetch       = 50;   // 单次向 Everything 索取上限：过滤噪音后仍能凑满展示上限
-
-#pragma pack(push, 1)
-struct Query {
-    DWORD reply_hwnd;
-    DWORD reply_copydata_message;
-    DWORD search_flags;
-    DWORD offset;
-    DWORD max_results;
-    WCHAR search_string[1];
-};
-struct Item {
-    DWORD flags;
-    DWORD filename_offset;
-    DWORD path_offset;
-};
-struct List {
-    DWORD totfolders, totfiles, totitems;
-    DWORD numfolders, numfiles, numitems;
-    DWORD offset;
-    Item items[1];
-};
-#pragma pack(pop)
-}  // namespace ev
+constexpr DWORD kMaxVisibleResults = 10;
 
 // ---------------- 设置数据模型（与 flowtary-settings.exe 共用） ----------------
 // 文本工具、通配符匹配、四个编辑器的解析/序列化、注册表原语、weights/learned 文件路径
@@ -115,8 +93,7 @@ using ft::RulesTextEqual;
 using ft::kWebRulesVer;
 using ft::kExcludeDefaultsVer;
 using ft::kEntrySep;
-using ft::StartupEnabled;
-using ft::SetStartupPath;
+using ft::SyncStartupPath;
 
 
 static std::vector<ThemeTune> sTune;      // 当前生效值（滑块实时预览会改 kThemes，这里只作回退/读写中转）
@@ -149,13 +126,13 @@ struct Program {
 struct Row {
     // Reveal：搜索框里直接粘贴了「文件」路径时的直达项 —— 回车不启动该文件，
     // 而是在资源管理器中打开其所在文件夹并选中它（action 为文件完整路径）。
-    enum Kind { File, Folder, Web, Prog, EvFallback, Hint, Group, Shell, Window, Top, Capture, Reveal };
+    enum Kind { File, Folder, Web, Prog, Hint, Group, Shell, Window, Top, Capture, Reveal };
     Kind kind = Hint;
     std::wstring title;
     std::wstring sub;     // 路径 / URL 说明
-    std::wstring action;  // 打开目标；EvFallback 时为 Everything 命令行参数；
-                          // Shell 时为命令行文本；Window 时为 HWND 十六进制串
+    std::wstring action;  // 打开目标；Shell 时为命令行文本；Window 时为 HWND 十六进制串
     Program* prog = nullptr;
+    bool workshopHit = false; // Flowtary-owned C:\\workshop\\*.exe priority metadata
     // 一键组（Row::Group）：groupKill=false 启动 groupTargets 里的文件；
     // groupKill=true 结束 groupTargets 里的进程名
     bool groupKill = false;
@@ -176,7 +153,7 @@ struct LearnVal {
     std::wstring lnk;       // 镜像快捷方式文件名（learned 目录内，空=尚未创建）
 };
 
-enum class Mode { None, Everything, Web, Programs, Shell, Window, Top, Capture };
+enum class Mode { None, Files, Web, Programs, Shell, Window, Top, Capture };
 
 // 窗口枚举缓存项
 struct WinInfo {
@@ -204,10 +181,7 @@ struct App {
     // 点开头过滤（默认开，UI 在设置「排除路径」Tab）：搜索文件/文件夹时，
     // 路径中任一层名以 '.' 开头（目录 .git / .vscode，或文件 .gitignore）即过滤该行。
     bool skipDotFolders = true;
-    int dfBackend = 0;          // d/f 搜索后端：0=新方案（内置索引） 1=Everything 旧链路（设置「常规」页）
-    int dfIndexTier = 2;        // 搜索索引档位：0=极简（不建索引，fd/WS 实时兜底）3=极速
-    int indexMemReady = -1;     // 守护进程索引状态（-1=未知 0=建库中 1=就绪），托盘提示与 d/f 提示行用
-    int indexDiskReady = -1;
+    int dfBackend = 0;          // d/f 后端：0=自动（Flowtary 优先）1=仅 Flowtary 2=仅 Windows Search
     bool fdjEnabled = true;    // 文件对话框跳转总开关（默认开；UI 在设置「常规」Tab，不再放托盘菜单）
     bool topEnabled = true;    // top 命令开关（默认开：空格+top 回车置顶/取消置顶当前窗口）
     bool cmdEnabled = true;    // cmd 命令开关（默认开：空格+cmd 执行 Shell 命令，原 "> 命令"）
@@ -216,9 +190,9 @@ struct App {
     bool weightEnabled = true; // 点击权重记忆总开关（默认开）
     int weightFlush = 1;       // 写盘时机：0=每次点击立即写入, 1=延迟合并写入, 2=仅退出时写入
     int weightMaxEntries = 5000;  // 权重条目上限（内存 + 磁盘均按此裁剪）
-    std::wstring evTermKey;    // 当前 Everything 查询对应的标准化有效搜索词（回复到达时用于按权重重排）
+    std::wstring evTermKey;    // 当前 d/f 查询对应的标准化有效搜索词
     // 本次刷新的排除词（-关键字 语法，已小写）：SearchPrograms / PrependLearnedRows 读取它过滤结果，
-    // f/d 分支同时用它把排除词翻成 Everything 原生 !file:/!folder: 语法。Refresh() 每轮开头清空。
+    // f/d 查询在 Flowtary / Windows Search 结果返回后统一应用排除词。
     std::vector<std::wstring> excludes;
     // 权重存储：有效搜索词（去首尾空格+小写） → 文件完整绝对路径 → 点击次数。
     // 不同搜索词之间互相独立；以完整路径区分同名文件。
@@ -238,7 +212,7 @@ struct App {
     bool historyEnabled = true;    // 总开关（默认开）
     int historyMaxLines = 2000;    // 文件保留行数（超出只留尾部）
     std::wstring qText;            // 本轮查询的输入原文（Q/O 行都记这一份）
-    std::wstring qLayer;           // 本轮层标签：D / F / P（程序搜索）/ EV（Everything 旧链路）
+    std::wstring qLayer;           // 本轮层标签：D / F / P（程序搜索）
     ULONGLONG qT0 = 0;             // 本轮派发时刻
     int qFirstMs = -1;             // 首屏上屏延迟（-1=结果还没上屏）
     bool qLogged = false;          // 本轮 Q 行已成型（先攒着，编辑会话结束才落盘）
@@ -246,8 +220,6 @@ struct App {
     std::wstring qPendingText;     // 攒着那条的输入，用来判断「还在接着打字」
     std::wstring qPendingLayer;
     std::wstring qMissed;          // 本轮到最近一次上屏为止还没报齐的层（空=报齐）
-    int qDaemonRows = 0;           // 守护进程层（内存+磁盘索引）最后一块行数
-    int qFdRows = 0;               // fd 实时遍历层最后一块行数
     int qWsRows = 0;               // Windows Search 层行数
     bool startingUp = true;    // 程序扫描尚未完成：托盘提示/右键菜单显示「正在启动中」
     Theme* theme = nullptr;
@@ -273,8 +245,8 @@ struct App {
     std::vector<CmdGroup> groupsKill;    // 一键关闭组：关键字 → 进程名列表
 
     // 排除路径（设置可编辑）：用户原文，每行一条（保留给设置页编辑框原样回显）。
-    // 命中 Everything 结果路径或程序 .lnk/.exe 完整路径时丢弃该项。
-    // 仅在 Everything 模式（d/f）与程序模式生效；网页/一键组不参与过滤。
+    // 命中文件路径或程序 .lnk/.exe 完整路径时丢弃该项。
+    // 仅在文件搜索与程序模式生效；网页/一键组不参与过滤。
     std::vector<std::wstring> excludePaths;
     // excludePaths 的归一化镜像（反斜杠统一 + 去尾部分隔符 + 全小写），与前者下标一一对应。
     // 匹配时只看这一份，避免用户填的大小写/尾部反斜杠写法导致静默失效。
@@ -293,28 +265,19 @@ struct App {
     std::vector<Row> items;
     int sel = 0;
 
-    std::wstring evQuery;      // 待发往 Everything 的完整查询串（含 file:/folder:）
-    std::wstring evFallbackQuery;  // 路径级兜底查询：主查询（按名字）零结果时自动追发一次；发出即清空
-    bool evFallbackPending = false;  // 兜底查询已排期、等待 WM_APP_EV_FALLBACK 发送
-    std::wstring evSentQuery;  // 上一次实际发出的查询串（回复到达时核对仍处于同一阶段）
-    DWORD expectReply = 0;     // 期待的结果消息 dwData
-    DWORD serial = 0;
+    // Query existing indexes only; no owned filesystem index or traversal backend.
+    df::Query dfQuery;
+    std::atomic<DWORD> dfGen{0};
+    bool dfWsDone = true;
+    bool dfWsFailed = false;
+    ft::search::Route searchRoute = ft::search::Route::Unavailable;
+    std::vector<Row> dfBaseRows;
 
-    // ---- d/f 双后端（Windows Search + fd，不建全盘索引；双后端全无时回退上面旧 IPC 链路）----
-    df::Query dfQuery;            // 当前 d/f 结构化查询（正向词表 + 排除词）
-    DWORD dfGen = 0;              // 查询代数：新查询 / 清空输入 / 隐藏窗口时 ++，旧回复按代数丢弃
-    int dfWsAvail = 0;            // Windows Search 可用性：0=未探测 1=可用 -1=不可用（首次查询时确定）
-    std::wstring dfFdExe;         // fd.exe 路径（首次 d/f 时探测一次，空=不存在）
-    bool dfFdLookedUp = false;
-    bool dfWsDone = false, dfFdDone = false, dfMemDone = true;  // 当前代各后端是否已回报（内存索引未就绪视为已完成）
-    bool dfDiskDone = true;     // 磁盘索引层回报状态（未就绪视为已完成）
-    std::vector<Row> dfBaseRows;  // 当前代已收到的后端结果（已过滤；fd 到达时与 WS 合并去重）
 
     std::vector<Program> programs;
     // 文件/文件夹行图标缓存：路径（小写）→ 小图标。File/Folder 结果行（含自学习置顶项）
     // 与程序行一样显示图标；首次经 shell 抽取后缓存，退出时统一销毁。
     std::unordered_map<std::wstring, HICON> pathIcons;
-    std::wstring everythingExe;
     std::wstring hotkeyName = L"Alt+Space";
     HHOOK hWakeHook = nullptr;     // 低级键盘钩子：让首选唤起组合优先于其他程序的 RegisterHotKey
     bool hotkeyRegistered = false; // 唤起热键是否已成功 RegisterHotKey（失败由重试定时器回收）
@@ -355,7 +318,6 @@ constexpr UINT_PTR kTimerBalloon = 3;
 constexpr UINT_PTR kTimerWeightSave = 4;   // 点击权重延迟合并写盘
 constexpr UINT_PTR kTimerTween = 5;        // 补间动画（与光标闪烁 kTimerBlink 区分，互不干扰）
 constexpr UINT_PTR kTimerHotkeyRetry = 6;  // 唤起快捷键被占用时定时重试回收
-constexpr UINT_PTR kTimerIndexStat = 7;    // 索引建库状态轮询（托盘提示/d/f 提示行用，仅新方案）
 constexpr UINT_PTR kTimerHistFlush = 8;    // 搜索历史：编辑静置后把攒着的 Q 行落盘
 constexpr UINT kHistFlushMs = 4000;        // 静置 4s 视为这一轮打完了（程序搜索逐字同步出结果，不落盘会一行一个前缀）
 constexpr int kDebounceMs = 120;
@@ -363,9 +325,9 @@ constexpr int kWeightSaveDelayMs = 3000;   // 延迟合并写盘的等待时间
 constexpr int WM_APP_TRAY = WM_APP + 1;
 constexpr int WM_APP_PROGRAMS_READY = WM_APP + 2;  // 工作线程扫描完成，回主线程接管结果
 constexpr int WM_APP_QUIT = WM_APP + 3;  // 新版本接管：通知旧实例退出
-constexpr int WM_APP_EV_FALLBACK = WM_APP + 4;  // Everything 路径级兜底查询：延迟到消息循环外发（见下）
 constexpr int WM_APP_SETTINGS_GONE = WM_APP + 5;  // 设置窗 sidecar 进程结束（线程池回调 PostMessage 进来）
 constexpr int WM_APP_DF_READY = WM_APP + 6;  // d/f 双后端结果就绪：lParam = DfReply*（堆上，主线程接管后 delete）
+constexpr int WM_APP_APPS_CHANGED = WM_APP + 7;
 constexpr int IDM_SETTINGS = 2001;
 constexpr int IDM_EXIT = 2002;
 constexpr int IDM_REFRESH = 2003;   // 托盘菜单：刷新应用缓存
@@ -555,7 +517,7 @@ static void GenerateStars() {
     for (int i = 0; i < 96; ++i) {
         Star st;
         st.x = 2 + (int)(rnd() % (kBaseW - 4));
-        st.y = 2 + (int)(rnd() % (kBaseInputH + ev::kMaxResults * kBaseRowH - 6));
+        st.y = 2 + (int)(rnd() % (kBaseInputH + kMaxVisibleResults * kBaseRowH - 6));
         st.s = (rnd() % 100) < 16 ? 2 : 1;
         st.v = (BYTE)(120 + rnd() % 135);  // 120..254 亮度
         g.stars.push_back(st);
@@ -916,7 +878,8 @@ static std::wstring ResolveLnkTarget(const std::wstring& lnk) {
         IPersistFile* pf = nullptr;
         if (SUCCEEDED(psl->QueryInterface(kIID_IPersistFile, (void**)&pf))) {
             if (SUCCEEDED(pf->Load(lnk.c_str(), STGM_READ))) {
-                psl->Resolve(nullptr, SLR_NO_UI);
+                // Read the stored target only. Resolve may search disks/network shares
+                // or update a broken shortcut; selecting an entry must not start that work.
                 WCHAR buf[MAX_PATH]{};
                 WIN32_FIND_DATAW wfd{};
                 if (SUCCEEDED(psl->GetPath(buf, MAX_PATH, &wfd, SLGP_RAWPATH))) out = buf;
@@ -929,127 +892,83 @@ static std::wstring ResolveLnkTarget(const std::wstring& lnk) {
 }
 
 // ---------------- 程序枚举（启动时一次性，之后纯内存匹配） ----------------
-static void AddLnk(const std::wstring& full, std::vector<Program>& out) {
-    size_t i = full.find_last_of(L"\\/");
-    Program p;
-    p.name = StripExt(i == std::wstring::npos ? full : full.substr(i + 1));
-    p.path = full;
-    p.target = ResolveLnkTarget(full);
-    p.startMenu = true;
-    if (!p.name.empty()) out.push_back(std::move(p));
-}
-
-static void EnumLnkDir(const std::wstring& dir, int depth, std::vector<Program>& out) {
-    if (depth > 6) return;
-    WIN32_FIND_DATAW fd{};
-    HANDLE h = FindFirstFileW((dir + L"\\*").c_str(), &fd);
-    if (h == INVALID_HANDLE_VALUE) return;
-    do {
-        std::wstring name = fd.cFileName;
-        if (name == L"." || name == L"..") continue;
-        std::wstring full = dir + L"\\" + name;
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
-            EnumLnkDir(full, depth + 1, out);
-        } else if (EndsWithI(name, L".lnk")) {
-            AddLnk(full, out);
-        }
-    } while (FindNextFileW(h, &fd));
-    FindClose(h);
-}
-
-static void EnumProgramFiles(const std::wstring& pf, std::vector<Program>& out) {
-    if (pf.empty()) return;
-    WIN32_FIND_DATAW fd{};
-    HANDLE h = FindFirstFileW((pf + L"\\*").c_str(), &fd);
-    if (h == INVALID_HANDLE_VALUE) return;
-    do {
-        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
-        if (fd.cFileName[0] == L'.') continue;
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
-        std::wstring sub = pf + L"\\" + fd.cFileName;
-        WIN32_FIND_DATAW fe{};
-        HANDLE he = FindFirstFileW((sub + L"\\*.exe").c_str(), &fe);
-        if (he == INVALID_HANDLE_VALUE) continue;
-        do {
-            if (fe.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-            Program p;
-            p.name = StripExt(fe.cFileName);
-            p.path = sub + L"\\" + fe.cFileName;
-            p.target = p.path;
-            p.startMenu = false;
-            if (!p.name.empty()) out.push_back(std::move(p));
-        } while (FindNextFileW(he, &fe));
-        FindClose(he);
-    } while (FindNextFileW(h, &fd));
-    FindClose(h);
-}
-
-// 扫描已装软件到 out（按显示名称去重，保留优先级更高的来源）。
-// 只写传入容器、不碰 g.programs，因此可以安全地在工作线程调用。
-static HICON GetProgramIcon(Program* p);  // 前置声明：扫描线程预抽图标用
-
-static void BuildProgramsInto(std::vector<Program>& out) {
-    std::vector<Program> raw;
-    WCHAR buf[MAX_PATH]{};
-    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, buf)))
-        EnumLnkDir(std::wstring(buf) + L"\\Microsoft\\Windows\\Start Menu\\Programs", 0, raw);
-    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_COMMON_PROGRAMS, nullptr, SHGFP_TYPE_CURRENT,
-                                   buf)))
-        EnumLnkDir(buf, 0, raw);
-    WCHAR pf[MAX_PATH]{};
-    if (GetEnvironmentVariableW(L"ProgramFiles", pf, MAX_PATH)) EnumProgramFiles(pf, raw);
-    if (GetEnvironmentVariableW(L"ProgramFiles(x86)", pf, MAX_PATH)) EnumProgramFiles(pf, raw);
-
-    // 按显示名称去重（保留优先级更高的来源）
-    for (auto& p : raw) {
-        std::wstring k = ToLowerW(p.name);
-        bool dup = false;
-        for (auto& q : out) {
-            if (ToLowerW(q.name) == k) { dup = true; break; }
-        }
-        if (!dup) out.push_back(std::move(p));
+struct ProgramScanState {
+    std::atomic<bool> stop{false},running{false};
+    std::mutex deliveryMutex;
+    HWND window=nullptr;
+};
+static auto s_programScanState=std::make_shared<ProgramScanState>();
+struct ProgramScanContext { std::shared_ptr<ProgramScanState> state; HWND destination; };
+static ft::apps::Stats s_programCatalogStats;
+static ft::apps::AsyncIcons s_programIcons;
+static ft::apps::CatalogWatch s_programWatch;
+static unsigned long long s_programGeneration=0;
+struct ProgramBuildReply { std::vector<Program> programs; ft::apps::Stats stats; };
+static void CopyAppCatalog(ft::apps::Result catalog,ProgramBuildReply& reply) {
+    for(auto& entry:catalog.entries){
+        Program p;
+        p.name=std::move(entry.name);p.path=std::move(entry.path);p.target=std::move(entry.target);p.startMenu=entry.startMenu;
+        reply.programs.push_back(std::move(p));
     }
-
-    // 预抽图标：SHGetFileInfoW(SHGFI_ICON) 首次抽取较慢（.lnk 还要经 shell 解析），
-    // 若留到 WM_PAINT 懒抽取，第一次搜索结果的绘帧会同步卡一下。
-    // 这里在扫描线程一次性抽完，之后绘制永远命中缓存，输入不再掉帧。
-    for (auto& p : out) GetProgramIcon(&p);
+    reply.stats=std::move(catalog.stats);
 }
-
-static void BuildPrograms() {  // 主线程：原地重建 g.programs
-    std::vector<Program> out;
-    BuildProgramsInto(out);
-    g.items.clear();   // Program rows borrow pointers into the vector being replaced.
-    g.programs = std::move(out);
+static void BuildProgramsInto(ProgramBuildReply& reply,const std::atomic<bool>* stop) {
+    CopyAppCatalog(ft::apps::Collect({},stop),reply);
 }
 
 // 启动扫描放到工作线程：托盘图标先就位并可响应（右键显示「正在启动中」），
 // 扫描结果通过 WM_APP_PROGRAMS_READY 交回主线程接管，避免与搜索并发读写 g.programs。
-static unsigned __stdcall ScanProgramsThread(void*) {
-    // ResolveLnkTarget 走 CoCreateInstance：COM 按线程初始化，工作线程必须自己来一次
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-    auto* out = new (std::nothrow) std::vector<Program>();
-    if (out) BuildProgramsInto(*out);
-    CoUninitialize();
-    if (!out || !g.hwnd || !PostMessageW(g.hwnd, WM_APP_PROGRAMS_READY, 0, (LPARAM)out))
-        delete out;
+static unsigned __stdcall ScanProgramsThread(void* context) {
+    std::unique_ptr<ProgramScanContext> request((ProgramScanContext*)context);
+    auto state=request->state;HWND destination=request->destination;
+    const HRESULT comResult=CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    std::unique_ptr<ProgramBuildReply> out(new(std::nothrow)ProgramBuildReply());
+    if(out)BuildProgramsInto(*out,&state->stop);
+    if(SUCCEEDED(comResult))CoUninitialize();
+    // Warm the bounded, Flowtary-owned C:\workshop rule on this same startup
+    // worker, after app discovery, so the first keystroke never starts its scan.
+    if(out && !state->stop.load(std::memory_order_acquire))df::WorkshopCatalogWarmup(&state->stop);
+    std::lock_guard<std::mutex> lock(state->deliveryMutex);
+    const bool delivered=!state->stop.load() && state->window==destination &&
+       PostMessageW(destination,WM_APP_PROGRAMS_READY,0,(LPARAM)out.get());
+    if(delivered)out.release();
+    else state->running=false;
+    // Keep multi-million-entry snapshot loading off this catalog/UI delivery
+    // worker. The indexer performs a machine-headroom preflight before loading.
+    if(delivered && df::FlowtaryIndexAvailable()) {
+        try { std::thread([] { (void)df::FlowtaryIndexPrewarm(); }).detach(); }
+        catch (...) { /* The normal first-query path still starts the child lazily. */ }
+    }
     return 0;
 }
-
-static std::wstring FindEverythingExe() {
-    std::vector<std::wstring> cand;
-    cand.push_back(L"C:\\Program Files\\Everything\\Everything.exe");
-    cand.push_back(L"C:\\Program Files (x86)\\Everything\\Everything.exe");
-    WCHAR buf[MAX_PATH]{};
-    if (GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH))
-        cand.push_back(std::wstring(buf) + L"\\Programs\\Everything\\Everything.exe");
-    if (GetModuleFileNameW(nullptr, buf, MAX_PATH))
-        cand.push_back(DirOf(buf) + L"\\Everything.exe");
-    for (auto& c : cand)
-        if (GetFileAttributesW(c.c_str()) != INVALID_FILE_ATTRIBUTES) return c;
-    if (SearchPathW(nullptr, L"Everything.exe", nullptr, MAX_PATH, buf, nullptr)) return buf;
-    return L"Everything.exe";
+static bool StartProgramsRefresh() {
+    auto state=s_programScanState;
+    if(state->running.exchange(true))return false;
+    state->stop=false;
+    {std::lock_guard<std::mutex> lock(state->deliveryMutex);state->window=g.hwnd;}
+    auto* context=new(std::nothrow)ProgramScanContext{state,g.hwnd};
+    HANDLE thread=context?(HANDLE)_beginthreadex(nullptr,0,ScanProgramsThread,context,0,nullptr):nullptr;
+    if(!thread){delete context;state->running=false;g.startingUp=false;s_programWatch.Stop();return false;}
+    CloseHandle(thread); // The worker is owned by its cancellation/delivery state, not a leaked thread handle.
+    s_programWatch.AcknowledgeRefresh();
+    g.startingUp=true;
+    return true;
+}
+static void StopProgramsRefresh(HWND hwnd) {
+    auto state=s_programScanState;
+    state->stop=true;
+    std::lock_guard<std::mutex> lock(state->deliveryMutex);
+    state->window=nullptr;
+    MSG message;
+    while(PeekMessageW(&message,hwnd,WM_APP_PROGRAMS_READY,WM_APP_PROGRAMS_READY,PM_REMOVE))
+        delete (ProgramBuildReply*)message.lParam;
+    s_programIcons.Stop();
+    s_programWatch.Stop();
+}
+static std::wstring ProgramWorkingDirectory(Program* p) {
+    if(!p)return {};
+    // Let the Shell honor a shortcut's own working-directory/arguments when opening it.
+    return p->startMenu ? std::wstring() : DirOf(p->target);
 }
 
 // ---------------- 程序模糊匹配 ----------------
@@ -1105,9 +1024,9 @@ static ParsedQuery ParseExcludes(const std::wstring& q) {
     return r;
 }
 
-// d/f 结构化词表：与 BuildModifierQuery 相同的切词规则（空格分隔，"短语"整体一词），
+// d/f 结构化词表：与文件查询分词规则相同（空格分隔，"短语"整体一词），
 // 但去掉引号本身；排除词已由 ParseExcludes 剥离，不在此处理。
-// 供 df::Query.words 使用（Windows Search SQL / fd 命令行各按需转义）。
+// 供 df::Query.words 使用（Windows Search SQL 按需转义）。
 static std::vector<std::wstring> SplitQueryWords(const std::wstring& q) {
     std::vector<std::wstring> out;
     size_t i = 0, n = q.size();
@@ -1185,7 +1104,7 @@ static void SearchPrograms(const std::wstring& query) {
         if (a.p->startMenu != b.p->startMenu) return a.p->startMenu;
         return _wcsicmp(a.p->name.c_str(), b.p->name.c_str()) < 0;
     });
-    size_t n = (std::min)(cands.size(), (size_t)ev::kMaxResults);
+    size_t n = (std::min)(cands.size(), (size_t)kMaxVisibleResults);
     for (size_t i = 0; i < n; ++i) {
         Row r;
         r.kind = Row::Prog;
@@ -1199,13 +1118,29 @@ static void SearchPrograms(const std::wstring& query) {
 }
 
 static HICON GetProgramIcon(Program* p) {
-    if (!p->iconTried) {
-        p->iconTried = true;
-        SHFILEINFOW sfi{};
-        if (SHGetFileInfoW(p->path.c_str(), 0, &sfi, sizeof(sfi), SHGFI_ICON | SHGFI_SMALLICON))
-            p->icon.reset(sfi.hIcon);
+    if(!p->iconTried)p->iconTried=s_programIcons.Request(p->path);
+    return p->icon ? p->icon.get() : LoadIconW(nullptr,IDI_APPLICATION);
+}
+static bool PollProgramIcons() {
+    bool changed=false;
+    for(auto& result:s_programIcons.Drain()){
+        if(result.generation!=s_programGeneration)continue;
+        auto found=std::find_if(g.programs.begin(),g.programs.end(),[&](const Program& p){return p.path==result.path;});
+        if(found==g.programs.end())continue;
+        if(result.icon){
+            size_t cached=(size_t)std::count_if(g.programs.begin(),g.programs.end(),[](const Program& p){return !!p.icon;});
+            if(cached>=128){
+                auto evict=std::find_if(g.programs.begin(),g.programs.end(),[&](const Program& p){
+                    if(!p.icon)return false;
+                    return std::none_of(g.items.begin(),g.items.end(),[&](const Row& r){return r.prog==&p;});
+                });
+                if(evict!=g.programs.end()){evict->icon.reset();evict->iconTried=false;}
+            }
+            found->icon.reset(result.icon.release());
+        }
+        found->iconTried=true;changed=true;
     }
-    return p->icon.get();
+    return changed;
 }
 
 // 取任意文件/文件夹的小图标（File/Folder 结果行用）：按路径缓存，首次经 shell 抽取。
@@ -1240,7 +1175,7 @@ static HICON GetPathIcon(const std::wstring& path) {
 static void Layout() {
     RECT rc;
     GetClientRect(g.hwnd, &rc);
-    int rows = (std::min)((int)g.items.size(), (int)ev::kMaxResults);
+    int rows = (std::min)((int)g.items.size(), (int)kMaxVisibleResults);
     POINT cur;
     GetCursorPos(&cur);
     HMONITOR mon = MonitorFromPoint(cur, MONITOR_DEFAULTTONEAREST);
@@ -1289,10 +1224,9 @@ static void Show() {
     g.hoverT = 0;
     g.pressT = 0;
     g.mode = Mode::None;
-    g.expectReply = 0;
     g.evTermKey.clear();
-    df::CancelAll();     // 上次会话的在途 fd 不再需要；旧回复随代数递增作废
     ++g.dfGen;
+    g.searchRoute = ft::search::Route::Unavailable;
     g.caretOn = true;
     KillTimer(g.hwnd, kTimerDebounce);
     Layout();
@@ -1311,8 +1245,8 @@ static void Show() {
 static void Hide() {
     if (!IsWindowVisible(g.hwnd)) return;
     KillTimer(g.hwnd, kTimerDebounce);
-    df::CancelAll();     // 在途 fd 不再需要：终止并作废旧代回复
     ++g.dfGen;
+    g.searchRoute = ft::search::Route::Unavailable;
     g.dragging = false;
     g.selStart = g.selEnd = 0;
     // 若正在组词，先取消 IME 组合，避免残留未上屏状态
@@ -1325,7 +1259,7 @@ static void Hide() {
     ShowWindow(g.hwnd, SW_HIDE);
 }
 
-// ---------------- Everything 查询 ----------------
+// ---------------- 文件索引查询 ----------------
 static void AddHint(const std::wstring& text) {
     Row r;
     r.kind = Row::Hint;
@@ -1333,208 +1267,45 @@ static void AddHint(const std::wstring& text) {
     g.items.push_back(std::move(r));
 }
 
-static void UseEverythingFallback() {
-    g.items.clear();
-    Row r;
-    r.kind = Row::EvFallback;
-    std::wstring kw = g.evQuery;
-    size_t c = kw.find(L':');
-    if (c != std::wstring::npos) kw = kw.substr(c + 1);
-    r.title = L"在 Everything 中搜索：" + kw;
-    r.sub = L"IPC 未连接，回车将打开 Everything 窗口";
-    r.action = L"-search \"" + g.evQuery + L"\"";
-    g.items.push_back(std::move(r));
-    // Everything 未连接时自学习结果照常可用：置顶插入
-    PrependLearnedRows(g.evTermKey);
-    g.sel = 0;
-    LayoutAndRepaint();
-}
+static void StartWindowsSearch(ft::search::Route route = ft::search::Route::WindowsSearch);
 
-static void ExecuteEverythingQuery() {
-    HWND evw = FindWindowW(L"EVERYTHING_TASKBAR_NOTIFICATION", nullptr);
-    if (!evw) { UseEverythingFallback(); return; }
-
-    size_t len = g.evQuery.size();
-    std::vector<BYTE> buf(sizeof(ev::Query) - sizeof(WCHAR) + (len + 1) * sizeof(WCHAR));
-    ev::Query* q = (ev::Query*)buf.data();
-    q->reply_hwnd = (DWORD)(DWORD_PTR)g.hwnd;
-    g.serial++;
-    g.expectReply = ev::kReplyBase | (g.serial & 0x7FFF);
-    q->reply_copydata_message = g.expectReply;
-    q->search_flags = 0;
-    q->offset = 0;
-    q->max_results = ev::kMaxFetch;
-    memcpy(q->search_string, g.evQuery.c_str(), (len + 1) * sizeof(WCHAR));
-    g.evSentQuery = g.evQuery;
-
-    COPYDATASTRUCT cds{};
-    cds.dwData = ev::kCopyDataQueryW;
-    cds.cbData = (DWORD)buf.size();
-    cds.lpData = buf.data();
-
-    DWORD_PTR res = 0;
-    ArmHistoryClock(L"EV");   // 旧链路：一问一答，派发即本轮计时起点（兜底重查另起一轮）
-    LRESULT lr = SendMessageTimeoutW(evw, WM_COPYDATA, (WPARAM)g.hwnd, (LPARAM)&cds,
-                                     SMTO_ABORTIFHUNG, 1500, &res);
-    if (lr == 0 || res == 0) { UseEverythingFallback(); return; }
-    // 结果异步回到本窗口（WM_COPYDATA，dwData == g.expectReply）
-}
-
-static void HandleEverythingReply(const COPYDATASTRUCT* cds) {
-    if (cds->dwData != g.expectReply || !cds->lpData) return;
-    if (cds->cbData < sizeof(ev::List) - sizeof(ev::Item)) return;
-    const ev::List* list = (const ev::List*)cds->lpData;
-
-    g.items.clear();
-    DWORD n = (std::min)(list->numitems, ev::kMaxFetch);
-    size_t headerBytes = sizeof(ev::List) - sizeof(ev::Item) + (size_t)n * sizeof(ev::Item);
-    if (headerBytes > cds->cbData) n = 0;
-    int kept = 0;  // 已保留的展示行数（过滤后凑满 kMaxResults 即停）
-    int want = (int)ev::kMaxResults;
-    for (DWORD i = 0; i < n && kept < want; ++i) {
-        const ev::Item& it = list->items[i];
-        if (it.filename_offset >= cds->cbData || it.path_offset >= cds->cbData) continue;
-        const WCHAR* fn = (const WCHAR*)((const BYTE*)list + it.filename_offset);
-        const WCHAR* pa = (const WCHAR*)((const BYTE*)list + it.path_offset);
-        Row r;
-        r.kind = (it.flags & ev::kFlagFolder) ? Row::Folder : Row::File;
-        r.title = fn ? fn : L"";
-        r.sub = pa ? pa : L"";
-        if (r.sub.empty()) {
-            r.action = r.title;  // 盘符根目录：Everything 返回的 path 为空
-        } else if (r.sub.back() == L'\\') {
-            r.action = r.sub + r.title;
-        } else {
-            r.action = r.sub + L"\\" + r.title;
-        }
-        // 排除命中：直接丢弃。点开头检测覆盖整条路径的每一层——
-        // 目录层（.git/.vscode）与 . 开头的文件名（.gitignore/.env）都过滤。
-        if (IsPathExcluded(r.action, true)) continue;
-        g.items.push_back(std::move(r));
-        ++kept;
-    }
-    // 主查询（关键词匹配名字）零结果：排期一次「路径级」兜底查询——
-    // 关键词改匹配整条路径（含所在目录），如 d aw-qtui software 命中 C:\software\aw-qtui。
-    // 注意：本函数运行在 WM_COPYDATA 回调里，Everything 的 IPC 线程可能仍阻塞在
-    // 发给我们这条消息的 SendMessage 上；此处绝不能再同步 SendMessageTimeout 回去
-    // （重入会让 Everything 超时不应答，被误判成「IPC 未连接」）——只置标志 + PostMessage，
-    // 由消息循环里的 WM_APP_EV_FALLBACK 真正把查询发出去。
-    if (g.items.empty() && !g.evFallbackQuery.empty() && !g.startingUp &&
-        g.evSentQuery == g.evQuery) {
-        g.evQuery = g.evFallbackQuery;
-        g.evFallbackQuery.clear();
-        g.evFallbackPending = true;
-        LogHistoryQuery();   // 主查询零结果先落一条台账，再排期路径级兜底（兜底算新一轮）
-        PostMessageW(g.hwnd, WM_APP_EV_FALLBACK, 0, 0);
-        AddHint(L"正在搜索…");
-        g.sel = 0;
-        LayoutAndRepaint();
-        return;
-    }
-    // 点击加权重排：同一有效搜索词下点过的文件/文件夹排前面（权重相同保持 Everything 原序）；
-    // 同样聚合前缀历史权重（自适应推荐：f bilibili 点过的文件，敲 f b / f bi 时也排前面）
-    if (g.weightEnabled && !g.evTermKey.empty() && g.items.size() > 1) {
-        const std::wstring& tk = g.evTermKey;
-        std::unordered_map<std::wstring, int> hist;
-        CollectPrefixWeights(tk, hist);
-        auto rowW = [&](const Row& r) {
-            int w = GetClickWeight(tk, r.action);
-            auto it = hist.find(r.action);
-            if (it != hist.end()) w += it->second;
-            return w;
-        };
-        std::stable_sort(g.items.begin(), g.items.end(),
-                         [&rowW](const Row& a, const Row& b) { return rowW(a) > rowW(b); });
-    }
-    // f/d 自学习：命中的学习项摘出原行后置顶（exe 优先）；有学习结果时不再显示「无结果」
-    PrependLearnedRows(g.evTermKey);
-    if (g.items.empty()) AddHint(g.startingUp ? L"正在启动中…" : L"无结果");
-    NoteHistoryFirstPaint();
-    LogHistoryQuery();
-    g.sel = 0;
-    LayoutAndRepaint();
-}
-
-// ---------------- d/f 双后端：Windows Search + fd（不建全盘索引） ----------------
-// 调度（StartDfSearch，由防抖定时器触发）：同时拉起两个后端——
-//   ① Windows Search（毫秒级，覆盖系统索引范围）→ 先到先显示；
-//   ② fd（现查全部固定盘，亚秒~秒级）→ 到达后与 ① 的结果按全路径去重合并再刷新。
-// 每个后端按名字零命中时，各自在工作线程里自动追发一次「路径级」兜底查询
-// （对应旧 evFallbackQuery 逻辑），主线程不再排期二次查询。
-// 两者都不可用（无 WSearch 且无 fd.exe）时回退到上面的旧 Everything IPC 链路。
-// 新查询 / 清空输入 / 隐藏窗口都会 ++g.dfGen 并 CancelAll 在途 fd，旧回复按代数丢弃。
-// d/f 后端编号（DfReply.backend）：mem=用户目录内存索引（毫秒），disk=全盘磁盘索引
-// （mmap 扫描，20-40ms），ws=Windows Search，fd=现查兜底
-enum { BkMem = 0, BkWs = 1, BkFd = 2, BkDisk = 3 };
-
+// d/f queries consume existing indexes; name/path fallback stays within the same catalog.
 struct DfReply {
-    DWORD gen;                    // 查询代数（与 g.dfGen 比对，过期即弃）
-    int backend;                  // BkMem / BkWs / BkFd
-    bool failed;                  // 后端本次不可用（COM/OLE DB 失败）
-    bool finalBatch;              // false=fd 流式中间批次（dfFdDone 保持 false），true=该后端已收尾
-    std::vector<df::Hit>* hits;   // 堆上结果，主线程接管后 delete
+    DWORD gen;
+    ft::search::Route route;
+    bool failed;
+    std::vector<df::Hit> hits;
 };
 
-static void PostDfReply(DWORD gen, int backend, bool failed, bool finalBatch,
-                        std::vector<df::Hit>* hits) {
-    DfReply* r = new DfReply{gen, backend, failed, finalBatch, hits};
-    if (!PostMessageW(g.hwnd, WM_APP_DF_READY, 0, (LPARAM)r)) {
-        delete hits;
-        delete r;
-    }
-}
-
-static void DfWsWorker(DWORD gen, df::Query q) {
-    auto* hits = new std::vector<df::Hit>();
-    int n = df::WindowsSearchQuery(q, false, *hits);
-    if (n < 0) { PostDfReply(gen, BkWs, true, true, hits); return; }   // 失败：空结果 + failed 标记
-    if (n == 0 && gen == g.dfGen)                                      // 按名字零结果 → 路径级兜底（换代即弃）
-        df::WindowsSearchQuery(q, true, *hits);
-    PostDfReply(gen, BkWs, false, true, hits);
-}
-
-// 守护进程 worker：内存+磁盘索引都在 flowtary-search --serve 进程内，一层查询全拿
-//（名字零命中时守护进程内部已按层做过路径兜底并合并，无需二次查询）。
-// 一次要 800 行：返回的是遍历序，UI 只显示 kMaxResults 行——截断若发生在排序前，
-// 深处目录的精确/前缀命中会被池序噪声挤出候选窗，UI 排序再好也无米下锅。
-// 守护进程崩溃时查询失败 → fd/WS 层自然接管
-static void DfDaemonWorker(DWORD gen, df::Query q) {
-    auto* hits = new std::vector<df::Hit>();
-    // 守护进程分两块回（内存层 → 磁盘层）：每块到达即上屏，界面不等磁盘扫描。
-    // 中间批 finalBatch=false，收尾由下面这条空回复给出（全量 hits 兜底去重）。
-    auto sink = [gen](std::vector<df::Hit>&& batch) {
-        PostDfReply(gen, BkMem, false, false, new std::vector<df::Hit>(std::move(batch)));
+static void DfWsWorker(DWORD gen, const df::Query& q, ft::search::Route route) {
+    auto reply = std::make_unique<DfReply>();
+    reply->gen = gen;
+    reply->route = route;
+    if (gen != g.dfGen.load()) return;
+    int result = 0;
+    auto appendWorkshop = [&]() {
+        std::vector<df::Hit> workshopHits;
+        const int workshopResult = df::WorkshopCatalogQuery(q, workshopHits);
+        for (auto& workshopHit : workshopHits) {
+            const bool duplicate = std::any_of(reply->hits.begin(), reply->hits.end(),
+                [&](const df::Hit& hit) { return CompareStringOrdinal(hit.path.c_str(), (int)hit.path.size(),
+                    workshopHit.path.c_str(), (int)workshopHit.path.size(), TRUE) == CSTR_EQUAL; });
+            if (!duplicate) reply->hits.push_back(std::move(workshopHit));
+        }
+        if (result < 0 && workshopResult >= 0) result = workshopResult;
     };
-    bool ok = df::SearchDaemonQuery(q, false, *hits, 800, sink);
-    PostDfReply(gen, BkMem, ok ? FALSE : TRUE, true, hits);
-}
-
-static void DfFdWorker(DWORD gen, df::Query q, std::wstring fdExe, bool skipHidden, DWORD budget) {
-    auto* hits = new std::vector<df::Hit>();
-    // 流式：fd 每凑一批结果就增量投递（finalBatch=false），界面边扫边上屏。
-    // 预算三段共享（用户目录 → 全盘 → 路径兜底），保证总耗时不超过 budget。
-    auto sink = [gen](std::vector<df::Hit>&& batch) {
-        PostDfReply(gen, BkFd, false, false, new std::vector<df::Hit>(std::move(batch)));
-    };
-    const DWORD reserve = (std::min)(budget / 4, (DWORD)2000);   // 路径兜底保留
-    const DWORD nameBudget = budget - reserve;
-    const DWORD s1 = (std::min)(nameBudget, (DWORD)2000);        // 阶段1：用户常用目录
-    bool timedOut = false;
-    const ULONGLONG t0 = GetTickCount64();
-    int n = df::FdQuery(fdExe, q, false, skipHidden, *hits, s1, &timedOut, sink,
-                        df::UserDirsRoots());                    // 子树小，秒级必达
-    const ULONGLONG elapsed = GetTickCount64() - t0;
-    // 阶段2：全盘根用剩余名字预算（覆盖 C:\software、其他盘等非用户目录区域）
-    const DWORD left = nameBudget > elapsed ? nameBudget - (DWORD)elapsed : 0;
-    if (left > 0 && gen == g.dfGen)
-        n = (std::max)(n, df::FdQuery(fdExe, q, false, skipHidden, *hits, left, &timedOut,
-                                      sink, df::DriveRoots()));
-    if (n == 0 && !timedOut && gen == g.dfGen) {                 // 按名字零结果 → -p 路径兜底
-        const ULONGLONG elapsedAll = GetTickCount64() - t0;
-        const DWORD fb = budget > elapsedAll ? budget - (DWORD)elapsedAll : 0;
-        if (fb > 0) df::FdQuery(fdExe, q, true, skipHidden, *hits, fb, &timedOut, sink);
+    if (route == ft::search::Route::FlowtaryIndex) {
+        result = df::FlowtaryIndexQuery(q, ft::search::HasExplicitPath(q.words), reply->hits);
+        if (result >= 0) appendWorkshop();
+    } else if (route == ft::search::Route::WorkshopCatalog) {
+        result = df::WorkshopCatalogQuery(q, reply->hits);
+    } else {
+        result = df::QueryWithPathFallback(q, reply->hits, df::WindowsSearchQuery,
+            [gen] { return gen == g.dfGen.load(); });
+        if (route == ft::search::Route::WindowsSearch) appendWorkshop();
     }
-    PostDfReply(gen, BkFd, false, true, hits);                   // 收尾（hits 为各阶段全量，合并去重兜底）
+    reply->failed = result < 0;
+    if (PostMessageW(g.hwnd, WM_APP_DF_READY, 0, (LPARAM)reply.get())) reply.release();
 }
 
 // 常驻 WS 工作线程（latest-wins）：df_search 里的 COM/索引会话只在首次查询时建一次，
@@ -1543,6 +1314,7 @@ static std::mutex s_wsMu;
 static std::condition_variable s_wsCv;
 static DWORD s_wsJobGen = 0;
 static df::Query s_wsJob;
+static ft::search::Route s_wsRoute = ft::search::Route::WindowsSearch;
 static bool s_wsHasJob = false;
 static bool s_wsQuit = false;
 
@@ -1550,64 +1322,94 @@ static unsigned __stdcall WsThreadProc(LPVOID) {
     for (;;) {
         df::Query q;
         DWORD gen = 0;
+        ft::search::Route route = ft::search::Route::WindowsSearch;
         {
             std::unique_lock<std::mutex> lk(s_wsMu);
             s_wsCv.wait(lk, [] { return s_wsHasJob || s_wsQuit; });
             if (s_wsQuit) break;
             gen = s_wsJobGen;
+            route = s_wsRoute;
             q = std::move(s_wsJob);
             s_wsHasJob = false;
         }
-        DfWsWorker(gen, q);   // 空闲时阻塞在条件变量上，不占 CPU
+        DfWsWorker(gen, q, route);   // 空闲时阻塞在条件变量上，不占 CPU
     }
     return 0;
 }
 
-static void WsEnqueue(DWORD gen, const df::Query& q) {
+static bool WsEnqueue(DWORD gen, const df::Query& q, ft::search::Route route = ft::search::Route::WindowsSearch) {
     static bool started = false;   // StartDfSearch 仅主线程调用：懒启动无竞争
     {
         std::lock_guard<std::mutex> lk(s_wsMu);
         s_wsJobGen = gen;
+        s_wsRoute = route;
         s_wsJob = q;
         s_wsHasJob = true;
         if (!started) {
+            HANDLE thread = (HANDLE)_beginthreadex(nullptr, 0, WsThreadProc, nullptr, 0, nullptr);
+            if (!thread) { s_wsHasJob = false; return false; }
             started = true;
-            CloseHandle((HANDLE)_beginthreadex(nullptr, 0, WsThreadProc, nullptr, 0, nullptr));
+            CloseHandle(thread);
         }
     }
     s_wsCv.notify_one();
+    return true;
+}
+
+static void RenderDfResults();
+static void StartFlowtaryIndexSearch() {
+    g.searchRoute = ft::search::Route::FlowtaryIndex;
+    g.dfWsDone = false;
+    g.dfWsFailed = false;
+    g.dfBaseRows.clear();
+    ArmHistoryClock(L"FTI");
+    if (!WsEnqueue(g.dfGen.load(), g.dfQuery, ft::search::Route::FlowtaryIndex)) {
+        g.dfWsDone = g.dfWsFailed = true;
+        RenderDfResults();
+    }
+}
+
+static void StartWindowsSearch(ft::search::Route route) {
+    g.searchRoute = route;
+    g.dfWsDone = false;
+    g.dfWsFailed = false;
+    g.dfBaseRows.clear();
+    ArmHistoryClock(L"WS");
+    if (!WsEnqueue(g.dfGen.load(), g.dfQuery, route)) {
+        g.dfWsDone = g.dfWsFailed = true;
+        RenderDfResults();
+    }
 }
 
 static void StartDfSearch() {
-    if (g.dfBackend == 1) {      // 设置「常规」页选了 Everything 旧链路：跳过内置索引层
-        ExecuteEverythingQuery();
-        return;
-    }
-    df::CancelAll();             // 上一代的 fd 若还在遍历：终止（保证同时最多一个 fd 在跑）
-    const bool daemonLayer = g.dfIndexTier > 0;   // 极简档：无守护层，fd/WS 实时兜底
-    if (daemonLayer) df::SearchDaemonStart();     // 守护进程不在线（崩溃/空闲退出）则自动重拉
     ++g.dfGen;
-    const DWORD gen = g.dfGen;
-    if (!g.dfFdLookedUp) { g.dfFdExe = df::FindFdExe(); g.dfFdLookedUp = true; }
-    // dfWsAvail：0=未定（乐观启用，由 WS 工作线程首次查询自证）/ -1=已确认不可用 / 1=正常
-    // 可用性探测不放在主线程（避免主线程碰 COM）；失败由 failed 回复在 handler 里落定
-    const bool wsOk = g.dfWsAvail >= 0;
-    const bool fdOk = !g.dfFdExe.empty();
-    g.dfMemDone = !daemonLayer;   // 守护层按块收尾（最后一块才置位）；极简档无守护层，直接算完
-    g.dfDiskDone = true;          // 磁盘索引已并入守护层
-    g.dfWsDone = !wsOk;
-    g.dfFdDone = !fdOk;
+
+    g.dfWsFailed = false;
     g.dfBaseRows.clear();
-    if (!wsOk && !fdOk && g.dfMemDone) { ExecuteEverythingQuery(); return; }   // 全后端无：旧链路兜底
-    const df::Query q = g.dfQuery;
-    const DWORD budget = df::DefaultFdDeadlineMs();
-    ArmHistoryClock(q.isFile ? L"F" : L"D");   // 本轮时间基准：防抖到期、真正派发的那一刻
-    if (daemonLayer) std::thread(DfDaemonWorker, gen, q).detach();
-    if (wsOk) WsEnqueue(gen, q);
-    if (fdOk) std::thread(DfFdWorker, gen, q, g.dfFdExe, g.skipDotFolders, budget).detach();
+    g.searchRoute = ft::search::SelectRoute(g.dfBackend, df::FlowtaryIndexAvailable(), df::WorkshopCatalogAvailable());
+    if (g.searchRoute == ft::search::Route::WindowsSearch ||
+        g.searchRoute == ft::search::Route::WindowsSearchOnly) {
+        StartWindowsSearch(g.searchRoute);
+    } else if (g.searchRoute == ft::search::Route::FlowtaryIndex) {
+        StartFlowtaryIndexSearch();
+    } else if (g.searchRoute == ft::search::Route::WorkshopCatalog) {
+        g.dfWsDone = false;
+        g.dfWsFailed = false;
+        g.dfBaseRows.clear();
+        if (!WsEnqueue(g.dfGen.load(), g.dfQuery, ft::search::Route::WorkshopCatalog)) {
+            g.dfWsDone = g.dfWsFailed = true;
+            RenderDfResults();
+        }
+    } else {
+        g.items.clear();
+        PrependLearnedRows(g.evTermKey);
+        AddHint(L"Flowtary 索引不可用；未启动文件扫描");
+        g.sel = 0;
+        LayoutAndRepaint();
+    }
 }
 
-// 点击加权重排（与 HandleEverythingReply 内同一套规则；含自适应前缀推荐）
+// 点击加权重排（与 Handle索引Reply 内同一套规则；含自适应前缀推荐）
 static void RerankDfByWeight() {
     if (!g.weightEnabled || g.evTermKey.empty() || g.items.size() <= 1) return;
     const std::wstring& tk = g.evTermKey;
@@ -1621,7 +1423,10 @@ static void RerankDfByWeight() {
         return w;
     };
     std::stable_sort(g.items.begin(), g.items.end(),
-                     [&rowW](const Row& a, const Row& b) { return rowW(a) > rowW(b); });
+                     [&rowW](const Row& a, const Row& b) {
+                         if (a.workshopHit != b.workshopHit) return a.workshopHit;
+                         return rowW(a) > rowW(b);
+                     });
 }
 
 // ---------------- 应用版本目录排序 ----------------
@@ -1652,12 +1457,13 @@ static void RenderDfResults() {
     };
     if (!words.empty() && g.items.size() > 1) {
         // 排序键一次算好（文本分 + 版本档）：比较器里现算路径解析会被排序放大几倍。
-        struct DfKey { int score; int vrank; unsigned long long ver; int plain; size_t idx; };
+        struct DfKey { int workshop; int score; int vrank; unsigned long long ver; int plain; size_t idx; };
         std::vector<DfKey> keys(g.items.size());
         std::vector<Info> av(g.items.size());
         appver::Table tab;
         for (size_t i = 0; i < g.items.size(); ++i) {
             keys[i].score = scoreOf(g.items[i]);
+            keys[i].workshop = g.items[i].workshopHit ? 1 : 0;
             keys[i].idx = i;
             av[i] = appver::Parse(g.items[i].action);
             tab.Feed(av[i]);
@@ -1668,11 +1474,12 @@ static void RenderDfResults() {
             keys[i].ver = av[i].ver;
         }
         std::stable_sort(keys.begin(), keys.end(), [](const DfKey& a, const DfKey& b) {
+            if (a.workshop != b.workshop) return a.workshop > b.workshop;
             if (a.score != b.score) return a.score > b.score;
             if (a.vrank != b.vrank) return a.vrank < b.vrank;
             if (a.ver != b.ver) return a.ver > b.ver;
             if (a.plain != b.plain) return a.plain > b.plain;
-            return a.idx < b.idx;   // 同键保持收行序（内存索引优先根在前）
+            return a.idx < b.idx;   // 同键保持后端返回顺序
         });
         std::vector<Row> sorted;
         sorted.reserve(g.items.size());
@@ -1680,24 +1487,15 @@ static void RenderDfResults() {
         g.items = std::move(sorted);
     }
     RerankDfByWeight();
-    // f/d 自学习置顶（与 Everything 展示路径同一套：摘出与结果重复的学习行后插到最前）
+    // f/d 自学习置顶（与 索引 展示路径同一套：摘出与结果重复的学习行后插到最前）
     PrependLearnedRows(g.evTermKey);
     NoteHistoryFirstPaint();
-    // 守护进程索引建库中：结果行尾部挂一条状态提示（完成后自动消失）
-    bool indexBuilding = g.dfBackend == 0 && g.dfIndexTier > 0 &&
-                    (g.indexMemReady == 0 || g.indexDiskReady == 0);   // 极简档无索引不提示
     if (g.items.empty()) {
-        if (indexBuilding)
-            AddHint(L"索引建库中…完成后 d/f 全盘毫秒级（当前由 fd 兜底，结果偏少属正常）");
-        else if (g.dfWsDone && g.dfFdDone && g.dfMemDone)
-            AddHint(g.startingUp ? L"正在启动中…" : L"无结果");
-        else
-            AddHint(L"正在搜索…");
-    } else if (indexBuilding) {
-        AddHint(L"索引建库中…完成后 d/f 全盘毫秒级");
+        if (!g.dfWsDone) AddHint(g.searchRoute == ft::search::Route::FlowtaryIndex ? L"正在查询 Flowtary 索引…" : g.searchRoute == ft::search::Route::WorkshopCatalog ? L"正在查询 C:\\workshop 应用…" : L"正在查询 Windows Search…");
+        else if (g.dfWsFailed) AddHint(g.searchRoute == ft::search::Route::WorkshopCatalog ? L"C:\\workshop 目录索引查询失败" : g.searchRoute == ft::search::Route::FlowtaryIndex ? L"Flowtary 索引查询失败；未启动文件扫描" : L"Windows Search 不可用；未启动文件扫描");
+        else AddHint(g.searchRoute == ft::search::Route::WorkshopCatalog ? L"无结果（C:\\workshop 应用）" : g.searchRoute == ft::search::Route::FlowtaryIndex ? L"无结果（Flowtary 索引）" : L"无结果（仅搜索 Windows Search 已索引的位置）");
     }
-    // 三个后端都回报了才写 Q 行（一轮一次）：中途写会把「fd 还没到」记成总耗时
-    if (g.dfMemDone && g.dfWsDone && g.dfFdDone) {
+    if (g.dfWsDone) {
         g.qMissed.clear();
         LogHistoryQuery();
     } else {
@@ -1711,27 +1509,20 @@ static void RenderDfResults() {
 static void HandleDfReply(DfReply* r) {
     if (!r) return;
     std::unique_ptr<DfReply> hold(r);
-    if (r->gen != g.dfGen || g.mode != Mode::Everything) return;   // 过期回复 / 已切走界面
-    if (r->backend == BkWs) {
-        if (r->failed) g.dfWsAvail = -1;   // 本次起停用 WS（fd 单后端，或全无时走旧链路）
-        g.dfWsDone = true;
-        g.qWsRows = r->hits ? (int)r->hits->size() : 0;
-    } else if (r->backend == BkFd) {
-        g.dfFdDone = r->finalBatch;        // fd 流式：中间批次不算收尾
-        if (r->finalBatch) g.qFdRows = r->hits ? (int)r->hits->size() : 0;
-    } else if (r->backend == BkMem) {
-        g.dfMemDone = r->finalBatch;       // 守护进程流式：内存层块不算收尾
-        if (r->finalBatch) g.qDaemonRows = r->hits ? (int)r->hits->size() : 0;
-    } else {
-        g.dfDiskDone = true;               // 磁盘索引：单批即收尾
-    }
+    if (r->gen != g.dfGen || g.mode != Mode::Files ||
+        g.searchRoute != r->route) return;
+    g.dfWsDone = true;
+    g.dfWsFailed = r->failed;
+    g.qWsRows = (int)r->hits.size();
     std::vector<Row> rows;
-    if (!r->failed && r->hits) {
-        for (const auto& h : *r->hits) {
+    if (!r->failed) {
+        for (const auto& h : r->hits) {
+            if (HasExcludeTerm(ToLowerW(h.path))) continue;
             Row row;
             row.kind = h.isFolder ? Row::Folder : Row::File;
             row.action = h.path;
-            // 与 Everything 行同构：title=名字, sub=父目录（盘根 C:\ 整行一个 title）
+            row.workshopHit = h.workshop;
+            // 与 索引 行同构：title=名字, sub=父目录（盘根 C:\ 整行一个 title）
             size_t p = h.path.find_last_of(L'\\');
             if (p == std::wstring::npos || p + 1 == h.path.size()) {
                 row.title = h.path;
@@ -1742,12 +1533,12 @@ static void HandleDfReply(DfReply* r) {
                 if (row.sub.size() == 2 && row.sub[1] == L':') row.sub += L'\\';  // 盘根目录补分隔符
             }
             if (row.title.empty()) row.title = h.path;
-            // 排除路径 / 点开头过滤：与 Everything 结果同一套规则
+            // 排除路径 / 点开头过滤：与 索引 结果同一套规则
             if (IsPathExcluded(row.action, true)) continue;
             rows.push_back(std::move(row));
         }
     }
-    for (auto& nr : rows) {          // fd 到达：与 WS 已收结果按全路径去重合并
+    for (auto& nr : rows) {          // 同一路径只展示一次
         bool dup = false;
         for (const auto& er : g.dfBaseRows)
             if (_wcsicmp(er.action.c_str(), nr.action.c_str()) == 0) { dup = true; break; }
@@ -1763,50 +1554,7 @@ static const WebCmd* FindWebCmd(const std::wstring& tok) {
     return nullptr;
 }
 
-// Everything 修饰符（file:/folder:）仅作用于紧随其后的一个词，
-// 因此多词关键词需逐词添加前缀：d foo bar -> file:foo file:bar。
-// 引号短语（"foo bar"）视为一个词整体传递。
-// -关键字 → 翻成 Everything 原生排除语法 !file:word / !folder:word（索引侧过滤，非本地丢弃）。
-static std::wstring BuildModifierQuery(const std::wstring& mod, const std::wstring& kw) {
-    std::wstring out;
-    size_t i = 0, n = kw.size();
-    while (i < n) {
-        while (i < n && iswspace(kw[i])) ++i;
-        if (i >= n) break;
-        size_t j;
-        if (kw[i] == L'"') {
-            j = kw.find(L'"', i + 1);
-            j = (j == std::wstring::npos) ? n : j + 1;
-        } else {
-            j = i;
-            while (j < n && !iswspace(kw[j])) ++j;
-        }
-        if (kw[i] == L'-' && j > i + 1) {  // 排除词：! + 修饰符 + 去掉前导 '-' 的词
-            out += L'!';
-            out += mod;
-            out.append(kw, i + 1, j - i - 1);
-        } else {
-            out += mod;
-            out.append(kw, i, j - i);
-        }
-        out += L' ';
-        i = j;
-    }
-    while (!out.empty() && out.back() == L' ') out.pop_back();
-    return out;
-}
-
-// 路径级兜底查询：typeFilter（folder: / file: 单独成词，作类型过滤）+ 每个关键词 path:word。
-// Everything 里 path: 匹配整条路径文本（所在目录 + 名字），关键词因此可以分布在不同层级：
-// d aw-qtui software -> "folder: path:aw-qtui path:software" 命中 C:\software\aw-qtui。
-static std::wstring BuildPathFallbackQuery(const WCHAR* typeFilter, const std::wstring& kw) {
-    std::wstring out = BuildModifierQuery(L"path:", kw);
-    if (out.empty()) return out;
-    out.insert(0, typeFilter);
-    out.insert(std::wcslen(typeFilter), L" ");
-    return out;
-}
-
+// 文件查询由结构化分词、路径回退和本地排除规则组成；不依赖外部 IPC 语法。
 // ---------------- Shell 命令 & 窗口切换 ----------------
 enum class ExecKind { Normal, Close, Kill, Admin };
 
@@ -1983,7 +1731,7 @@ static void SearchWindows(const std::wstring& query) {
                 r.sub = g.winShowProc ? rep.processName : L"";
                 g.items.push_back(std::move(r));
             }
-            if (g.items.size() >= ev::kMaxResults) break;
+            if (g.items.size() >= kMaxVisibleResults) break;
         }
     } else {
         for (auto& c : cands) {
@@ -1993,17 +1741,18 @@ static void SearchWindows(const std::wstring& query) {
             r.sub = g.winShowProc ? w.processName : L"";
             r.action = std::to_wstring((uintptr_t)w.hwnd);
             g.items.push_back(std::move(r));
-            if (g.items.size() >= ev::kMaxResults) break;
+            if (g.items.size() >= kMaxVisibleResults) break;
         }
     }
 }
 
 static void Refresh() {
     KillTimer(g.hwnd, kTimerDebounce);
+    ++g.dfGen;
+    g.searchRoute = ft::search::Route::Unavailable;
     g.items.clear();
     g.sel = 0;
     g.mode = Mode::None;
-    g.expectReply = 0;
     g.evTermKey.clear();
 
     const std::wstring& t = g.text;
@@ -2128,21 +1877,16 @@ static void Refresh() {
                 LogHistoryQuery();   // 程序搜索在主线程同步完成，派发即有结果
             }
         } else if (tok == L"d" || tok == L"f") {
-            g.mode = Mode::Everything;
-            g.evFallbackPending = false;  // 新输入作废旧的兜底排期（已投递的 WM_APP 会因标志为 false 直接返回）
-            df::CancelAll();              // 上一代的在途 fd 一并终止，旧回复随代数递增作废
+                    g.mode = Mode::Files;
             ++g.dfGen;
+            g.searchRoute = ft::search::Route::Unavailable;
             if (rest.empty()) {
-                g.evFallbackQuery.clear();
                 AddHint(tok == L"f" ? L"输入关键词搜索文件" : L"输入关键词搜索文件夹");
             } else {
                 bool isFile = tok == L"f";
-                ParsedQuery pq = ParseExcludes(rest);  // -关键字：Everything 侧原生 !mod: 过滤，本地学习项按 g.excludes 过滤
+                ParsedQuery pq = ParseExcludes(rest);  // -关键字：Flowtary / Windows Search 结果统一过滤
                 g.excludes = pq.excludes;
-                // BuildModifierQuery/BuildPathFallbackQuery 接收含 -词 的原始 rest，自行翻译成 !file:/!folder:
-                g.evQuery = BuildModifierQuery(isFile ? L"file:" : L"folder:", rest);
-                // 主查询无结果时自动追发的路径级兜底（见 HandleEverythingReply；仅旧链路兜底用）
-                g.evFallbackQuery = BuildPathFallbackQuery(isFile ? L"file:" : L"folder:", rest);
+
                 g.evTermKey = NormalizeSearchTerm(pq.positive);  // 有效搜索词（权重/学习 key，不含排除词）
                 // 双后端结构化查询（正向词表 + 排除词）：防抖到期由 StartDfSearch() 派发
                 g.dfQuery = df::Query{};
@@ -2150,7 +1894,7 @@ static void Refresh() {
                 g.dfQuery.words = SplitQueryWords(pq.positive);
                 g.dfQuery.excludes = pq.excludes;
                 AddHint(L"正在搜索…");
-                // f/d 自学习：以前打开过的条目先置顶（Everything 结果到达后再合并）
+                // f/d 自学习：以前打开过的条目先置顶（索引 结果到达后再合并）
                 PrependLearnedRows(g.evTermKey);
                 SetTimer(g.hwnd, kTimerDebounce, kDebounceMs, nullptr);
             }
@@ -2197,6 +1941,11 @@ static void Refresh() {
             SearchPrograms(pq.positive);
             // 自学习结果同样参与普通搜索（覆盖不在程序索引里的条目）
             PrependLearnedRows(term);
+            if(g.items.empty()){
+                if(g.startingUp)AddHint(L"正在加载应用…");
+                else if(s_programCatalogStats.truncated)AddHint(L"应用列表尚未完整，可稍后刷新");
+                else if(!s_programCatalogStats.errors.empty())AddHint(L"部分应用入口暂时无法读取，可刷新重试");
+            }
             LogHistoryQuery();   // 程序搜索在主线程同步完成，派发即有结果
         }
     }
@@ -2239,15 +1988,11 @@ static bool ExecuteRow(Row& r, ExecKind ek = ExecKind::Normal) {
             return true;
         }
         case Row::Prog: {
-            std::wstring dir = DirOf(!r.prog->target.empty() ? r.prog->target : r.action);
+            std::wstring dir = ProgramWorkingDirectory(r.prog);
             ShellExecuteW(nullptr, L"open", r.action.c_str(), nullptr,
                           dir.empty() ? nullptr : dir.c_str(), SW_SHOWNORMAL);
             return true;
         }
-        case Row::EvFallback:
-            ShellExecuteW(nullptr, L"open", g.everythingExe.c_str(), r.action.c_str(), nullptr,
-                          SW_SHOWNORMAL);
-            return true;
         case Row::Group: {
             // 一键组：启动组逐个打开文件路径；关闭组按进程名结束进程
             if (r.groupKill) {
@@ -2385,7 +2130,7 @@ static bool ExecuteRowAdmin(Row& r) {
     std::wstring path, dir;
     if (r.kind == Row::Prog) {
         path = r.action;
-        dir = DirOf(!r.prog->target.empty() ? r.prog->target : r.action);
+        dir = ProgramWorkingDirectory(r.prog);
     } else if (r.kind == Row::File) {
         path = r.action;
         dir = DirOf(path);
@@ -2808,10 +2553,6 @@ static std::wstring TrayTipText() {
     std::wstring tip = g.startingUp ? L"Flowtary — 正在启动中…"
                                     : (g.hotkeyWake ? (L"Flowtary — " + g.hotkeyName + L" 唤出")
                                                     : L"Flowtary — 左键点击唤出");
-    // 索引建库中：托盘提示常驻可见（完成即自动消失，无需用户查询；极简档无索引不提示）
-    if (g.dfBackend == 0 && g.dfIndexTier > 0 &&
-        (g.indexMemReady == 0 || g.indexDiskReady == 0))
-        tip += L"（索引建库中…）";
     std::wstring ver;
     for (const char* p = FT_VER_DOT; *p; ++p) ver += (wchar_t)(unsigned char)*p;
     return tip + L" v" + ver;
@@ -2960,18 +2701,6 @@ static std::wstring GetExePath() {
     return buf;
 }
 
-static bool GetStartupEnabled() { return ft::StartupEnabled(); }
-
-static void SetStartup(bool on) { ft::SetStartupPath(GetExePath(), on); }
-
-// 内置索引层守护进程（幂等）：仅新方案模式且非极简档需要；Everything 旧链路或
-// 极简档不建索引省内存省 I/O，设置里切回时由设置应用路径惰性启动（守护进程
-// 自己读注册表档位，档位变更时它会自行退出、这里按新档重拉）。
-static void StartIndexTiersIfNeeded() {
-    if (g.dfBackend != 0 || g.dfIndexTier == 0) return;
-    df::SearchDaemonStart();
-}
-
 // 设置项的唯一读法在 ft::Settings::Load()（settings_model.cpp）；这里只做
 // 「Settings → g 运行态」的搬运。三个入口共用它：启动时读注册表、sidecar 保存后
 // 重放、sidecar 取消时回退快照 —— 保证运行态只有一种被写法。
@@ -2985,8 +2714,6 @@ static void ApplySettingsToRuntime(const ft::Settings& s) {
     g.beautify = s.beautify;
     g.skipDotFolders = s.skipDotFolders;
     g.dfBackend = s.dfBackend;
-    g.dfIndexTier = s.dfIndexTier;
-    StartIndexTiersIfNeeded();
     sTune = s.tune;
     s.ApplyTuneToThemes();
     g.weightEnabled = s.weightEnabled;
@@ -3118,7 +2845,7 @@ static std::wstring NormalizeSearchTerm(const std::wstring& s) {
 
 // 拆分输入：识别开头的前置命令关键字，把命令前缀和实际搜索内容分离。
 // 返回本次点击是否应记录权重；termOut 输出标准化后的有效搜索词。
-//   f/d 前缀（Everything 文件/文件夹搜索）→ 只有前缀后的关键词参与权重
+//   f/d 前缀（索引 文件/文件夹搜索）→ 只有前缀后的关键词参与权重
 //   网页命令前缀（如 gg、bd）           → 完全不记录，不写入权重存储
 //   其它（程序搜索，无前缀）             → 整个输入即有效搜索词
 static bool WeightTermFromInput(std::wstring& termOut) {
@@ -3320,7 +3047,7 @@ static void ArmHistoryClock(const WCHAR* layer) {
     g.qFirstMs = -1;
     g.qLogged = false;
     g.qMissed.clear();
-    g.qDaemonRows = g.qFdRows = g.qWsRows = 0;
+    g.qWsRows = 0;
 }
 
 // 结果第一次上屏：记下首屏延迟（「秒出」要的就是这个数，不是总耗时）
@@ -3331,11 +3058,9 @@ static void NoteHistoryFirstPaint() {
 
 // 本轮还没报齐的层（只有 d/f 这条路是分层的；其余模式返回空）
 static std::wstring HistoryMissingLayers() {
-    if (g.mode != Mode::Everything) return std::wstring();
+    if (g.mode != Mode::Files) return std::wstring();
     std::wstring m;
-    if (!g.dfMemDone) m += L"索引";
-    if (!g.dfFdDone) m += (m.empty() ? L"fd" : L"+fd");
-    if (!g.dfWsDone) m += (m.empty() ? L"WS" : L"+WS");
+    if (g.searchRoute == ft::search::Route::WindowsSearch && !g.dfWsDone) m = L"WS";
     return m;
 }
 
@@ -3349,8 +3074,6 @@ static std::wstring BuildHistoryLine(const std::wstring& missed) {
     q.firstMs = g.qFirstMs;
     q.totalMs = (int)(GetTickCount64() - g.qT0);
     q.rows = (int)HistoryRowCount();
-    q.daemonRows = g.qDaemonRows;
-    q.fdRows = g.qFdRows;
     q.wsRows = g.qWsRows;
     q.top = HistoryTopPath();
     q.missed = missed;
@@ -3398,7 +3121,7 @@ static void LogHistoryOpen(const Row& r) {
 // ---------------- f/d 自学习（打开即记忆，下次同词搜索直接置顶） ----------------
 // 用户在 f / d 前缀搜索里成功打开一个文件/文件夹后，把「本次有效搜索词 → 完整路径」
 // 记为长期记忆（learned.dat），并在 %APPDATA%\Flowtary\learned 镜像一个 .lnk 快捷方式。
-// 之后敲同一词（或它的前缀）时，学习项无视 Everything 是否命中，直接置顶展示：
+// 之后敲同一词（或它的前缀）时，学习项无视 索引 是否命中，直接置顶展示：
 // 精确词组在前，exe 优先，再按打开次数与最近使用时间。
 // learned.dat 是权威数据；.lnk 目录可人工查看/增删：启动时双向同步一次
 // （被删掉的 .lnk 会遗忘对应条目；手动放进来的 .lnk 会以次数 1 被吸收为学习项）。
@@ -3542,13 +3265,13 @@ static void ScheduleLearnedSave() {
 }
 
 // 打开成功后记录学习项。来源两类：
-//   - f/d（Everything）模式下的本地文件/文件夹行 → 词 = f/d 前缀后的有效搜索词
+//   - f/d（索引）模式下的本地文件/文件夹行 → 词 = f/d 前缀后的有效搜索词
 //   - 普通程序搜索模式下的程序行（元宝这类不在开始菜单索引里的程序，就是从这学的）
 //     → 词 = 整条输入剥离 -关键字 后的正向词；范围仍受 learnScope 控制
 static void RecordLearned(const Row& r) {
     if (!g.learnEnabled) return;
     std::wstring term;
-    if (g.mode == Mode::Everything && (r.kind == Row::File || r.kind == Row::Folder)) {
+    if (g.mode == Mode::Files && (r.kind == Row::File || r.kind == Row::Folder)) {
         term = g.evTermKey;  // f/d 前缀后的有效搜索词（已标准化）
     } else if (g.mode == Mode::Programs && r.kind == Row::Prog) {
         if (g.text.empty() || g.text[0] == L' ') return;  // 空格命令派生的程序搜索不学
@@ -3832,7 +3555,7 @@ static void PrependLearnedRows(const std::wstring& term) {
     size_t n = (std::min)(cs.size(), (size_t)10);
     for (size_t i = 0; i < n; ++i) {
         const Cand& c = cs[i];
-        // 同一目标已在结果里（Everything 命中或权重重排）：摘掉原行，改由学习位置顶
+        // 同一目标已在结果里（索引 命中或权重重排）：摘掉原行，改由学习位置顶
         for (size_t k = 0; k < g.items.size();) {
             if (g.items[k].kind != Row::Hint && _wcsicmp(g.items[k].action.c_str(),
                                                          c.path.c_str()) == 0)
@@ -3966,7 +3689,7 @@ static void Paint(HDC hdc) {
 
     // 结果列表
     SelectObject(mem, g.fList);
-    int rows = (std::min)((int)g.items.size(), (int)ev::kMaxResults);
+    int rows = (std::min)((int)g.items.size(), (int)kMaxVisibleResults);
     HBRUSH selBr = CreateSolidBrush(t.selBg);
     for (int i = 0; i < rows; ++i) {
         Row& row = g.items[i];
@@ -3995,7 +3718,7 @@ static void Paint(HDC hdc) {
         } else if ((row.kind == Row::File || row.kind == Row::Folder ||
                     row.kind == Row::Reveal) &&
                    !row.action.empty()) {
-            // 文件/文件夹行（自学习置顶项、Everything 结果、粘贴路径直达项均属此类）：
+            // 文件/文件夹行（自学习置顶项、索引 结果、粘贴路径直达项均属此类）：
             // 按路径经 shell 取图标并缓存，与程序行保持同一直视对齐
             HICON ic = GetPathIcon(row.action);
             if (ic) DrawIconEx(mem, x, y + (rowH - S(16)) / 2, ic, S(16), S(16), 0, nullptr, DI_NORMAL);
@@ -4137,8 +3860,6 @@ static void ApplySettingsPreview(const ipc::Preview& p) {
     g.hotkeyMode = p.hotkeyMode;
     g.skipDotFolders = p.skipDotFolders != FALSE;
     g.dfBackend = p.dfBackend;
-    g.dfIndexTier = p.dfIndexTier;
-    StartIndexTiersIfNeeded();
     g.fdjEnabled = p.fdjEnabled != FALSE;  // 仅为镜像；判定处现读注册表
     g.weightEnabled = p.weightEnabled != FALSE;
     g.weightFlush = p.weightFlush;
@@ -4360,10 +4081,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             UINT blink = GetCaretBlinkTime();
             if (blink == 0 || blink == INFINITE) blink = 530;
             SetTimer(hwnd, kTimerBlink, blink, nullptr);
-            if (g.dfBackend == 0 && g.dfIndexTier > 0) SetTimer(hwnd, kTimerIndexStat, 10000, nullptr);   // 索引建库状态轮询（极简档无索引不轮询）
             return 0;
         }
         case WM_DESTROY:
+            StopProgramsRefresh(hwnd);
             KillTimer(hwnd, kTimerBlink);
             FlushHistoryQuery();    // 退出前把攒着的最后一轮查询落盘（含没报齐就退出的那类现场）
             SaveClickWeightsNow();  // 退出前把未写盘的点击权重落盘（含「仅退出时写入」模式）
@@ -4493,7 +4214,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_TIMER:
             if (wParam == kTimerDebounce) {
                 KillTimer(hwnd, kTimerDebounce);
-                if (g.mode == Mode::Everything) StartDfSearch();
+                if (g.mode == Mode::Files) StartDfSearch();
             } else if (wParam == kTimerWeightSave) {
                 KillTimer(hwnd, kTimerWeightSave);
                 SaveClickWeightsNow();  // 延迟合并写盘到期：一次写出全部权重
@@ -4502,6 +4223,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 KillTimer(hwnd, kTimerHistFlush);
                 FlushHistoryQuery();   // 编辑静置到期：把这一轮的 Q 行落盘
             } else if (wParam == kTimerBlink) {
+                if(PollProgramIcons())InvalidateRect(hwnd,nullptr,FALSE);
+                if(s_programWatch.Poll())StartProgramsRefresh();
                 g.caretOn = !g.caretOn;
                 RECT r{0, 0, S(kBaseW), S(kBaseInputH)};
                 InvalidateRect(hwnd, &r, FALSE);
@@ -4513,16 +4236,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 Shell_NotifyIconW(NIM_MODIFY, &g.nid);
             } else if (wParam == kTimerTween) {
                 TickTweens();
-            } else if (wParam == kTimerIndexStat) {
-                // 索引建库状态轮询：托盘提示与 d/f 提示行的数据源（仅新方案）
-                int mr = -1, ms = 0, dr = -1, drs = 0;
-                if (df::SearchDaemonStat(mr, ms, dr, drs)) {
-                    if (mr != g.indexMemReady || dr != g.indexDiskReady) {
-                        g.indexMemReady = mr;
-                        g.indexDiskReady = dr;
-                        TrayUpdateTip();
-                    }
-                }
             } else if (wParam == kTimerHotkeyRetry) {
                 // 唤起快捷键被占用后的自动恢复：优先抢注首选组合 Alt+Space
                 if (!g.hotkeyWake || g.wakeIndex == 0) {
@@ -4547,8 +4260,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_COMMAND:
             switch (LOWORD(wParam)) {
                 case IDM_REFRESH:
-                    BuildPrograms();
-                    TrayBalloon(L"已刷新", std::to_wstring(g.programs.size()) + L" 个应用已重新索引");
+                    StartProgramsRefresh();
                     return 0;
                 case IDM_SETTINGS:
                     OpenSettings();
@@ -4561,8 +4273,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         case WM_COPYDATA: {
             const COPYDATASTRUCT* cds = (const COPYDATASTRUCT*)lParam;
-            if (cds && cds->dwData >= ev::kReplyBase) HandleEverythingReply(cds);
-            else if (cds) HandleSettingsIpc(cds);  // 设置窗 sidecar
+            if (cds) HandleSettingsIpc(cds);  // 设置窗 sidecar
             return TRUE;
         }
 
@@ -4572,32 +4283,32 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
 
         case WM_APP_DF_READY:
-            // d/f 双后端（Windows Search / fd）结果就绪：接管堆上结果并按代数过滤
+            // Windows Search 结果就绪：按查询代数和当前后端过滤过期回复
             HandleDfReply((DfReply*)lParam);
             return 0;
 
-        case WM_APP_EV_FALLBACK: {
-            // 路径级兜底查询：必须在 WM_COPYDATA 回调之外（消息循环层）发出，
-            // 否则与 Everything 的 IPC 线程互相阻塞 → 超时 → 假「IPC 未连接」。
-            if (!g.evFallbackPending) return 0;
-            g.evFallbackPending = false;
-            if (g.mode == Mode::Everything) ExecuteEverythingQuery();
-            return 0;
-        }
-
         case WM_APP_PROGRAMS_READY: {
             // 工作线程扫描完成：在主线程接管结果（工作线程从不写 g.programs）
-            std::vector<Program>* p = (std::vector<Program>*)lParam;
+            ProgramBuildReply* p = (ProgramBuildReply*)lParam;
             if (p) {
-                g.items.clear();
-                g.programs = std::move(*p);
+                g.items.erase(std::remove_if(g.items.begin(),g.items.end(),[](const Row& r){return r.kind==Row::Prog;}),g.items.end());
+                g.programs = std::move(p->programs);
+                s_programCatalogStats=std::move(p->stats);
+                s_programIcons.Reset(++s_programGeneration);
                 delete p;
             }
+            s_programScanState->running=false;
             g.startingUp = false;
             TrayUpdateTip();  // 提示文案从「正在启动中」切回热键名
-            if (IsWindowVisible(hwnd)) LayoutAndRepaint();
+            if (IsWindowVisible(hwnd)) {
+                if(g.mode==Mode::Programs)Refresh();
+                else LayoutAndRepaint();
+            }
             return 0;
         }
+        case WM_APP_APPS_CHANGED:
+            s_programWatch.ShellNotification((HANDLE)wParam,(DWORD)lParam);
+            return 0;
 
         case WM_APP_QUIT:
             // 新版本接管：干净退出（WM_DESTROY 会移除托盘、注销热键）
@@ -5451,7 +5162,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
 
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
-    StartIndexTiersIfNeeded();  // 新方案模式：后台建内存/磁盘索引（旧链路模式不建，省 I/O）
 
     // 单实例：区分「同版本重复启动」与「新版本替换启动」
     // （放在主题/字体初始化之后，这样弹窗才能用上主题配色与字体）
@@ -5471,9 +5181,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     }
     RecordRunningBuild();
 
+    // 自启项跟着本次真正跑起来的 exe 走：部署目录带版本号，Run 里记的却是上次点
+    // 「保存」那一刻的路径。发版后不点设置也会自己纠正，登录不再起在旧版本上。
+    // 放在单实例接管之后：只有活下来的那个实例写，被顶掉的旧 exe 不会把路径改回去。
+    ft::SyncStartupPath(GetExePath());
+
     LoadWebRules();
     LoadGroupRules();
-    LoadExcludePaths();  // 排除路径（设置可编辑），作用于 Everything + 程序搜索结果
+    LoadExcludePaths();  // 排除路径（设置可编辑），作用于 索引 + 程序搜索结果
     LoadClickWeights();  // 点击权重数据（%APPDATA%\Flowtary\weights.dat）
     LoadLearned();       // f/d 自学习数据（learned.dat + learned\*.lnk 双向同步）
     EnableDarkMenus();  // 按主题深浅强制弹出菜单（托盘/右键） 绘制
@@ -5513,9 +5228,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     TrayAdd();  // 优先让托盘图标就位（气泡提示使用最终选定的热键名）
 
     // 程序扫描较慢：放到工作线程，托盘图标已先就位且可响应（右键显示「正在启动中」）
-    g.startingUp = true;
-    _beginthreadex(nullptr, 0, ScanProgramsThread, nullptr, 0, nullptr);
-    g.everythingExe = FindEverythingExe();
+    s_programWatch.Start(g.hwnd,WM_APP_APPS_CHANGED);
+    StartProgramsRefresh();
+
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {

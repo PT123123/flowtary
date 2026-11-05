@@ -60,7 +60,6 @@ New-Item -ItemType Directory -Force -Path $dest | Out-Null
 
 # Copy every runtime dependency so the deployed folder actually runs.
 $src = Join-Path $Root 'build'
-if (-not (Test-Path (Join-Path $src 'fd.exe'))) { throw 'fd.exe missing from build output; search indexes cannot be built' }
 Copy-Item (Join-Path $src 'flowtary.exe')        (Join-Path $dest "flowtary-$ver.exe") -Force
 if (Test-Path (Join-Path $src 'flowtary-settings.exe')) {
     Copy-Item (Join-Path $src 'flowtary-settings.exe') (Join-Path $dest 'flowtary-settings.exe') -Force
@@ -76,7 +75,9 @@ Copy-Item (Join-Path $src 'ImageReader.exe')     (Join-Path $dest 'ImageReader.e
 if (Test-Path (Join-Path $src 'flowtary-search.exe')) {
     Copy-Item (Join-Path $src 'flowtary-search.exe') (Join-Path $dest 'flowtary-search.exe') -Force
 }
-Copy-Item (Join-Path $src 'fd.exe') (Join-Path $dest 'fd.exe') -Force
+if (Test-Path (Join-Path $src 'flowtary-indexer.exe')) {
+    Copy-Item (Join-Path $src 'flowtary-indexer.exe') (Join-Path $dest 'flowtary-indexer.exe') -Force
+}
 
 Write-Host ("[ok] deployed to {0}" -f $dest)
 exit 0

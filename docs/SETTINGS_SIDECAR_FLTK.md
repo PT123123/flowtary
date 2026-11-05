@@ -219,3 +219,31 @@ BGR→RGB，最后 `fl_write_png()`；同时把控件树几何（窗口子控件
   再用同一份 `ft::hist::ReadTail` 读回（见 `SEARCH_DAEMON_NOTES.md` 第十五节的实测表）。
 - 展示行的截取（`kHistoryViewLines=400`）与「台账共 N 行」计数走 `TakeTail`/`CountLines`，
   由 ctest 的 `TakeTail` 断言钉住；未做人工点测。
+
+## 10. 2026-11-05：开机自启项由程序自己在启动时对齐
+
+之前只有设置页点「保存」才写 `HKCU\...\Run\Flowtary`，记的是**那一刻的 exe 全路径**。
+部署目录和 exe 名都带版本号，发新版后没人再去点保存，登录就一直起在旧版本上——
+本机实测到的现场：workshop 已经是 `Flowtary-1.1.28.11`，Run 里还停在
+`C:\workshop\Flowtary-1.1.25.10\flowtary-1.1.25.10.exe`（而且是不带引号的裸路径——本程序的保存按钮
+从初始提交起就一直写带引号的值，所以这条更像外部 `reg` 塞进来的）。
+改成主程序每次启动自己对齐，不靠脚本、也不靠用户回忆去点保存。
+
+| 位置 | 改动 |
+|---|---|
+| `src/settings_model.h/.cpp` | Run 键的三个原子操作 `ReadRunValue`/`WriteRunValue`/`DeleteRunValue`（**值名参数化**，只为取证门能用临时值名在本机真跑）；`StartupEnabled`/`SetStartupPath` 改由它们拼出，读值不再用固定 `MAX_PATH` 缓冲；新增纯函数 `NormalizeStartupValue`（去两端空白 + 去包裹引号 + 再去空白）、`StartupNeedsSync`（不区分大小写比路径；值缺失或空值 → 永不判定为要改写）与 `SyncStartupPath` |
+| `src/main.cpp` | `WinMain` 在 `RecordRunningBuild()` 之后调 `ft::SyncStartupPath(GetExePath())`；删掉迁移期遗留、已无人调用的 `GetStartupEnabled()`/`SetStartup()` 两个包装 |
+| `tests/startup_sync_test.cpp` | ctest `startup_sync` 门：纯函数判定三组（换了版本目录必改 / 同一路径的各种写法不重改 / 值缺失与空值绝不代用户打开）+ 一段在本机 `HKCU\...\Run` 上用 `Flowtary-selftest-<PID>` 真跑「写→读回→判定→改写→再判定→删除→确认读不到」的取证，RAII 兜底删除，存的路径指向不存在的目录，进程被硬杀也不会在登录时起真程序 |
+
+放在单实例接管之后：同版本重复启动直接返回、被新版本顶掉的旧 exe 提前退出，
+两条都不会写注册表，只有活下来的那个实例对齐。值不存在 = 用户没开自启，绝不替他打开。
+
+### 取证
+
+- ctest 9/9 通过（新增 `startup_sync`）；`flowtary.exe`、`flowtary-settings.exe` 重新编译无警告。
+- 门第一轮就是红的：`"  C:\…  "` 这种引号内层还带空格的值被判成「同一条路径」，
+  于是修的是实现（去引号后再 trim 一次），不是放宽断言。
+- **线上那条 `Flowtary` 值没被测试碰过**：跑完回读仍是 `C:\workshop\Flowtary-1.1.25.10\flowtary-1.1.25.10.exe`，
+  Run 键下也没有 `Flowtary-selftest-*` 残留。
+- 未做：没装机、没 bump 版本号、没启动新版跑端到端。这条链路要在下一次发版后、新版真的起来过一次，
+  Run 才会跟着换成新版目录；在那之前登录仍起 1.1.25.10。局限说明写在契约 §7。

@@ -1,3 +1,5 @@
+> 搜索资源安全修复：旧版 `fd.exe` 全盘遍历、自建索引和全盘目录监听已移除。d/f 已接入 Flowtary 快照查询；快照生成仍未开放，自动模式在快照缺失时使用 Windows Search。MFT/USN 初建仍需完成真实卷完整性与整机资源验收。方案与门槛见 [搜索资源与索引架构方案](docs/SEARCH_RESOURCE_ARCHITECTURE.md)，当前离线六项整机实测见 [索引离线评测](docs/INDEXER_OFFLINE_MEASUREMENTS.md)。
+
 # Flowtary — Windows 极简全局搜索启动器
 
 Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割版）。纯 Win32 + GDI 自绘，
@@ -16,8 +18,8 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
 | `f {关键词}` | 只搜本地**文件**（多词 AND、子串匹配），回车直接打开 |
 | `d {关键词}` | 只搜**文件夹**，回车在资源管理器打开 |
 | （`f`/`d` 兜底） | 按名字搜不到任何结果时，自动改按**整条路径**逐词再搜一次，如 `d aw-qtui software` 命中 `C:\software\aw-qtui` |
-| （自学习） | 用 `f`/`d` 搜开（或普通搜索打开程序）并**成功打开**过的条目自动记忆（在 `%APPDATA%\Flowtary\learned` 生成 `.lnk` 快捷方式），下次搜同词/前缀词时无视 Everything/程序索引直接**置顶**，exe 优先、长期保留；参数见设置 `自学习` 页 |
-| （排除语法 `-关键词`） | 任意搜索输入里，**以 `-` 开头的词**表示「从结果中排除含该词的项目」，可与正向词混用：`chrome -portable`、`f 报告 -草稿`、`空格 w 浏览器 -无痕`。程序与 d/f 文件搜索按名称/路径文本匹配；`f`/`d` 翻成 Everything 原生 `!file:`/`!folder:` 索引侧排除；权重与自学习的记录 key 只取剥离排除词后的正向词 |
+| （自学习） | 用 `f`/`d` 搜开（或普通搜索打开程序）并**成功打开**过的条目自动记忆（在 `%APPDATA%\Flowtary\learned` 生成 `.lnk` 快捷方式），下次搜同词/前缀词时直接**置顶**，exe 优先、长期保留；参数见设置 `自学习` 页 |
+| （排除语法 `-关键词`） | 任意搜索输入里，**以 `-` 开头的词**表示「从结果中排除含该词的项目」，可与正向词混用：`chrome -portable`、`f 报告 -草稿`、`空格 w 浏览器 -无痕`。程序与 d/f 文件搜索按名称/路径文本匹配；权重与自学习的记录 key 只取剥离排除词后的正向词 |
 | `bd {q}` | 百度 `https://www.baidu.com/#ie=UTF-8&wd={q}` |
 | `bili {q}` | B站 `https://search.bilibili.com/all?keyword={q}` |
 | `xhs {q}` | 小红书 `https://www.xiaohongshu.com/search_result?keyword={q}` |
@@ -59,7 +61,8 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
     侧栏顶部有 `Flowtary` 品牌标题，激活页用主题强调色 + 左侧竖条高亮。
   - `常规` 页：
     - `开机自动启动`：勾选后写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\Flowtary`，
-      取消则删除该值
+      取消则删除该值。主程序每次启动还会把这条值**对齐到当前正在跑的 exe**——部署目录带版本号
+      （`Flowtary-<版本>\flowtary-<版本>.exe`），发新版后不必再进设置页点保存；自启没开时不碰注册表
     - `结果项快捷键`：下拉选择结果列表中「每行右侧徽章 + 对应 `Alt+` 快捷打开」的方案，**默认 `Alt + 数字`**：
       - `Alt + 数字（1–9,0）`：按结果优先级自上而下分配 `1`/`2`…`0`，`1` = 列表最高优先级项（主键盘或数字小键盘均可）
       - `Alt + 字母（A–J）`：按结果优先级自上而下分配 `A`/`B`…`J`
@@ -131,18 +134,11 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
     - 默认项含各盘符回收站、`System Volume Information`、`RECYCLER`、`node_modules`、
       `__pycache__` 及编辑器备份/临时文件（`*~`、`~$*`、`*.swp`）。
       **点开头文件夹由上方开关统一处理，不再写成硬编码默认项**
-  - `索引目录` 页：**优先根列表**（多行编辑器，每行一个目录，`#` 开头为注释，打开时原文回显）
-    - 这里填的目录排到内存索引遍历序**最前面**先扫，所以自研应用发布目录（如 `C:\workshop`、
-      `C:\software`）的 exe 命中一定出现在第一块结果里（秒出），不受用户目录条目多少挤掉
-    - 下方实时显示「当前 N 个优先根」；保存即写 `HKCU\Software\Flowtary\IndexDirs`，
-      守护进程下次查询比对指纹后自动按新根重启，无需手动重启程序
-    - 不填也能搜到（走全盘索引层），只是不在第一块结果里、要等第二块
-      （旧版本写入的 `*\.git` / `*\.vscode\extensions\*` 会在升级时自动撤掉，用户自加项保留），
-      否则开关关掉后这些目录仍搜不到
+  - `索引目录` 页：旧版 `IndexDirs` 配置只读保留，不参与当前 d/f 搜索。历史配置可能包含 `C:\workshop`、`C:\software`；workshop `.exe` 专用 posting 已在 Flowtary 索引中实现，真实 C 卷快照未验收前不可用，详见 `docs/SEARCH_RESOURCE_ARCHITECTURE.md`。
   - `自学习` 页：**打开记忆**——用 `f`/`d` 前缀搜索（或直接普通搜索）并成功打开一个
     文件/文件夹/程序后，按「本次搜索词 → 完整路径」记为长期记忆，并在
     `%APPDATA%\Flowtary\learned` 镜像一个 `.lnk` 快捷方式；下次搜同一个词（或它的前缀）时，
-    学习项无视 Everything / 程序索引是否命中，直接**置顶**出现在结果最前面
+    学习项无视 Flowtary / Windows Search / 程序目录是否命中，直接**置顶**出现在结果最前面
     （精确词组在前，**exe 优先**，再按打开次数与最近使用时间）。
     普通搜索记忆的范围同样受 `记录范围` 约束：默认只记 exe 与文件夹，所以
     不在开始菜单索引里的程序（如某些绿色 exe）也能靠一次打开被记住
@@ -184,12 +180,12 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
   1. 用户开始菜单 `%APPDATA%\Microsoft\Windows\Start Menu\Programs` 下全部 `.lnk`
   2. 系统开始菜单 `C:\ProgramData\Microsoft\Windows\Start Menu\Programs` 下全部 `.lnk`
   3. `C:\Program Files`、`C:\Program Files (x86)` 一级子目录下的 `.exe`
-- 过滤：Everything（`d`/`f`）结果与上述程序搜索结果都受设置 `排除路径` 页影响——
+- 过滤：d/f 索引结果与上述程序搜索结果都受设置 `排除路径` 页影响——
   **默认跳过路径任一层以 `.` 开头的结果（含 `.gitignore` 这类点开头文件）**（该开关默认开），
   再叠加用户排除列表；网页指令与一键组不受影响。
 - 查询内排除（`-关键词` 语法）：与上面的「排除路径」独立，是每次输入即时生效的临时过滤——
   以 `-` 开头的词命中即丢弃该行（程序搜索匹配名称/路径，`w` 匹配标题/进程/类名，
-  `f`/`d` 交给 Everything 用 `!file:`/`!folder:` 在索引侧排除）；正向词与排除词分开解析，
+  `f`/`d` 由 Flowtary 索引或 Windows Search 过滤文件名与路径）；正向词与排除词分开解析，
   权重/自学习只以正向词作 key，故排除词不会污染记忆记录。
 - 匹配排序：**点击权重（含自适应前缀推荐，见下）>** 精确 > 前缀 > 包含 > 子序列模糊，同级内开始菜单优先于 Program Files；
   最多显示 10 条。`.lnk` 通过 `IShellLink + IPersistFile` 解析目标路径，以其目录作为
@@ -201,11 +197,11 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
     `f`/`d` 前缀只对后面的关键词记录（如 `f 报告` 记 `报告`），无前缀时整个输入即有效词
   - 命中不应保存的命令前缀（如 `gg`、`bd` 等网页指令）时，本次点击**完全不记录、不写入存储**
   - 条目以**文件完整绝对路径**为唯一标识，同名文件不混淆
-  - Everything（`f`/`d`）结果返回后同样按权重稳定重排（权重相同保持 Everything 原序）
+  - Flowtary / Windows Search（`f`/`d`）结果返回后同样按权重稳定重排
   - **自适应前缀推荐**：搜索时额外聚合「已记录搜索词以当前输入为前缀」的历史权重
     （按真实点击次数累加），于是多点几次 `bilibili` → 哔哩哔哩后，只敲 `b` / `bi`
     也能把它顶到结果最前，输入随使用越来越短；单字符查询下有历史权重的条目
-    不受「只保留精确/前缀」过滤限制（点过的不算噪音）。Everything（`f`/`d`）重排
+    不受「只保留精确/前缀」过滤限制（点过的不算噪音）。文件索引（`f`/`d`）重排
     同样适用；跟随「启用点击权重记忆」开关，无独立设置项，现有 `weights.dat`
     无需迁移、直接生效
 
@@ -225,225 +221,32 @@ build\evtest.exe     :: Everything IPC 协议冒烟测试工具（控制台）
 ```
 
 > **热键占用提示**：若 `Alt + Space` 已被其他程序（如 Flow.Launcher）注册，启动时会弹窗
-> 提示一次，并自动改用备用热键 `Alt + Q`。本机实测：稳态工作集 0.3~5MB、私有内存约
-> 4MB、exe 186KB；`d/f` 走 Everything IPC 实测可用（`evtest.exe file:hosts` 返回 136 条）。
+> 提示一次，并自动改用备用热键 `Alt + Q`。本机旧版进程的内存和 Everything IPC 数字仅是历史记录，
+> 不代表目前 Flowtary 快照客户端或整机索引服务的资源表现。当前 d/f 的短时 IPC 数据见
+> [C++ 快照查询接入记录](docs/INDEXER_CPP_INTEGRATION.md)。
 > 注意：全屏独占游戏（如 VALORANT + Vanguard）前台时，热键可能被反作弊拦截或无法抢占
 > 焦点，这是系统限制；切回正常桌面后即可正常使用。
 
-运行前提：`d`/`f` **不再依赖 Everything**。搜索走双后端并行（见下节）；
-两个后端都不可用时才回退旧 Everything IPC（需 Everything 1.4+ 正在后台运行，
-未运行则给出「在 Everything 中搜索」降级项，`everything.exe` 依次在 Program Files、
-`%LOCALAPPDATA%`、exe 同目录及 PATH 中查找）。
+运行前提：d/f 查询 Flowtary 已发布快照；当前尚无生产 C 卷快照生成器，所以自动模式在快照缺失时使用 Windows Search。
 
-## d/f 搜索后端（不建全盘内存索引）
+## d/f 搜索后端（当前实现）
 
-方案名 **Flowtary Search**。架构：**内存索引 + 磁盘索引宿主在独立守护进程
-`flowtary-search.exe --serve` 中**（TCP 127.0.0.1 行协议，单实例、空闲 30 分钟自动退出、
-崩溃不影响 flowtary）——任务管理器里 `flowtary.exe`（UI，约 25MB）与
-`flowtary-search.exe`（索引，约 45–85MB）分开计数，与 Everything 的对比一目了然，
-两者之和约 70–110MB。防抖到期后**四层并行**，结果按全路径去重合并（先到先显示、流式上屏）：
+d/f 已接入常驻只读快照查询进程，读取 `%LOCALAPPDATA%\Flowtary\index-C.fti`。自动模式有快照时优先 Flowtary；快照不存在时查询 Windows Search。也可在设置中强制选择 Flowtary 快照或 Windows Search。快照损坏、过期或查询超预算时显示失败，不改走目录遍历。真实 C 卷的完整快照生成尚未验收，因此当前默认仍落到 Windows Search。
 
-| 层 | 原理 | 覆盖 | 延迟 | 内存 |
-| :--- | :--- | :--- | :--- | :--- |
-| ① 内存索引 | flowtary-search 全列用户常用目录 + 注册表 `IndexDirs` 附加目录建库，**附加目录（如 `C:\workshop`）排为优先根、最先扫描**；常驻内存 + ReadDirectoryChangesW 增量维护（**增/删/改名事件即时入 RAM delta，查询时与池合并**）；磁盘缓存 `%LOCALAPPDATA%\Flowtary\memindex.dat` 重启即用 | 常用目录内**毫秒级** | 首块 **15–47ms**（秒出）；二块流式补 | ~45MB（16.3 万条，档位可调） |
-| ② 磁盘索引 | flowtary-search 全盘遍历一次（空闲优先级）→ 小写化 UTF-8 路径 blob（`%LOCALAPPDATA%\Flowtary\diskindex.dat`，数百 MB 磁盘文件）→ mmap 只读 + 首字节 memchr 全 blob 扫描；命中按**路径组件级大小写缓存**还原真名（每级目录名一次 `FindFirstFileW`，4MiB LRU-ish 上限） | **全盘** | 扫描 **15ms**（暖） | **进程私有 ~0**（文件映射页可被系统回收；启动时空闲线程 PrefetchVirtualMemory 预取，首查免冷页）；另有由 blob 派生的**应用子索引**（`.exe`/`.lnk`/`.appref-ms`/`.msi`，本机 1.8 万条）常驻，专供「应用名 + exe」这类查询秒出 |
-| ③ fd 现查 | 随包 `fd.exe`（同目录或 PATH）现场并行遍历，**不建任何索引** | 全部固定盘 | 亚秒~8s | 查询瞬时，空闲 0 |
-| ④ Windows Search | OLE DB 查系统索引 `SystemIndex`（覆盖范围 = 系统「索引选项」） | 索引范围内 | 0.8–1.2s 暖查询 | 0（服务系统已有） |
+注册表中旧 `IndexDirs` 配置仍可能包含 `C:\workshop` 与 `C:\software`，当前版本不消费这些配置。`C:\workshop` 下 `.exe` 的专用 posting 已由 Flowtary 索引实现；当前没有经过真实 C 卷验证的快照，因此该规则尚不能用于本机文件。全盘索引候选使用 MFT 初建与 USN 增量，仍需通过整机资源验收。方案与限制见 [搜索资源与索引架构方案](docs/SEARCH_RESOURCE_ARCHITECTURE.md)。
 
-> 组件说明：`flowtary-search.exe --serve` 是 Flowtary 自己的常驻索引守护进程；
-> `fd.exe` 是单独随包分发的 [sharkdp/fd](https://github.com/sharkdp/fd) 10.5.0
->（MIT/Apache-2.0 双许可），负责遍历，查找顺序为同目录 `fd.exe` → PATH。
-> 部署必须同时带上两者；缺少 `fd.exe` 时已有内存缓存仍可读取，但新索引无法构建。
+旧版 benchmark 与搜索架构记录不代表当前实现或安全验证结果。
+## 独立历史诊断工具
 
-- **建库/遍历剪枝**（fd `-E`，目录级剪枝=整棵子树不进遍历）：点开头、node_modules、
-  `__pycache__`、回收站（`$RECYCLE.BIN`/`RECYCLER`）、`System Volume Information`、
-  `tmp`/`temp` 目录、`*.tmp`/`*.temp`/`~$*`/`*~`/`*.swp` 临时备份文件——与默认显示过滤同向。
-  内存索引建库规则与默认显示过滤一致（Desktop+Documents 实测 16.3 万条 ≈ 45MB）。
-  首次建库 ~65s（后台，不阻塞②③），之后重启从缓存 0.5s 加载；
-  `FT_DF_MEMINDEX_MAX` 调上限、`FT_DF_MEMINDEX_OFF=1` 关闭。
-  附加目录在**设置 → 索引目录**里填（也可手写注册表 `HKCU\Software\Flowtary\IndexDirs`，
-  REG_SZ，每行一个路径，`#` 注释），并作为**优先根**排在常用目录之前扫描——
-  自建应用目录（如 `C:\workshop`）因此进首块。
-- **搜索匹配范围**：程序、文件和文件夹只按原始名称/路径文本匹配，不做拼音或中文首字母缩写展开。
-  产品决定与原因见 `docs/SEARCH_POLICY.md`。
-- **磁盘索引**：全覆盖但按上述规则剪枝（junk 不进索引，建库时间与体积同步大降）；
-  每盘根 ReadDirectoryChangesW → RAM 内 delta 表查询时合并，delta > 5 万条或缓存超 7 天
-  自动后台重建（空闲优先级不干扰前台）。`FT_DF_DISKINDEX_MAX` 限条目数（默认 8000000）、
-  `FT_DF_DISKINDEX_OFF=1` 关闭。
-- **秒出（分块流式 + 优先根）**：守护进程一次查询分两块下发——① 首块 = 内存索引（优先根
-  先扫）+ 应用子索引，拿满即先 send 上屏；② 二块 = 磁盘 blob 扫描的大候选窗结果随后补发。
-  主程序收到首块立刻画，不再等全盘扫描。各层不再用「遍历序截断」而是**排名堆**
-  （精确 > 前缀 > 后缀 > 包含，同分短路径优先），避免饱和时把 workshop 里的命中挤掉。
-- **应用子索引 + workshop 版本排序**：磁盘索引建好后后台派生一份只含
-  `.exe`/`.lnk`/`.appref-ms`/`.msi` 的小表（本机 18,689 条），「`aura exe`」「`chrome exe`」
-  这类查询直接命中它，不再靠 90MB blob 全扫；守护进程启动即踢后台建表，开机头几十秒也能命中。
-  子目录名带版本号的（`C:\workshop\aura-1.2.25\`）**版本号大的排在前面**（`src/app_ver.h`
-  解析 `x.y.z`/`x.y.z-alpha.N`，数值比较而非字典序），同版本再按名字/路径质量与点击权重排序。
-- **路径显示完整**：行右侧父目录用 `DT_PATH_ELLIPSIS` 在可用宽度内**保留末段**
-  （省略的是中间，`C:\workshop\aura-1.2.25\aura-ui.exe` 的版本目录看得见），
-  宽度按标题实际占位动态计算，不再固定截半。
-- flowtary-search 三段预算（用户目录 2s → 全盘 → 路径兜底，总默认 8000ms，`FT_DF_FD_TIMEOUT_MS` 可调），
-  超时终止保留部分结果；多词 AND（`--and`）、固定字符串、不分大小写；`-I` 不理会 gitignore。
-- ④ 的会话进程级缓存（provider/命令工厂只建一次）；失败自动降级。
-- 全部不可用（无缓存无 flowtary-search 无 WSearch）时回退旧 Everything IPC 链路；
-  `FT_DF_DEBUG=1` 向 stderr 打印诊断。
-- 冒烟工具 `build\wsquery.exe`：`--check` 探测 / `--memstat`、`--diskstat` 索引状态 /
-  `[-d] [-p] [--fd|--mem|--disk] 词…` 直查 / `--bench N` 连查 N 次打印暖查询耗时。
-- **想让 Windows 自带搜索也变全盘**：设置 → 隐私和安全性 → 搜索 Windows →
-  「查找我的文件」改为**增强**（系统索引服务自己重建，内存由系统服务承担，与 flowtary 无关）。
-- **后端切换**：设置 → 常规 → 「d/f 搜索后端」下拉——`新方案（内置索引 + fd）`（默认）/
-  `Everything（旧链路）`。切到 Everything 时不再建任何索引（省 I/O），d/f 直接走
-  Everything IPC（需 Everything 正在运行）；切回新方案时索引层惰性启动。
-- **索引档位（内存 ↔ 速度自选）**：设置 → 常规 → 「搜索索引档位」——
-  `极简`（不建索引，守护进程不驻留，查询实时 fd/WS，秒级）/ `轻量`（索引 ≤10 万条，低内存）/
-  `均衡`（默认，≤30 万 + 全盘 ≤800 万）/ `极速`（≤100 万 + ≤1600 万，大用户目录不截断）；
-  守护进程自读注册表，**保存后下一次查询自动按新档重启生效**，
-  无需手动重启（值存 `HKCU\Software\Flowtary\DfIndexTier`）。
-
-### 搜索历史台账（搜不出来时先看这里）
-
-设置 → `搜索历史` 页直接看/刷新/打开/清空这份文件，开关与保留条数也在那一页。
-- 文件：`%APPDATA%\Flowtary\search_history.log`（UTF-8 带 BOM，一行一条，超出保留行数只留尾部）。
-  只在本机、不参与排序、不进仓库。
-- `Q` 行 = 一轮查询：`first=` 首屏上屏延迟（「秒出」看这个）、`total=` 各层报齐的耗时、
-  `rows=` 可打开的结果条数、`src=索引N/fdN/WSN` 每条路给了几条、`top=` 第一行完整路径；
-  落盘时还有层没报齐就挂 `未回=WS`。`rows=0` 和带 `未回=` 的行就是现场。
-- `O` 行 = 这次实际打开了哪条（与点击权重分开记，关了权重也留痕）。
-- 打完字静置 4 秒才落一条，逐字打字不重复记；卡住的那一轮在换查询或退出时也会写出去。
-- 本机实测（`tools/hist_probe.ps1` 往真窗口发消息，人工点测没参与）：`f ftprobe58474` →
-  `first=16ms rows=1 src=索引1/fd0/WS0 未回=WS`；乱码词的空结果要 12969ms 才写「无结果」。
-  台账翻出的四条待办见 `docs/SEARCH_DAEMON_NOTES.md` 第十五节。
-
-## 性能 benchmark（2026-10-24 本机实测）
-
-口径：Win11 · NVMe SSD · Defender 实时防护开启 · 用户目录（桌面+文档等）约 54 万原始条目
-（剪枝后 16.3 万入内存索引）· 全盘数百万文件。所有延迟为「回车后出结果」口径，含防抖 120ms。
-
-| 场景 | ① 内存索引 | ② 磁盘索引 | ③ flowtary-search 现查 | ④ Windows 搜索 | Everything（对照） |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| 桌面/常用目录搜索 | **15–31ms** | 16–93ms | 26s+（8s 预算内部分结果） | — | 毫秒级 |
-| 全盘任意词搜索 | 范围外 | **15–47ms**（暖） | ≤8s 部分结果 | 0.8–1.2s | 毫秒级 |
-| 常驻内存 | ~45MB | **≈0**（文件映射页） | 0（查询瞬时 ~31MB） | 0（系统服务） | 257–270MB |
-| 建库成本 | 常用目录 ~65s 后台；重启缓存 0.5s 加载 | 全盘一次（空闲优先级后台） | 无 | 系统自己重建 | 秒级 MFT |
-| 新鲜度 | 实时（目录监听） | 实时（盘根监听 delta）+7 天重建 | 实时（现查） | 秒级（系统索引器） | 实时（USN） |
-
-- flowtary 整体稳态私有内存 **54–72MB**（含 16.3 万条内存索引 + 程序缓存），对照
-  Everything 常驻 257–270MB；全盘索引本体放磁盘（数百 MB 文件）不占进程内存。
-- flowtary-search 现查全盘走完实测 100s+（Defender 拖累每次目录枚举），因此只作 ≤8s 预算的兜底层；
-  磁盘索引建库同受 Defender 影响（全盘一次约 0.5–1.5h，空闲优先级后台跑一次付清）。
-- Windows Search 的 0.8–1.2s 为暖查询（LIKE 前导通配线性扫描），prefix 场景可换
-  CONTAINS 提速（后续项）。
-- **2026-10-25 补测**（`docs/SEARCH_DAEMON_NOTES.md` 有完整方法）：内存层扫描
-  0–5ms；磁盘层暖扫描 31–47ms（90MB blob）；守护进程重启后
-  首查 200–500ms 为 mmap 页缓存回填，一次性成本，常驻后不复发。索引缓存落盘已改为
-  「锁内快照 + 锁外写」，根增量重建不再卡查询。
-
-### 2026-10-25 五轮优化后（守护进程整链路实测，`wsquery --bench` 口径）
-
-同机同口径（Win11 · NVMe · Defender 开 · 内存索引 16.5 万条 + 全盘 blob 68 万条 / 90MB）。
-五轮优化 = 协议批量化、mem 饱和跳磁盘扫描、PrefetchVirtualMemory 冷页预热、目录级
-大小写还原缓存、mem 扫描 ASCII 快路径 + 词条折叠提升（完整记录见 `docs/SEARCH_DAEMON_NOTES.md`）。
-
-| 指标 | 优化前（10-24/25 上） | 优化后（10-25 下） | 说明 |
-| :--- | :--- | :--- | :--- |
-| 饱和查询（命中满 200 行） | 78–250ms | **15–31ms**（~10×） | mem 拿满即跳过磁盘 blob 扫描 + 协议整包一次 send |
-| 0 命中最坏（四层全扫） | ~250ms | **63ms** | mem 扫描 ASCII 快路径：31–47ms → 0–16ms |
-| 800 行排序候选窗大查询 | —（功能新增） | **暖 47–62ms**，冷 860ms 仅守护进程重启后首查 | 冷 = 目录级大小写缓存首次枚举，暖态零文件系统调用 |
-| 磁盘 blob 扫描（暖） | 31–47ms | **15ms** | 90MB memchr 单线程；冷首查 218–609ms 由 PrefetchVirtualMemory 预取挪到启动期 |
-| 每命中大小写还原 | GetLongPathNameW 6–8ms/次（Defender） | **~0（缓存命中）** | 按目录 FindFirstFileW 枚举一次整目录真名映射 + 进程级缓存 |
-| 协议开销 | 逐字节 recv + 逐条 send（一查上万次系统调用） | 请求/响应各一次 send + 4KB 缓冲行读 + TCP_NODELAY | 环回 Nagle+延迟 ACK 的百毫秒级 stall 一并消除 |
-| 新文件可搜 | 等整根重建 ~113s | **2s 内**（delta 即时入库） | 删除同样 2s 内生效 |
-| 排序候选窗 | 200 行遍历序 | 800 行（`test` 查询精确/前缀命中 53 → 393 个） | UI 质量排序 + 点击权重叠加 |
-| 守护进程内存 | ~45–85MB | 同级；**档位可调**（极简 ≈0 / 轻量 / 均衡 / 极速，设置里选） | 轻量档缓存加载实测 165,282 → 84,471 条 |
-
-> 测试方法：`build\wsquery.exe --bench N [--rows M] --mem 词`（守护进程整链路，
-> 客户端含连接/协议/解析）；`FT_DF_DEBUG=1` 起守护进程可看各层分解
-> （`[mems]`/`[disks]`/`[prefetch]`/`[case]`）。完整方法论与冒烟步骤见
-> `docs/SEARCH_DAEMON_NOTES.md` 第六节。
->
-> **本节是 10-25 的口径存档**：其中「目录级大小写缓存」与「mem 拿满即跳磁盘扫描」
-> 两条已被 2026-10-29 第八轮分别改为**组件级缓存**与**两块流式**，实测见下节。
-
-### 2026-10-29 第八轮：workshop/应用 exe 秒出（守护进程整链路 A/B）
-
-同机同口径（Win11 · NVMe · Defender 开 · 内存索引 16.5 万条 + 全盘 blob 68 万条 / 90MB ·
-`IndexDirs` 含 `C:\workshop`、`C:\software` · 请求 800 行）。
-对照 = 已装的 1.1.23.10 守护进程，实验 = 本轮构建；逐批耗时用 `wsquery --bench` 打印，
-各层分解用 `FT_DF_DEBUG=1`（`[conn]`/`[appidx]`/`[disks]`）。
-
-| 查询 | 对照（已装 1.1.23.10） | 本轮（首块 / 二块） | 变化点 |
-| :--- | :--- | :--- | :--- |
-| `aura exe` | 296ms / 58 行（workshop 命中 12） | **16–31ms** / 53 行（workshop 命中 14，版本号降序） | 优先根 + 应用子索引 |
-| `chrome exe` | 328ms / 216 行 | **16–47ms** / 43 行 + 219–266ms / 190 行 | 两块流式：首屏不等磁盘扫描 |
-| `quire` | 578ms / 800 行（优先根命中 5） | **15–47ms** / 231 行（优先根命中 34）+ 62–282ms / 569 行 | 磁盘大小写还原 516ms → 冷 63ms / 暖 0ms |
-| `screenpipe exe` | 312ms / 179 行 | **31–47ms** / 65 行 + 250–266ms / 114 行 | 应用行首块出场，不再「显示不出来」 |
-| `bitwarden exe` | 234ms / 7 行 | **78ms** / 7 行 | 命中稀少时仍走全扫，无首块可拆 |
-| `v2rayn` | 47ms / 800 行 | **15–32ms** / 10 行 + 78–157ms / 790 行 | 同上 |
-
-- 大小写还原改造的取证探针 `build\case_probe.exe <目录> <子项名>`（本机实测：
-  `System32` 5007 项整目录枚举 **1505µs**、精确名 `FindFirstFileW` **75µs**、
-  `GetLongPathNameW` **276µs**）——旧「整目录真名映射表」在 800 行大查询里装不下，
-  整表清空重枚举导致单次还原 **516ms**；组件级缓存把每次还原降为「每级目录名一次 `FindFirstFileW`」。
-- 路径省略号改造的像素证据：`build\path_ellipsis_probe.exe <out.bmp> <宽px> <字号>`
-  用列表同款字体（Microsoft YaHei UI）+ 顶向下 32bpp DIB 实拍 `DT_PATH_ELLIPSIS` 与
-  `DT_END_ELLIPSIS` 两种模式的落点；160px / 260px 各出一张（实测 304×216、404×216）。
-- 版本排序单测：`build\appver_test.exe`（`1.10.0` > `1.9.2`、预发布后缀、无版本号回落）。
-- 完整根因、改动清单、已知边界见 `docs/SEARCH_DAEMON_NOTES.md` 第十四节。
-
-### 内存 benchmark（档位实测，2026-10-25 同机）
-
-守护进程 `flowtary-search.exe` 实测（PowerShell PrivateMemorySize64 / WorkingSet64，
-缓存加载 + 一次暖查询后取值；Defender 开；磁盘 blob 90MB 为文件映射 standby 页，
-**不计入私有内存**）。**2026-10-25 晚：内存索引池改 UTF-8 字节存储后按同口径 A/B
-重测（同一份 158,957 条缓存、同环境）——宽池 59.5MB → UTF-8 池 33.5MB（−44%）**：
-
-| 配置 | 私有内存（UTF-8 池） | 构成 |
-| :--- | :--- | :--- |
-| 极简档 | **0**（守护进程不驻留） | 查询走 fd/WS 实时兜底 |
-| 轻量档（≤10 万条） | **~24MB** | 缓存裁剪后 ~84K 条 |
-| 均衡档（默认，≤30 万条） | **33.5MB** | 158,957 条 UTF-8 路径池/偏移表 + 目录大小写缓存 |
-| 极速档（≤100 万条） | 与均衡档相同（本机实际条目 16.5 万未触及上限） | 上限只在目录实际条目超过时生效，防止大目录撑爆内存 |
-
-（对照：UTF-8 化之前同口径 59.5MB；旧表 40.7MB 为更早缓存状态下的测量，条件不可比。）
-
-- 主程序 `flowtary.exe` 约 **25MB**（纯 UI，不含索引）——索引内存全记在守护进程名下，
-  任务管理器里与 Everything 的 257–270MB 直接对照。
-- 内存索引本体 ≈ 120 字节/条（UTF-8 路径池 + 偏移表 + 标志位），
-  16 万条 ≈ 19MB；条目数由「索引档位」封顶，`FT_DF_MEMINDEX_MAX`/`FT_DF_DISKINDEX_MAX`
-  环境变量仍可覆盖。
-- 内存 delta 表洪峰上限 1 万条（~4MB，百度网盘级持续 churn 场景），超限放弃增量
-  交给整根重建。
-- 磁盘索引 blob（68 万条 / 90MB 磁盘文件）映射后为 standby 页，内存紧张时系统自动回收、
-  查询时再从文件回填（预热线程已把首查成本挪到启动期）。
-
-## Everything IPC 协议说明（现仅作全部后端不可用时的回退路径）
-
-实现严格对照 voidtools 官方 SDK 头文件 `ipc/everything_ipc.h`（Everything 1.4.1）：
-
-1. 目标窗口类名 `EVERYTHING_TASKBAR_NOTIFICATION`，`WM_COPYDATA` 的 `dwData = 2`
-   （`EVERYTHING_IPC_COPYDATAQUERYW`）——与原方案一致。
-2. **原方案中的 `dwData=5`（取结果数）、`10/11`（按索引取名/路径）命令并不存在**。
-   官方协议是：`EVERYTHING_IPC_QUERYW` 结构体中自带 `reply_hwnd` 与
-   `reply_copydata_message`（由调用方指定），Everything 搜索完成后**异步**把打包好的
-   `EVERYTHING_IPC_LISTW` 结果列表通过一条 `WM_COPYDATA` 推回该窗口。本实现即采用该
-   异步回复模型（回复 `dwData = 0x46540000 | 查询序号`，防止串话）。
-3. `EVERYTHING_IPC_LISTW`/`EVERYTHING_IPC_ITEMW` 均为 `#pragma pack(1)`，
-   `filename_offset/path_offset` 相对列表结构起始；`flags & 0x1` 表示文件夹。
-4. `file:` / `folder:` 是 Everything 搜索语法中的修饰符，**仅作用于紧随其后的一个词**，
-   故多词关键词逐词添加前缀（`d foo bar` → `file:foo file:bar`），引号短语整体传递。
-   注意它们只匹配**名字**，不匹配所在目录层级。
-4b. 因此主查询（逐词 `file:`/`folder:`）**零结果**时会自动追发一条路径级兜底查询：
-   类型过滤单独成词 + 逐词 `path:`（`d aw-qtui software` → `folder: path:aw-qtui path:software`），
-   让关键词分布在路径任意层级也能命中；兜底只发一次，不循环。
-5. 协议验证工具：`build\evtest.exe [查询串]` 可直接打印 IPC 返回结果。
+`tools/evtest.cpp` 与 `build/evtest.exe` 仅用于独立协议诊断，不参与 Flowtary 搜索路由。
 
 ## 目录结构
 
 ```
 src/main.cpp         全部实现（搜索后端调度 / 双后端结果合并 / 网页指令 / 程序枚举匹配 / 自绘 UI / 热键）
-src/df_search.cpp/.h d/f 搜索后端：Windows Search（OLE DB 查 SystemIndex）+ fd（子进程现查），零第三方依赖
-tools/wsquery.cpp    d/f 后端冒烟工具（--check 探测 / 直查，与 evtest 同位）
-tools/evtest.cpp     Everything IPC 协议测试工具（现仅回退链路使用）
+src/df_search.cpp/.h d/f 搜索后端：仅查询现有 Windows Search SystemIndex
+tools/wsquery.cpp    d/f 后端诊断工具（只查询现有 Windows Search 索引）
+tools/evtest.cpp     历史 Everything IPC 协议测试工具（不参与当前 d/f 路由）
 vendor/ScreenCapture/  截图工具源码（git submodule，xland/ScreenCapture 2.4.25），构建产物 ScreenCapture.exe
 vendor/Ling/           GUI 框架源码（git submodule，xland/Ling），OCR 链依赖
 vendor/TinyOCR/        OCR 推理引擎源码（git submodule，xland/TinyOCR），基于 onnxruntime
@@ -479,18 +282,10 @@ OCR 链的依赖关系：`ImageReader` → `TinyOCR` + `Ling` → `yoga` + `Clip
 
 ## 已知限制
 
-- ③ flowtary-search 现查兜底层受 deadline 截止（默认 8s）：全盘走不完时返回部分结果
-  （正常情况下 ①② 索引层毫秒级接管，现查只在守护进程离线/建库中短暂出场）；
-  `FT_DF_FD_TIMEOUT_MS=0` 可走完全盘（本机实测约 100s+）
-- **索引只覆盖固定磁盘**（`DRIVE_FIXED`）：网络驱动器、U 盘、移动硬盘不在内存/磁盘索引范围内，
-  这类位置依赖 ③ 现查与 ④ Windows Search 兜底
-- 档位切换/守护进程重启后的首次查询由磁盘缓存先行（数据可能略旧，后台逐根重建收敛，
-  新建文件经 delta 秒级补上）
+- Flowtary 快照查询已接入 C++ d/f 界面；真实卷快照生成与持续 USN 增量仍未接入生产流程。
+- `C:\workshop` 下 `.exe` 专用规则已在索引查询目录中实现，但需完整 C 卷快照才能用于真实文件；当前仍未完成真实卷验证。
 - 全屏独占程序中热键仍可响应，但焦点抢占可能被系统限制
 - 程序索引在启动时构建，安装/卸载新程序需重启 flowtary 生效
 - UWP 应用不在搜索范围（按方案仅索引 .lnk 与一级 .exe）
-- **MSIX / 商店应用没有 exe 可搜**：如本机「ChatGPT」实为 `OpenAI.Codex_2p2nqsd0c76g0!App`
-  包，装在 `C:\Program Files\WindowsApps`（目录 ACL 拒读，fd 与磁盘索引整棵跳过），
-  且不落开始菜单 `.lnk`（`Get-StartApps` 才列得出）——所以内存/磁盘/应用三层与快捷方式层
-  都看不见它，搜「chatgpt」零结果是当前实现的预期。
-  要覆盖这类应用需枚举 `shell:AppsFolder` 并按 AUMID 启动（未做）。
+- **商店应用目录需实机验收**：快速应用目录已查询开始菜单快捷方式、App Paths 和
+  `shell:AppsFolder`，但打包应用启动与图标成本仍需在实际安装环境验证。

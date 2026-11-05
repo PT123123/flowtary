@@ -37,3 +37,6 @@ build-fltk.log
 
 # rustc-wrapper（废弃的 UFFS 实验构建产物）
 tools/rustc-wrapper/
+
+# Local indexer metrics output
+resource-samples.jsonl

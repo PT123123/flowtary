@@ -374,13 +374,6 @@ static ChoiceCtl* AddChoice(Fl_Group* p, int x, int y, int w, std::vector<ft::Op
     return ctl;
 }
 
-// 搜索索引档位只在「内置搜索」后端下有效——选 Everything 旧链路时置灰。
-static ChoiceCtl* s_tierCtl = nullptr;
-static void ApplySearchCtlGating() {
-    const bool on = g_s.dfBackend == 0;
-    if (s_tierCtl) on ? s_tierCtl->w->activate() : s_tierCtl->w->deactivate();
-}
-
 static ChoiceCtl* AddChoiceRow(Fl_Group* p, int y, const WCHAR* label,
                                std::vector<ft::Option> opts, int* bind, int kind = 0) {
     AddLabel(p, 0, y, 160, kRowH, label);
@@ -448,7 +441,6 @@ static void onChoice(Fl_Widget*, void* v) {
         ApplyShellLayout();
         g_win->redraw();
     }
-    if (ctl->kind == 2) ApplySearchCtlGating();  // d/f 搜索后端：Everything 时索引档位置灰
     PushPreview();
 }
 
@@ -811,15 +803,12 @@ static void BuildTabGeneral() {
     AddChoiceRow(p, 78, L"唤醒位置：", ft::CenterWakeOptions(), &g_s.centerWake);
     AddCheck(p, 0, 116, kPW, L"文件对话框跳转（在文件对话框中直接定位文件夹）", &g_s.fdjEnabled);
     AddChoiceRow(p, 150, L"d/f 搜索后端：", ft::DfBackendOptions(), &g_s.dfBackend, 2);
-    s_tierCtl = AddChoiceRow(p, 184, L"搜索索引档位：", ft::DfIndexTierOptions(), &g_s.dfIndexTier);
-    ApplySearchCtlGating();   // 初始状态：Everything 旧链路时索引档位置灰
+    AddLabel(p, 0, 184, kPW, kRowH, L"Flowtary 快照查询已接入；当前仍需独立完成索引生成与验证。");
     AddHint(p, 0, 218, kPW, 60,
-            L"索引档位是「内存 ↔ 速度」的权衡：极简=不建索引每次实时搜（秒级、守护进程不驻留）；"
-            L"轻量/均衡/极速逐级加大索引覆盖（毫秒级），内存占用随之上升。\n"
-            L"仅对内置搜索生效；保存后守护进程自动按新档重启（首次切档需重新建库）。");
+            L"自动模式优先查询已发布的 Flowtary 快照；快照尚未就绪时查询 Windows Search。\n"
+            L"Flowtary 快照缺失或损坏时不会启动文件扫描；Windows Search 范围由系统设置决定。");
     AddHint(p, 0, 282, kPW, 46,
-            L"d/f 搜索后端：新方案=内置索引+fd（不依赖 Everything，后台自动建索引）；"
-            L"Everything=旧链路（需 Everything 正在运行）。\n"
+            L"Flowtary 不启动文件扫描，不自动启动索引服务，也不修改系统索引范围。\n"
             L"唤起快捷键（Alt+Space）在托盘菜单里开关；结果项快捷键改动立即生效。");
     p->end();
 }
@@ -924,22 +913,22 @@ static void BuildTabExclude() {
 static void UpdateIndexDirsCount() {
     size_t n = ft::ParseIndexDirs(editorText(g_edtIndexDirs)).size();
     g_lblIndexDirsCount->copy_label(
-        u8(L"当前 " + std::to_wstring(n) + L" 个优先根").c_str());
+        u8(L"保留 " + std::to_wstring(n) + L" 条旧目录配置（不生效）").c_str());
 }
 static void onIndexDirsChanged(Fl_Widget*, void*) { UpdateIndexDirsCount(); }
 static void BuildTabIndexDirs() {
     Fl_Group* p = NewPanel(6);
-    AddLabel(p, 0, 4, kPW, 20, L"索引目录（优先根，每行一个路径）：");
+    AddLabel(p, 0, 4, kPW, 20, L"旧索引目录（仅保留配置，不参与搜索）：");
     g_edtIndexDirs = AddMultiline(p, 28, kPW, kPH - 112);
     FillEditor(g_edtIndexDirs, g_s.indexDirsText);
+    g_edtIndexDirs->deactivate();
     g_edtIndexDirs->when(FL_WHEN_CHANGED);
     g_edtIndexDirs->callback(onIndexDirsChanged);
     g_lblIndexDirsCount = AddLabel(p, 0, kPH - 72, kPW, kRowH, L"", 10);
     UpdateIndexDirsCount();
     AddHint(p, 0, kPH - 42, kPW, 42,
-            L"这些目录排到索引最前面先扫，保存后守护进程自动重启生效——自研应用发布目录"
-            L"（如 C:\\workshop、C:\\software）填在这里，搜 exe 才会秒出且版本号大的排前。\n"
-            L"# 开头为注释；不填也能搜到（走全盘索引层），只是不在第一块结果里。保存后生效。");
+            L"旧目录配置不触发扫描。d/f 查询 Flowtary 快照或 Windows Search。\n"
+            L"C:\\workshop\\*.exe 由 Flowtary 自己维护。");
     p->end();
 }
 
@@ -1124,7 +1113,7 @@ static void BuildTabHistory() {
     AddHint(p, 0, kPH - 56, kPW, 56,
             L"文件：%APPDATA%\\Flowtary\\search_history.log（UTF-8，一行一条，超出保留行数只留尾部）\n"
             L"Q=一轮查询（打完字 4 秒后落一条，逐字打字不重复记）：first=首屏上屏延迟 total=各层报齐的总耗时 "
-            L"rows=结果条数 src=索引/fd/WS 各层给几条 未回=到落盘还没报齐的层；O=实际打开了哪条。"
+            L"rows=结果条数 WS=Windows Search 返回条数；旧索引/fd 计数字段仅为兼容保留；O=实际打开项。"
             L"搜不出东西时先看这里：rows=0 和带「未回」的行就是现场。记录只在本机，不参与排序，也不进 git。");
     p->end();
 }

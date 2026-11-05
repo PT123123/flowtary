@@ -103,6 +103,20 @@ size_t CountLearnedEntries();
 // 注意：必须写入「主程序 exe」路径，sidecar 不能用自己的模块路径。
 bool StartupEnabled();
 void SetStartupPath(const std::wstring& mainExePath, bool on);
+// 去掉 Run 值两端的空白与包裹的引号，得到裸 exe 路径（空值→空串）。
+std::wstring NormalizeStartupValue(const std::wstring& runValue);
+// 自启项记的路径不是这个 exe 时返回 true。runValue 为空（用户没开自启）永远返回
+// false：启动对齐只跟路径，不替用户打开自启。
+bool StartupNeedsSync(const std::wstring& runValue, const std::wstring& mainExePath);
+// 主程序启动时调用：自启开着就把 Run 对齐到当前 exe，关着不动注册表。
+void SyncStartupPath(const std::wstring& mainExePath);
+
+// HKCU\...\Run 的三个原子操作，值名参数化：只为本机的取证门能用临时值名真跑一遍
+// 读→比→写，不碰线上那条 `Flowtary`。业务代码走上面四个函数。
+// ReadRunValue 返回 false = 这条值不存在；返回 true 时 out 是原文（可能是空串）。
+bool ReadRunValue(const wchar_t* valueName, std::wstring& out);
+bool WriteRunValue(const wchar_t* valueName, const std::wstring& command);
+bool DeleteRunValue(const wchar_t* valueName);
 
 // ---------------- 设置快照（所有可持久化字段） ----------------
 struct Settings {
@@ -128,8 +142,8 @@ struct Settings {
     std::vector<std::wstring> excludePaths;
     std::wstring indexDirsText;   // IndexDirs 原文（优先根列表，编辑器直写注册表）
     bool skipDotFolders = true;
-    int dfBackend = 0;              // d/f 搜索后端：0=新方案（内置索引） 1=Everything 旧链路
-    int dfIndexTier = 2;            // 搜索索引档位：0=极简 1=轻量 2=均衡 3=极速（内存↔速度权衡；守护进程自读注册表）
+    int dfBackend = 0;              // d/f 后端：0=自动（Flowtary 优先）1=仅 Flowtary 2=仅 Windows Search
+    int dfIndexTier = 2;            // 旧索引档位（仅保留配置，不参与搜索）
     // 搜索权重
     bool weightEnabled = true;
     int weightFlush = 1;
@@ -187,13 +201,8 @@ inline std::vector<Option> LearnExpireOptions() {
             {L"180 天未使用即清理", 180}, {L"365 天未使用即清理", 365}};
 }
 inline std::vector<Option> DfBackendOptions() {
-    return {{L"内置搜索（Flowtary Search）", 0}, {L"Everything（旧链路，需 Everything 运行）", 1}};
-}
-inline std::vector<Option> DfIndexTierOptions() {
-    return {{L"极简（不建索引：实时搜索，内存占用最低）", 0},
-            {L"轻量（索引约 10 万条：低内存）", 1},
-            {L"均衡（默认：约 30 万条 + 全盘索引）", 2},
-            {L"极速（最大覆盖：内存占用最高）", 3}};
+    return {{L"自动（Flowtary 索引优先，Windows Search 备用）", 0},
+            {L"仅 Flowtary 索引", 1}, {L"仅 Windows Search（系统索引范围）", 2}};
 }
 inline std::vector<Option> ShellTypeOptions() {
     return {{L"命令提示符 (cmd)", 0}, {L"PowerShell", 1}, {L"Git Bash", 2}, {L"自定义…", 3}};

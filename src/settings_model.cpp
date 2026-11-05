@@ -260,7 +260,7 @@ std::vector<std::wstring> ParseExcludePaths(const std::wstring& text) {
 std::wstring ExcludePathsToText(const std::vector<std::wstring>& patterns) {
     std::wstring t;
     t += L"# 排除路径：每行一条，支持通配符 * ?。路径以排除项开头即视为命中（含整棵子树）。\r\n";
-    t += L"# 作用于 Everything 搜索（d/f 前缀）与本地程序搜索的结果，网页与一键组不受影响。\r\n";
+    t += L"# 作用于 d/f 文件搜索与本地程序搜索的结果，网页与一键组不受影响。\r\n";
     for (auto& p : patterns) t += p + L"\r\n";
     return t;
 }
@@ -268,7 +268,7 @@ std::wstring ExcludePathsToText(const std::vector<std::wstring>& patterns) {
 std::wstring DefaultExcludePathsText() {
     std::wstring t =
         L"# 排除路径：每行一条，支持通配符 * ?。路径以排除项开头即视为命中（含整棵子树）。\r\n"
-        L"# 作用于 Everything 搜索（d/f 前缀）与本地程序搜索的结果，网页与一键组不受影响。\r\n"
+        L"# 作用于 d/f 文件搜索与本地程序搜索的结果，网页与一键组不受影响。\r\n"
         L"# 默认已排除各盘符回收站、系统目录，以及 node_modules/__pycache__ 等开发噪音目录\r\n"
         L"# 和编辑器备份/临时文件（*~、~$、*.swp 等），可自行增删。\r\n"
         L"# 以 . 开头的文件/文件夹（.git/.vscode/.gitignore …）由上方开关统一跳过，无需在此逐条填写。\r\n";
@@ -463,23 +463,74 @@ size_t CountLearnedEntries() {
 
 // ---------------- 开机自启 ----------------
 
+namespace {
+const WCHAR* kRunKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+const wchar_t* kRunValueName = L"Flowtary";
+}  // namespace
+
+bool ReadRunValue(const wchar_t* valueName, std::wstring& out) {
+    out.clear();
+    DWORD cb = 0;
+    if (RegGetValueW(HKEY_CURRENT_USER, kRunKey, valueName, RRF_RT_REG_SZ, nullptr, nullptr, &cb) !=
+        ERROR_SUCCESS)
+        return false;
+    if (cb < sizeof(WCHAR)) return true;  // 存在但是空值
+    std::wstring v(cb / sizeof(WCHAR), L'\0');
+    if (RegGetValueW(HKEY_CURRENT_USER, kRunKey, valueName, RRF_RT_REG_SZ, nullptr, &v[0], &cb) !=
+        ERROR_SUCCESS)
+        return false;
+    size_t chars = cb / sizeof(WCHAR);
+    if (chars > 0 && v[chars - 1] == L'\0') --chars;  // 去掉结尾 NUL
+    v.resize(chars);
+    out = v;
+    return true;
+}
+
+bool WriteRunValue(const wchar_t* valueName, const std::wstring& command) {
+    return RegSetKeyValueW(HKEY_CURRENT_USER, kRunKey, valueName, REG_SZ, command.c_str(),
+                           (DWORD)((command.size() + 1) * sizeof(WCHAR))) == ERROR_SUCCESS;
+}
+
+bool DeleteRunValue(const wchar_t* valueName) {
+    return RegDeleteKeyValueW(HKEY_CURRENT_USER, kRunKey, valueName) == ERROR_SUCCESS;
+}
+
 bool StartupEnabled() {
-    WCHAR buf[MAX_PATH]{};
-    DWORD cb = sizeof(buf);
-    return RegGetValueW(HKEY_CURRENT_USER,
-                        L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", L"Flowtary",
-                        RRF_RT_REG_SZ, nullptr, buf, &cb) == ERROR_SUCCESS;
+    std::wstring v;
+    return ReadRunValue(kRunValueName, v);
 }
 
 void SetStartupPath(const std::wstring& mainExePath, bool on) {
-    const WCHAR* run = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-    if (on) {
-        std::wstring v = L"\"" + mainExePath + L"\"";
-        RegSetKeyValueW(HKEY_CURRENT_USER, run, L"Flowtary", REG_SZ, v.c_str(),
-                        (DWORD)((v.size() + 1) * sizeof(WCHAR)));
-    } else {
-        RegDeleteKeyValueW(HKEY_CURRENT_USER, run, L"Flowtary");
-    }
+    if (on) WriteRunValue(kRunValueName, L"\"" + mainExePath + L"\"");
+    else DeleteRunValue(kRunValueName);
+}
+
+std::wstring NormalizeStartupValue(const std::wstring& runValue) {
+    const wchar_t* kPad = L" \t";
+    auto trim = [&](std::wstring s) {
+        size_t b = s.find_first_not_of(kPad);
+        if (b == std::wstring::npos) return std::wstring();
+        return s.substr(b, s.find_last_not_of(kPad) - b + 1);
+    };
+    std::wstring v = trim(runValue);
+    if (v.size() >= 2 && v.front() == L'"' && v.back() == L'"') v = trim(v.substr(1, v.size() - 2));
+    return v;
+}
+
+bool StartupNeedsSync(const std::wstring& runValue, const std::wstring& mainExePath) {
+    std::wstring have = NormalizeStartupValue(runValue);
+    std::wstring want = NormalizeStartupValue(mainExePath);
+    if (have.empty() || want.empty()) return false;
+    return _wcsicmp(have.c_str(), want.c_str()) != 0;  // NTFS 路径不区分大小写
+}
+
+// 自启项记的是「点保存那一刻的 exe 全路径」，而部署目录与 exe 名都带版本号
+// （Flowtary-1.1.28.11\flowtary-1.1.28.11.exe）。发版后没人再进设置页点保存，
+// 登录时就会起在上一个版本上。主程序每次启动自己纠正一次。
+void SyncStartupPath(const std::wstring& mainExePath) {
+    std::wstring have;
+    if (!ReadRunValue(kRunValueName, have)) return;  // 没有这条值 = 用户没开自启
+    if (StartupNeedsSync(have, mainExePath)) SetStartupPath(mainExePath, true);
 }
 
 // ---------------- Settings::Load / Save ----------------
@@ -515,7 +566,7 @@ void Settings::Load() {
     v = 1;
     skipDotFolders = RegGetDword(L"SkipDotFolders", v) ? v != 0 : true;
     v = 0;
-    if (RegGetDword(L"DfBackend", v)) dfBackend = (v == 1) ? 1 : 0;
+    if (RegGetDword(L"DfBackend", v)) dfBackend = v <= 2 ? (int)v : 0;
     v = 2;
     if (RegGetDword(L"DfIndexTier", v)) dfIndexTier = (v > 3) ? 2 : (int)v;   // 越界回默认档
 

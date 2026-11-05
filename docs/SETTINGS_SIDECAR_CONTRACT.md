@@ -257,7 +257,7 @@ x https://x.com/search?q={q}
 
 ```
 # 排除路径：每行一条，支持通配符 * ?。路径以排除项开头即视为命中（含整棵子树）。
-# 作用于 Everything 搜索（d/f 前缀）与本地程序搜索的结果，网页与一键组不受影响。
+# 作用于 d/f 文件搜索与本地程序搜索的结果，网页与一键组不受影响。
 # 默认已排除各盘符回收站、系统目录，以及 node_modules/__pycache__ 等开发噪音目录
 # 和编辑器备份/临时文件（*~、~$、*.swp 等），可自行增删。
 # 以 . 开头的文件/文件夹（.git/.vscode/.gitignore …）由上方开关统一跳过，无需在此逐条填写。
@@ -437,11 +437,27 @@ x https://x.com/search?q={q}
 内容："<主 exe 完整路径>"            // 外层带英文双引号，无任何命令行参数
 ```
 
-- 写：`SetStartup(true)` `src/main.cpp:2764-2770`，路径来自 `GetExePath()` = `GetModuleFileNameW`（`2750-2754`）→ **进程自己的 exe**。
-- 删：`SetStartup(false)` → `RegDeleteKeyValueW`（`2771`）。
-- 读（勾选态）：`GetStartupEnabled()` `2756-2762` = **只要 `RegGetValueW` 返回 `ERROR_SUCCESS` 就算开**，不校验内容、不校验路径是否指向当前 exe。
-- 触发时机：仅保存按钮（`5862`），取消按钮不回滚 Run 键（因为勾选只改内存）。
-- **sidecar 注意**：sidecar 的 `GetModuleFileNameW` 是 `flowtary-settings.exe`。路径必须由主进程传入（命令行参数 / 环境变量 / 或读 `RunningPath` `7219`）。
+实现全在 `src/settings_model.cpp`（主程序与 sidecar 共用同一份），主程序侧的调用点在 `src/main.cpp`：
+
+| 函数 | 作用 |
+|---|---|
+| `ReadRunValue` / `WriteRunValue` / `DeleteRunValue` | Run 键的三个原子操作，**值名参数化**——只为 `tests/startup_sync_test.cpp` 能在本机用临时值名 `Flowtary-selftest-<PID>` 真跑一遍读→比→写→删，不碰线上那条 `Flowtary` |
+| `StartupEnabled()` | 勾选态：只要 `RegGetValueW` 返回 `ERROR_SUCCESS` 就算开，不校验内容、不校验路径是否指向当前 exe |
+| `SetStartupPath(mainExePath, on)` | 开=写带引号的主 exe 全路径，关=删值。**路径必须是主程序的**，谁调用都得把主 exe 传进来 |
+| `NormalizeStartupValue` / `StartupNeedsSync` | 纯函数判定：去掉两端空白与包裹引号后按不区分大小写比路径；值缺失/空值 → 永不判定为「要改写」 |
+| `SyncStartupPath(mainExePath)` | 启动对齐（下面这条是它的存在理由） |
+
+- 写：仅两处 —— 设置页点「保存」（`src/settings_main.cpp:711`）与主程序启动对齐（`src/main.cpp:5187`）。
+- 删：取消勾选后点保存。
+- 触发时机：保存按钮；取消按钮不回滚 Run 键（勾选只改内存）。
+- **启动对齐**：部署目录和 exe 名都带版本号（`C:\workshop\Flowtary-<版本>\flowtary-<版本>.exe`），
+  而 Run 记的是「点保存那一刻的路径」。发版后没人再去点保存，登录就会起在上一个版本上
+  （实测过：workshop 已到 1.1.28.11，Run 里还停在 1.1.25.10，且是不带引号的裸路径）。
+  所以主程序在**单实例接管之后**调 `SyncStartupPath(GetExePath())`：值存在且路径不是自己就改写，
+  值不存在（用户没开自启）绝不动注册表。放在接管之后是为了让被顶掉的旧 exe 不把路径改回去。
+- 局限：对齐只能对齐「正在跑的那个 exe」。换了部署目录但一直没启动新版，登录时仍是旧版把自己写回去。
+- **sidecar 注意**：sidecar 的 `GetModuleFileNameW` 是 `flowtary-settings.exe`。路径必须由主进程传入
+  （命令行参数 / 环境变量 / 或读 `RunningPath` `7219`）。
 
 ---
 

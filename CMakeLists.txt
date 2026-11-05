@@ -3,6 +3,21 @@ cmake_minimum_required(VERSION 3.20)
 project(Flowtary LANGUAGES C CXX RC)
 include(CTest)
 
+# Explicit development target only; stages the query host but never starts it.
+option(FLOWTARY_EXPERIMENTAL_INDEXER "Expose the experimental Rust indexer build target" OFF)
+if(FLOWTARY_EXPERIMENTAL_INDEXER)
+  find_program(FLOWTARY_CARGO cargo REQUIRED)
+  add_custom_target(flowtary-indexer-experimental
+    COMMAND "${FLOWTARY_CARGO}" build --release --locked --jobs 1
+      --manifest-path "${CMAKE_CURRENT_SOURCE_DIR}/indexer/Cargo.toml"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+      "${CMAKE_CURRENT_SOURCE_DIR}/indexer/target/release/flowtary-indexer.exe"
+      "$<TARGET_FILE_DIR:flowtary>/flowtary-indexer.exe"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/indexer"
+    COMMENT "Build and stage snapshot query helper (does not collect volumes)"
+    VERBATIM)
+endif()
+
 # =====================================================================
 # MSVC include 路径自动检测（必须在 add_subdirectory(vendor) 之前）
 # =====================================================================
@@ -89,6 +104,11 @@ else()
     target_include_directories(index_dirs_test PRIVATE src)
     target_link_libraries(index_dirs_test PRIVATE shell32)
     add_test(NAME index_dirs COMMAND index_dirs_test)
+    add_executable(startup_sync_test tests/startup_sync_test.cpp src/settings_model.cpp)
+    target_include_directories(startup_sync_test PRIVATE src)
+    target_link_libraries(startup_sync_test PRIVATE shell32 advapi32)
+    add_test(NAME startup_sync COMMAND startup_sync_test)
+    set_tests_properties(startup_sync PROPERTIES TIMEOUT 10)
     add_executable(search_history_test tests/search_history_test.cpp src/search_history.cpp
       src/settings_model.cpp)
     target_include_directories(search_history_test PRIVATE src)
@@ -102,11 +122,16 @@ else()
     src/settings_model.cpp
     src/search_history.cpp
     src/df_search.cpp
+    src/indexer_client.cpp
+    src/workshop_catalog.cpp
     src/flowtary.rc
     src/flowtary.ico)
   set_source_files_properties(src/flowtary.ico PROPERTIES HEADER_FILE_ONLY TRUE)
   set_target_properties(flowtary PROPERTIES OUTPUT_NAME flowtary)
   target_link_libraries(flowtary PRIVATE ${FLOWTARY_LIBS})
+  if(FLOWTARY_EXPERIMENTAL_INDEXER)
+    add_dependencies(flowtary flowtary-indexer-experimental)
+  endif()
 
   # 第三方源码子项目（vendor/CMakeLists.txt）：
   #   ScreenCapture.exe / ImageReader.exe 均为源码构建，输出目录即 build\
@@ -132,15 +157,15 @@ else()
   set_target_properties(path_ellipsis_probe PROPERTIES OUTPUT_NAME path_ellipsis_probe)
   target_link_libraries(path_ellipsis_probe PRIVATE gdi32 user32 shell32)
 
-  # d/f 搜索后端冒烟工具（Windows Search OLE DB + fd），与 src/main.cpp 共用 df_search
+  # d/f 搜索后端诊断工具（仅查询已有 Windows Search 索引）
   # （df_search 只按文件名/路径文本匹配）
   add_executable(wsquery tools/wsquery.cpp src/df_search.cpp)
   set_target_properties(wsquery PROPERTIES OUTPUT_NAME wsquery)
   target_include_directories(wsquery PRIVATE src)
   target_link_libraries(wsquery PRIVATE ole32 shell32 uuid)
 
-  # 搜索守护进程：内存/磁盘索引宿主 + TCP 查询服务（flowtary-search --serve）
-  add_executable(flowtary-search tools/ft_search_main.cpp src/df_search.cpp)
+  # 兼容旧启动命令：独立索引已移除，此程序只提示并退出
+  add_executable(flowtary-search tools/ft_search_main.cpp)
   set_target_properties(flowtary-search PROPERTIES OUTPUT_NAME flowtary-search)
   target_include_directories(flowtary-search PRIVATE src)
   target_link_libraries(flowtary-search PRIVATE ole32 shell32 uuid ws2_32 user32)
@@ -149,11 +174,39 @@ else()
     target_link_options(flowtary-search PRIVATE /DEBUG "/MAP:$<TARGET_FILE_DIR:flowtary-search>/flowtary-search.map")
   endif()
   if(BUILD_TESTING)
-    add_executable(search_memory_test tests/search_memory_test.cpp)
-    target_include_directories(search_memory_test PRIVATE src)
-    target_link_libraries(search_memory_test PRIVATE ole32 shell32 uuid ws2_32 user32)
-    add_test(NAME search_memory COMMAND search_memory_test)
-    set_tests_properties(search_memory PROPERTIES TIMEOUT 120)
+    add_executable(app-catalog-probe tools/app_catalog_probe.cpp src/df_search.cpp src/indexer_client.cpp
+      src/workshop_catalog.cpp src/filedlg_jump.cpp src/settings_model.cpp src/search_history.cpp)
+    target_include_directories(app-catalog-probe PRIVATE src)
+    target_link_libraries(app-catalog-probe PRIVATE ${FLOWTARY_LIBS})
+    add_executable(app_catalog_test tests/app_catalog_test.cpp)
+    target_include_directories(app_catalog_test PRIVATE src)
+    target_link_libraries(app_catalog_test PRIVATE shell32 ole32 uuid advapi32 user32)
+    add_test(NAME app_catalog COMMAND app_catalog_test)
+    set_tests_properties(app_catalog PROPERTIES TIMEOUT 15)
+    add_executable(existing_index_search_test tests/existing_index_search_test.cpp)
+    target_include_directories(existing_index_search_test PRIVATE src)
+    target_link_libraries(existing_index_search_test PRIVATE ole32 shell32 uuid ws2_32 user32)
+    add_test(NAME existing_index_search COMMAND existing_index_search_test)
+    set_tests_properties(existing_index_search PROPERTIES TIMEOUT 15)
+    add_executable(indexer_client_test tests/indexer_client_test.cpp src/indexer_client.cpp)
+    target_include_directories(indexer_client_test PRIVATE src)
+    target_compile_definitions(indexer_client_test PRIVATE FLOWTARY_TEST_SNAPSHOT_OVERRIDE=1)
+    add_test(NAME indexer_client COMMAND indexer_client_test)
+    set_tests_properties(indexer_client PROPERTIES TIMEOUT 10)
+    add_executable(existing_index_ui_test tests/existing_index_ui_test.cpp
+      src/filedlg_jump.cpp src/settings_model.cpp src/search_history.cpp)
+    target_include_directories(existing_index_ui_test PRIVATE src)
+    target_link_libraries(existing_index_ui_test PRIVATE ${FLOWTARY_LIBS})
+    add_test(NAME existing_index_ui COMMAND existing_index_ui_test)
+    set_tests_properties(existing_index_ui PROPERTIES TIMEOUT 20)
+    add_executable(workshop_catalog_test tests/workshop_catalog_test.cpp src/workshop_catalog.cpp)
+    target_include_directories(workshop_catalog_test PRIVATE src)
+    add_test(NAME workshop_catalog COMMAND workshop_catalog_test)
+    set_tests_properties(workshop_catalog PROPERTIES TIMEOUT 10)
+    add_executable(workshop-catalog-probe tools/workshop_catalog_probe.cpp src/workshop_catalog.cpp)
+    target_include_directories(workshop-catalog-probe PRIVATE src)
+    add_executable(directory-api-probe tools/directory_api_probe.cpp)
+    target_link_libraries(directory-api-probe PRIVATE Psapi)
   endif()
 
   add_library(filedlg_hook64 SHARED src/hookdlg.cpp)

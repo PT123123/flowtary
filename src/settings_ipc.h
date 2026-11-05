@@ -64,8 +64,8 @@ struct Preview {
     BOOL beautify;
     BOOL skipDotFolders;
     BOOL fdjEnabled;
-    int dfBackend;   // d/f 搜索后端：0=新方案（内置索引） 1=Everything 旧链路
-    int dfIndexTier; // 搜索索引档位：0=极简（主进程不拉守护进程，fd/WS 实时兜底）
+    int dfBackend;   // d/f 搜索后端：0=自动（Flowtary 优先）1=仅 Flowtary 2=仅 Windows Search
+    int dfIndexTier; // 旧索引档位（仅保留配置，不参与搜索）
 
     BOOL weightEnabled;
     int weightFlush;
