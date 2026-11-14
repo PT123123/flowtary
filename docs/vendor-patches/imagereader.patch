@@ -1,0 +1,457 @@
+diff --git a/ImageReader/OcrDoc.cpp b/ImageReader/OcrDoc.cpp
+index 90d3795..6ef98cd 100644
+--- a/ImageReader/OcrDoc.cpp
++++ b/ImageReader/OcrDoc.cpp
+@@ -2,6 +2,7 @@
+ #include <TinyOCR/include/tinyocr/tiny_ocr.h>
+ #include <algorithm>
+ #include <cfloat>
++#include <cwctype>
+ #include "OcrDoc.h"
+ 
+ using namespace Microsoft::WRL;
+@@ -207,3 +208,97 @@ TextPos OcrDoc::hitTestImage(float px, float py) const
+ 	if (nearest >= 0) return TextPos{ nearest, caretInLine(nearest, px) };
+ 	return TextPos{};
+ }
++
++// 编辑后的文本可能改变行数与每行长度：按行沿用原有字符框，新增字符按原行
++// AABB 均分，重建几何后图像侧的选区高亮仍然可用。
++static ComPtr<ID2D1PathGeometry> makeQuadGeometry(const Quad& q)
++{
++	auto d2d = Ling::D2D::get();
++	ComPtr<ID2D1PathGeometry> path;
++	if (FAILED(d2d->d2dFactory->CreatePathGeometry(path.GetAddressOf()))) return nullptr;
++	ComPtr<ID2D1GeometrySink> sink;
++	if (FAILED(path->Open(sink.GetAddressOf()))) return nullptr;
++	sink->BeginFigure(q.p[0], D2D1_FIGURE_BEGIN_FILLED);
++	sink->AddLine(q.p[1]);
++	sink->AddLine(q.p[2]);
++	sink->AddLine(q.p[3]);
++	sink->EndFigure(D2D1_FIGURE_END_CLOSED);
++	if (FAILED(sink->Close())) return nullptr;
++	return path;
++}
++
++std::wstring OcrDoc::getAllText() const
++{
++	std::wstring out;
++	for (const auto& line : lines) {
++		if (!out.empty()) out += L"\r\n";
++		out += line.text;
++	}
++	return out;
++}
++
++void OcrDoc::replaceText(const std::wstring& text)
++{
++	std::vector<std::wstring> newTexts;
++	size_t start = 0;
++	for (size_t i = 0; i <= text.size(); ++i) {
++		if (i == text.size() || text[i] == L'\n' || text[i] == L'\r') {
++			newTexts.push_back(text.substr(start, i - start));
++			if (i < text.size() && text[i] == L'\r' && i + 1 < text.size() && text[i + 1] == L'\n') ++i;
++			start = i + 1;
++		}
++	}
++	if (newTexts.empty()) newTexts.emplace_back();
++
++	std::vector<OcrLine> rebuilt;
++	rebuilt.reserve(newTexts.size());
++	for (size_t li = 0; li < newTexts.size(); ++li) {
++		OcrLine out;
++		out.text = std::move(newTexts[li]);
++		out.charQuads.assign(out.text.size(), Quad{});
++		out.charGeoms.assign(out.text.size(), nullptr);
++
++		const OcrLine* old = li < lines.size() ? &lines[li]
++			: (lines.empty() ? nullptr : &lines.back());
++		const size_t oldN = old ? old->charQuads.size() : 0;
++		const bool hasBox = old && old->hasGeom
++			&& old->boxRight > old->boxLeft && old->boxBottom > old->boxTop;
++		const float l = old ? old->boxLeft : 0.f, t = old ? old->boxTop : 0.f;
++		const float r = old ? old->boxRight : 0.f, b = old ? old->boxBottom : 0.f;
++		const float span = hasBox ? (r - l) / (float)(std::max)(oldN, (size_t)1) : 0.f;
++
++		for (size_t ch = 0; ch < out.text.size(); ++ch) {
++			if (std::iswspace(static_cast<wint_t>(out.text[ch]))) continue;
++			Quad q;
++			if (old && ch < oldN && old->charQuads[ch].valid) {
++				q = old->charQuads[ch];
++			}
++			else if (hasBox) {
++				const float x0 = l + span * (float)ch;
++				const float x1 = l + span * ((float)ch + 1.f);
++				q.p[0] = { x0, t }; q.p[1] = { x1, t };
++				q.p[2] = { x1, b }; q.p[3] = { x0, b };
++				q.valid = x1 > x0 && b > t;
++			}
++			if (!q.valid) continue;
++			auto geom = makeQuadGeometry(q);
++			if (!geom) continue;
++			out.charQuads[ch] = q;
++			out.charGeoms[ch] = geom;
++			if (!out.hasGeom) {
++				out.boxLeft = q.left(); out.boxTop = q.top();
++				out.boxRight = q.right(); out.boxBottom = q.bottom();
++				out.hasGeom = true;
++			}
++			else {
++				out.boxLeft = (std::min)(out.boxLeft, q.left());
++				out.boxTop = (std::min)(out.boxTop, q.top());
++				out.boxRight = (std::max)(out.boxRight, q.right());
++				out.boxBottom = (std::max)(out.boxBottom, q.bottom());
++			}
++		}
++		rebuilt.push_back(std::move(out));
++	}
++	lines = std::move(rebuilt);
++	clearSelection();
++}
+diff --git a/ImageReader/OcrDoc.h b/ImageReader/OcrDoc.h
+index 3a3d497..cc27665 100644
+--- a/ImageReader/OcrDoc.h
++++ b/ImageReader/OcrDoc.h
+@@ -66,6 +66,11 @@ public:
+ 	// 第 line 行被选中的字符区间 [b, e)。返回 false 表示该行没有选中内容。
+ 	bool getLineRange(int line, int& b, int& e) const;
+ 	std::wstring getSelectedText() const;
++	// 全文：行间用 \r\n 连接（含空行），供复制/编辑使用
++	std::wstring getAllText() const;
++	// 用编辑后的文本替换识别结果。字符几何按行沿用，长度变化时按原行
++	// bbox 均分重建，保证图像侧选区仍可用；选区会被清空。
++	void replaceText(const std::wstring& text);
+ 
+ 	// ---- 命中测试（原图坐标 -> 文本流位置）----
+ 	TextPos hitTestImage(float px, float py) const;
+diff --git a/ImageReader/OcrTextEdit.cpp b/ImageReader/OcrTextEdit.cpp
+new file mode 100644
+index 0000000..a67fa63
+--- /dev/null
++++ b/ImageReader/OcrTextEdit.cpp
+@@ -0,0 +1,195 @@
++#include "pch.h"
++#include "OcrTextEdit.h"
++#include <algorithm>
++
++// A small self-contained Win32 modal editor. Kept out of Ling's node tree on
++// purpose: a native EDIT control gives us caret, IME, undo and selection for
++// free, which the read-only OCR text panel does not provide.
++namespace {
++    constexpr int kIdEdit = 101;
++    constexpr int kIdOk = 102;
++    constexpr int kIdCancel = 103;
++    constexpr int kIdCopyAll = 104;
++    constexpr const wchar_t* kClassName = L"FlowtaryOcrTextEdit";
++
++    struct EditState {
++        HWND hwnd{ nullptr };
++        HWND parent{ nullptr };
++        HWND edit{ nullptr };
++        HFONT font{ nullptr };
++        std::wstring initial;
++        std::wstring result;
++        bool confirmed{ false };
++        bool done{ false };
++    };
++    EditState g;
++
++    std::wstring getEditContent(HWND edit)
++    {
++        if (!edit || !IsWindow(edit)) return {};
++        int len = GetWindowTextLengthW(edit);
++        if (len <= 0) return {};
++        std::wstring out((size_t)len + 1, L'\0');
++        int n = GetWindowTextW(edit, out.data(), len + 1);
++        out.resize((size_t)(std::max)(0, n));
++        return out;
++    }
++
++    HWND makeButton(HWND parent, const wchar_t* label, int id)
++    {
++        return CreateWindowExW(0, L"BUTTON", label,
++            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
++            0, 0, 0, 0, parent,
++            reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
++            GetModuleHandleW(nullptr), nullptr);
++    }
++
++    LRESULT CALLBACK editProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
++    {
++        switch (msg) {
++        case WM_CREATE: {
++            g.font = CreateFontW(-16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
++                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
++                DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
++            g.edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", nullptr,
++                WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | WS_TABSTOP |
++                ES_MULTILINE | ES_WANTRETURN | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
++                0, 0, 0, 0, hwnd,
++                reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdEdit)),
++                GetModuleHandleW(nullptr), nullptr);
++            if (g.font) SendMessageW(g.edit, WM_SETFONT, (WPARAM)g.font, TRUE);
++            SetWindowTextW(g.edit, g.initial.c_str());
++            return 0;
++        }
++        case WM_SIZE: {
++            const int w = LOWORD(lParam), h = HIWORD(lParam);
++            constexpr int pad = 12, btnW = 96, btnH = 28, gap = 8;
++            int editH = h - btnH - pad * 3;
++            if (editH < 40) editH = 40;
++            if (g.edit) MoveWindow(g.edit, pad, pad, (std::max)(40, w - pad * 2), editH, TRUE);
++            int bx = w - pad - btnW;
++            const int by = h - btnH - pad;
++            HWND ok = GetDlgItem(hwnd, kIdOk);
++            HWND cancel = GetDlgItem(hwnd, kIdCancel);
++            HWND copy = GetDlgItem(hwnd, kIdCopyAll);
++            if (ok) MoveWindow(ok, bx, by, btnW, btnH, TRUE);
++            bx -= btnW + gap;
++            if (cancel) MoveWindow(cancel, bx, by, btnW, btnH, TRUE);
++            bx -= btnW + gap;
++            if (copy) MoveWindow(copy, bx, by, btnW, btnH, TRUE);
++            return 0;
++        }
++        case WM_COMMAND: {
++            const int id = LOWORD(wParam);
++            if (id == kIdOk) {
++                g.result = getEditContent(g.edit);
++                g.confirmed = true;
++                g.done = true;
++            }
++            else if (id == kIdCancel) {
++                g.done = true;
++            }
++            else if (id == kIdCopyAll) {
++                auto cur = getEditContent(g.edit);
++                if (!cur.empty()) Ling::Util::setTextToClipboard(cur);
++            }
++            return 0;
++        }
++        case WM_CLOSE:
++            g.done = true;
++            return 0;
++        case WM_DESTROY:
++            if (g.font) { DeleteObject(g.font); g.font = nullptr; }
++            g.hwnd = nullptr;
++            return 0;
++        }
++        return DefWindowProcW(hwnd, msg, wParam, lParam);
++    }
++}
++
++bool showTextEditDialog(HWND parent, std::wstring& text)
++{
++    static bool registered = false;
++    if (!registered) {
++        WNDCLASSEXW wc{ sizeof(WNDCLASSEXW) };
++        wc.style = CS_HREDRAW | CS_VREDRAW;
++        wc.lpfnWndProc = editProc;
++        wc.hInstance = GetModuleHandleW(nullptr);
++        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
++        wc.hbrBackground = (HBRUSH)(COLOR_3DFACE + 1);
++        wc.lpszClassName = kClassName;
++        if (!RegisterClassExW(&wc)) return false;
++        registered = true;
++    }
++
++    g = EditState{};
++    g.initial = text;
++    g.parent = parent;
++
++    RECT rc{};
++    if (parent && IsWindow(parent)) GetWindowRect(parent, &rc);
++    else { rc = RECT{ 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN) }; }
++    constexpr int ww = 720, wh = 520;
++    int wx = rc.left + ((rc.right - rc.left) - ww) / 2;
++    int wy = rc.top + ((rc.bottom - rc.top) - wh) / 2;
++    if (wx < 0) wx = 0;
++    if (wy < 0) wy = 0;
++
++    g.hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT,
++        kClassName, L"编辑识别文本",
++        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_SIZEBOX | WS_VISIBLE,
++        wx, wy, ww, wh, parent, nullptr, GetModuleHandleW(nullptr), nullptr);
++    if (!g.hwnd) return false;
++
++    // Buttons must exist before WM_CREATE returns (WM_SETFONT in WM_CREATE
++    // looks them up). Create them right after the top-level window is up.
++    makeButton(g.hwnd, L"复制全部", kIdCopyAll);
++    makeButton(g.hwnd, L"取消", kIdCancel);
++    makeButton(g.hwnd, L"确定", kIdOk);
++    if (g.font) {
++        for (int id : { kIdCopyAll, kIdCancel, kIdOk }) {
++            SendMessageW(GetDlgItem(g.hwnd, id), WM_SETFONT, (WPARAM)g.font, TRUE);
++        }
++    }
++    SendMessageW(g.hwnd, WM_SIZE, 0, MAKELPARAM(ww, wh));
++    SetFocus(g.edit);
++
++    const bool parentEnabled = parent && IsWindow(parent) && IsWindowEnabled(parent);
++    if (parentEnabled) EnableWindow(parent, FALSE);
++
++    // Modal loop. PeekMessage + WaitMessage avoids blocking forever after the
++    // window is destroyed (GetMessage would wait for a message that never comes).
++    MSG msg{};
++    while (!g.done) {
++        if (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
++            if (msg.message == WM_QUIT) {
++                PostQuitMessage((int)msg.wParam);  // pass through to the outer Ling loop
++                break;
++            }
++            if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) break;
++            // Ctrl+A in a multi-line EDIT is not handled by the control itself.
++            if (msg.message == WM_KEYDOWN && msg.wParam == 'A'
++                && (GetKeyState(VK_CONTROL) & 0x8000) != 0 && g.edit) {
++                SendMessageW(g.edit, EM_SETSEL, 0, -1);
++                continue;
++            }
++            // Only Tab goes through the dialog manager. Passing Enter to it
++            // would close the window instead of inserting a new line.
++            if (g.hwnd && msg.message == WM_KEYDOWN && msg.wParam == VK_TAB
++                && IsDialogMessageW(g.hwnd, &msg)) continue;
++            TranslateMessage(&msg);
++            DispatchMessageW(&msg);
++        }
++        else {
++            WaitMessage();
++        }
++    }
++
++    if (g.hwnd && IsWindow(g.hwnd)) DestroyWindow(g.hwnd);
++    if (parentEnabled) {
++        EnableWindow(parent, TRUE);
++        SetForegroundWindow(parent);
++    }
++    if (g.confirmed) text = std::move(g.result);
++    return g.confirmed;
++}
+diff --git a/ImageReader/OcrTextEdit.h b/ImageReader/OcrTextEdit.h
+new file mode 100644
+index 0000000..d0674c4
+--- /dev/null
++++ b/ImageReader/OcrTextEdit.h
+@@ -0,0 +1,7 @@
++#pragma once
++#include <Windows.h>
++#include <string>
++
++// Modal editor for the OCR result. Returns true only when the user confirms;
++// `text` then holds the edited content. Used by the right-click "Edit text" action.
++bool showTextEditDialog(HWND parent, std::wstring& text);
+diff --git a/ImageReader/WindowMain.cpp b/ImageReader/WindowMain.cpp
+index 9772d57..1e7ce84 100644
+--- a/ImageReader/WindowMain.cpp
++++ b/ImageReader/WindowMain.cpp
+@@ -6,9 +6,14 @@
+ #include "ImgViewer.h"
+ #include "TextBox.h"
+ #include "StatusBar.h"
++#include "OcrTextEdit.h"
+ 
+ namespace {
+     static std::unique_ptr<WindowMain> ins;
++    constexpr UINT kCmdCopySelection = 1001;
++    constexpr UINT kCmdCopyAll = 1002;
++    constexpr UINT kCmdSelectAll = 1003;
++    constexpr UINT kCmdEditText = 1004;
+ }
+ WindowMain::WindowMain() : Ling::WinBase()
+ {
+@@ -108,6 +113,9 @@ void WindowMain::onKey(UINT vk)
+     else if (vk == 'A') {
+         if (doc->selectAll()) doc->notifyChanged();
+     }
++    else if (vk == 'E') {
++        editText();
++    }
+ }
+ 
+ LRESULT WindowMain::onHitTest(const POINT pos)
+@@ -142,7 +150,10 @@ void WindowMain::onSetCursor(bool* flag)
+ 
+ void WindowMain::onDown(POINT pt, bool isRight)
+ {
+-    if (isRight) return;
++    if (isRight) {
++        showContextMenu(pt);
++        return;
++    }
+     if (!splitter->isPosIn(pt)) return;
+     // 落在 splitter 上：开始拖拽
+     isDragging = true;
+@@ -165,3 +176,61 @@ void WindowMain::onUp(POINT pt)
+     isDragging = false;
+     ReleaseCapture();
+ }
++
++void WindowMain::showContextMenu(POINT pt)
++{
++    auto doc = imgViewer ? imgViewer->getDoc() : nullptr;
++    const bool hasText = doc && !doc->empty();
++    const bool hasSel = doc && doc->hasSelection();
++
++    HMENU menu = CreatePopupMenu();
++    if (!menu) return;
++    AppendMenuW(menu, MF_STRING | (hasSel ? 0 : MF_GRAYED),
++        kCmdCopySelection, L"复制选中文本\tCtrl+C");
++    AppendMenuW(menu, MF_STRING | (hasText ? 0 : MF_GRAYED),
++        kCmdCopyAll, L"复制全部文本");
++    AppendMenuW(menu, MF_STRING | (hasText ? 0 : MF_GRAYED),
++        kCmdSelectAll, L"全选\tCtrl+A");
++    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
++    AppendMenuW(menu, MF_STRING | (hasText ? 0 : MF_GRAYED),
++        kCmdEditText, L"编辑文本...\tCtrl+E");
++
++    POINT screenPt = pt;   // onDown receives client coordinates
++    ClientToScreen(hwnd, &screenPt);
++    SetForegroundWindow(hwnd);
++    // TPM_RETURNCMD returns the chosen id synchronously, so no WM_COMMAND has
++    // to be routed through Ling's window procedure.
++    const int cmd = (int)TrackPopupMenuEx(menu,
++        TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_TOPALIGN,
++        screenPt.x, screenPt.y, hwnd, nullptr);
++    DestroyMenu(menu);
++
++    switch (cmd) {
++    case kCmdCopySelection:
++        if (hasSel) Ling::Util::setTextToClipboard(doc->getSelectedText());
++        break;
++    case kCmdCopyAll:
++        if (hasText) Ling::Util::setTextToClipboard(doc->getAllText());
++        break;
++    case kCmdSelectAll:
++        if (hasText && doc->selectAll()) doc->notifyChanged();
++        break;
++    case kCmdEditText:
++        editText();
++        break;
++    default:
++        break;
++    }
++}
++
++void WindowMain::editText()
++{
++    auto doc = imgViewer ? imgViewer->getDoc() : nullptr;
++    if (!doc || doc->empty()) return;
++    std::wstring text = doc->getAllText();
++    if (!showTextEditDialog(hwnd, text)) return;
++    doc->replaceText(text);
++    textBox->loadText(doc);   // rebuild text layouts for the edited content
++    doc->notifyChanged();     // repaint the selection surfaces on both sides
++    refresh();                // repaint the image-side overlay
++}
+diff --git a/ImageReader/WindowMain.h b/ImageReader/WindowMain.h
+index 9ba6d38..db4ad51 100644
+--- a/ImageReader/WindowMain.h
++++ b/ImageReader/WindowMain.h
+@@ -26,6 +26,9 @@ private:
+ 	void onMove(POINT pt);
+ 	void onUp(POINT pt);
+ 	void onKey(UINT vk);
++	// 右键菜单：复制选中 / 复制全部 / 全选 / 编辑文本
++	void showContextMenu(POINT pt);
++	void editText();
+ 	// 宿主程序（比如 ScreenCapture）用命令行把图丢过来，启动即识别
+ 	void loadImgFromArgs();
+ 	// 选区变化：两侧各自重画自己的 surface。不走 refresh()，

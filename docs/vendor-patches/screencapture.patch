@@ -1,0 +1,162 @@
+diff --git a/ScreenCapture/History.cpp b/ScreenCapture/History.cpp
+index 40e9e49..75e660f 100644
+--- a/ScreenCapture/History.cpp
++++ b/ScreenCapture/History.cpp
+@@ -68,6 +68,7 @@ ShapeBase* History::createShape(const std::wstring& state, const int& x, const i
+         result = shape.get();
+         shapes.push_back(std::move(shape));
+     }
++    if (!result) return nullptr;  // unknown tool state: never dereference null
+     result->mouseDown((float)x, (float)y);
+     return result;
+ }
+diff --git a/ScreenCapture/Win/WinBase.cpp b/ScreenCapture/Win/WinBase.cpp
+index 225df65..b52cfa8 100644
+--- a/ScreenCapture/Win/WinBase.cpp
++++ b/ScreenCapture/Win/WinBase.cpp
+@@ -222,13 +222,48 @@ LRESULT WinBase::winProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+         self->onMouseDown(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam), false);
+     }
+     else if (msg == WM_LBUTTONUP) {
+-        ReleaseCapture();
++        if (GetCapture() == hwnd) ReleaseCapture();
+         self->isMouseDown = false;
+         self->onMouseUp(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+     }
++    else if (msg == WM_CAPTURECHANGED) {
++        // A tool popup / tip window can steal the capture mid-stroke. Just
++        // clearing isMouseDown here leaves a half-drawn shape behind, and the
++        // stale shapeHover then swallows every following stroke. While the
++        // button is still held, take the capture back and keep drawing.
++        if (self->isMouseDown && (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0) {
++            if (GetCapture() != hwnd) SetCapture(hwnd);
++        }
++        else if (self->isMouseDown) {
++            self->isMouseDown = false;
++            POINT pt;
++            GetCursorPos(&pt);
++            ScreenToClient(hwnd, &pt);
++            self->onMouseUp(pt.x, pt.y);
++        }
++    }
++    else if (msg == WM_CANCELMODE) {
++        // System is cancelling a modal interaction: finish the stroke instead
++        // of leaving a pending drag state behind.
++        if (self->isMouseDown) {
++            self->isMouseDown = false;
++            POINT pt;
++            GetCursorPos(&pt);
++            ScreenToClient(hwnd, &pt);
++            self->onMouseUp(pt.x, pt.y);
++        }
++    }
+     else if (msg == WM_MOUSEMOVE) {
+         if (self->isMouseDown) {
+-            self->onMouseDrag(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam), wParam);
++            // Recover from a lost WM_LBUTTONUP (window switch, popup, etc.)
++            // instead of staying in drag mode with no button pressed.
++            if ((wParam & MK_LBUTTON) == 0 && (GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0) {
++                self->isMouseDown = false;
++                self->onMouseUp(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
++            }
++            else {
++                self->onMouseDrag(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam), wParam);
++            }
+         }
+         else {
+             self->mouseMove(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+diff --git a/ScreenCapture/Win/WinPin.cpp b/ScreenCapture/Win/WinPin.cpp
+index 85da076..a3e874c 100644
+--- a/ScreenCapture/Win/WinPin.cpp
++++ b/ScreenCapture/Win/WinPin.cpp
+@@ -376,12 +376,21 @@ void WinPin::updateToolLayout(bool subVisible)
+ 
+ void WinPin::bringTopmostToFront()
+ {
+-    POINT pt;
+-    GetCursorPos(&pt);
+-    LPARAM lParam = MAKELPARAM(pt.x - 6, pt.y - 6);
+-    PostMessage(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lParam);
+-    Sleep(60);
+-    PostMessage(hwnd, WM_LBUTTONUP, 0, lParam);
++    // Do NOT fake a pair of WM_LBUTTONDOWN/WM_LBUTTONUP here. Those posted
++    // messages race with the user's first real press and reset isMouseDown,
++    // which makes the very first stroke silently disappear.
++    // The window is already WS_EX_TOPMOST; just re-assert the z-order and
++    // lift the toolbars (separate top-level windows) along with it.
++    constexpr UINT flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW;
++    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags);
++    if (toolMain && toolMain->hwnd && IsWindow(toolMain->hwnd)) {
++        SetWindowPos(toolMain->hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags);
++    }
++    // ToolSub is hidden until a drawing tool is selected; do not force it visible.
++    if (toolSub && toolSub->hwnd && IsWindow(toolSub->hwnd) && IsWindowVisible(toolSub->hwnd)) {
++        SetWindowPos(toolSub->hwnd, HWND_TOPMOST, 0, 0, 0, 0,
++                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
++    }
+ }
+ 
+ void WinPin::restoreWindowState(HWND foregroundBeforeDialog)
+@@ -410,7 +419,15 @@ void WinPin::onCreated()
+ 
+ void WinPin::onMouseMove(const int& x, const int& y)
+ {
+-    if (toolMain->state == L"") return;
++    if (toolMain->state == L"") {
++        // Tool switched off (or restored after a right-click): a left-over
++        // hover would otherwise be reused by the next onMouseDown.
++        if (shapeHover) {
++            shapeHover = nullptr;
++            refresh();
++        }
++        return;
++    }
+     int i{ (int)(history->shapes.size() - 1) };
+     for (; i >= 0; i--)
+     {
+@@ -428,6 +445,7 @@ void WinPin::onMouseMove(const int& x, const int& y)
+     }
+     if (shapeHover) {
+         shapeHover = nullptr;
++        refresh();  // clear the stale dragger handles from the canvas
+     }
+ }
+ 
+@@ -439,6 +457,9 @@ void WinPin::onMouseDrag(const int& x, const int& y, const UINT_PTR& modifiers)
+         move(this->x, this->y);
+     }
+     else{
++        // A capture change can invalidate the hovered shape while the button is
++        // held. Ignore that move instead of dereferencing a stale/null hover.
++        if (!shapeHover) return;
+         shapeHover->mouseDrag((float)x, (float)y,modifiers);
+         refresh();
+     }
+@@ -481,10 +502,14 @@ void WinPin::onMouseDown(const int& x, const int& y, bool isRight)
+         toolMain->hide();
+         return;
+     }
+-    if (shapeHover) {
++    // Only reuse an existing shape when the press actually lands on one of its
++    // draggers. A shapeHover left over from an interrupted stroke would
++    // otherwise swallow every new stroke instead of creating a shape.
++    if (shapeHover && shapeHover->hoverDraggerIndex >= 0) {
+         shapeHover->mouseDown((float)x, (float)y);
+         return;
+     }
++    shapeHover = nullptr;
+     shapeHover = history->createShape(toolMain->state, x, y);
+ }
+ 
+@@ -505,6 +530,11 @@ void WinPin::onMouseUp(const int& x, const int& y)
+         refresh();
+         setTimer(800, timerID);
+     }
++    else {
++        // Stroke ended without a live shape (interrupt / unknown tool):
++        // still repaint so no half-drawn frame stays on screen.
++        refresh();
++    }
+ }
+ 
+ void WinPin::onMouseLeave()
