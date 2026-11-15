@@ -614,3 +614,60 @@ chatgpt/software 这类应用 exe 搜得慢而且有时根本不出现、行尾�
 
 - `aura exe` 首块 15–47ms；`weixinceshi` 全拼 0 命中（281ms = 磁盘层全扫，PY1 兼容路径）；
   中文探针直查命中（delta 新鲜度）；ctest 4/4。
+
+---
+
+## 十七、文件夹判别只认 "Folder"，d 搜索整片漏文件夹（2026-11-15）
+
+### 现场：用户搜 `d justbrowse` 只出来一个文件夹，机器上还有多个同名文件夹
+
+- 搜索历史台账：`2026-11-15 16:52:18 Q [WS] d justbrowse … rows=0`——目录后端 0 命中。
+  用户看到的那一个文件夹并非索引命中（后端当时一条文件夹都没返回）；具体来源未核实，不推断。
+- 当时生产快照不存在（`%LOCALAPPDATA%\Flowtary\index-C.fti` 缺失、FlowtaryIndexer 服务未装），
+  自动路由走 Windows Search 目录（SystemIndex）。
+
+### 根因：System.ItemType 的文件夹值实测是 "Directory"，代码只认 "Folder"
+
+- ADODB 直查目录取证：`SELECT … WHERE System.Kind='folder'` 抽样 400 条，真实文件夹
+  390 条 **ItemType 全部是 `Directory`**；`WHERE System.ItemType='Folder'` 全库 **0 条**。
+  （Kind='folder' 里另有 .zip/.lnk/.library-ms 等 10 条，它们是文件，ItemType 为扩展名。）
+- `df_search.cpp` 旧判别 `_wcsicmp(type, L"Folder")==0` 在本机目录上恒假 →
+  **所有文件夹都被判成文件**：`d`（只要文件夹）把它们全部过滤掉，`f`（只要文件）反而混入文件夹。
+  这是全局缺陷，justbrowse 只是用户撞见的现场。
+
+### 修复
+
+- 新增 `IsFolderItemType()`：`Directory` 与 `Folder` 都算文件夹（大小写不敏感），
+  其余值（扩展名、NULL、空串）一律按文件；`WsQueryImpl` 改用它。
+- `tests/existing_index_search_test.cpp` 钉住：Directory/Folder/大小写 → 文件夹；
+  .zip/.lnk/"File folder"/空/NULL → 文件。
+
+### 验证（真目录，非离线断言）
+
+- `wsquery -d justbrowse`：0 → **3 条 [D]**（Desktop\justbrowse 及其 A/W-JustBrowse 子目录）。
+- `wsquery justbrowse`（文件档）：只剩 .json 文件，不再混入文件夹。
+- ctest 9/9 通过；主程序与 wsquery 已用修复后源码重编。
+
+### 遗留边界（不是本 bug，不随本次修复改变）
+
+- `C:\workshop\w-justbrowse-0.2.0`、`AppData\Roaming\justbrowse` 等不在 Windows Search
+  默认索引范围，目录里根本没有它们的条目——修判别也搜不到。全覆盖要靠原生索引器
+  （生产采集尚未通过资源门槛，见 INDEXER_CPP_INTEGRATION.md / SEARCH_ENGINE_SELECTION.md）。
+- Flowtary 不创建索引、不改变系统索引范围（df_search.h 约定）；如需 WS 覆盖 workshop，
+  由用户在 Windows「索引选项」里自行添加位置。
+
+### 补覆盖的可行路径与当前门槛（2026-11-15 复核）
+
+- 旧守护进程的全盘索引 `diskindex.dat`（FTDISKIDX3，2,823,558 条，其中目录行 669,196）
+  仍在 `%LOCALAPPDATA%\Flowtary`，实测含 `c:\workshop\w-justbrowse-0.2.0\` 等缺失文件夹。
+  但它是 2026-11-03 的冻结快照，建库守护进程已随原生索引器接入而移除、不再更新——
+  只能作陈旧兜底，不能作为「搜索完善」的长期方案（新建文件夹搜不到、已删的会残留）。
+- 全覆盖的正路是原生索引器产出生产快照。其采集门槛 `native_host_violations`
+  （`indexer/src/policy.rs`）是**绝对基线硬门槛**：System 句柄 >10 万、非分页池 >2 GiB、
+  分页池 >4 GiB、可用内存 <2 GiB、提交率 >80%、压力 >90% 任一即拒绝；文档明确禁止放宽。
+- 2026-11-15 只读复测（`logs/indexer/host-baseline-20261115/`，metrics 不开卷不提权）：
+  主机已重启，11-04/05 记录的异常基线（约 252 万 System 句柄、9.8/5.7 GiB 池）已消失。
+  现仅「非分页池 2.22 GiB > 2 GiB」一项越线；句柄 28,267、分页池 3.06 GiB、
+  可用 9.05 GiB、提交率 0.565、压力 0.714 均健康。门槛比文档记载接近可通过得多。
+- 仍缺四步：非分页池回落到 2 GiB 内、真实 C 卷完整性验证、一次**经确认**的有界采集
+  （需 UAC 与用户点头）、快照原子发布。未点头前不启动采集、不放宽门槛、不拿陈旧快照冒充完整。

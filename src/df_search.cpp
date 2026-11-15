@@ -50,6 +50,12 @@ bool ContainsAny(const std::wstring& lower, const std::vector<std::wstring>& ter
     return false;
 }
 
+// System.ItemType 的文件夹判别：Win10/11 目录实测值是 "Directory"，部分版本/文档
+// 写作 "Folder"，两者都认。文件是扩展名（.zip/.lnk…）或 NULL，其余一律按文件。
+bool IsFolderItemType(const wchar_t* type) {
+    return type && (_wcsicmp(type, L"Folder") == 0 || _wcsicmp(type, L"Directory") == 0);
+}
+
 // COM æ¥å£å®å«ï¼ææ Releaseï¼éè¯¯è·¯å¾ä¸æ³æ¼
 template <class T>
 struct CI {
@@ -161,8 +167,8 @@ bool WsBuildSession(std::wstring* diag, HRESULT* hrOut) {
 }
 
 // ç»ä¸æ¥è¯¢å¥å£ãmaxRows éå¶æåè¡æ°ï¼æ¢æµç¨ 1ï¼çå®æ¥è¯¢ 400ï¼ã
-// æä»¶/æä»¶å¤¹å¤å«æ¾å¨å®¢æ·ç«¯ï¼System.ItemType == "Folder"ï¼èé SQL ç
-// <> 'Folder'ï¼æ æ©å±åæä»¶ç ItemType å¯è½ä¸º NULLï¼ä¸å¼é»è¾ä¼æ¼è¡ã
+// 文件/文件夹判别放在客户端（IsFolderItemType：Directory/Folder 都算文件夹）而非
+// SQL 的 <> 'Folder'：无扩展名文件的 ItemType 可能为 NULL，三值逻辑会漏行。
 // diag éç©ºæ¶éæ­¥è®°å½å¤±è´¥ç¹ä¸ HRESULTï¼åçå·¥å· wsquery --check ç¨ï¼ã
 int WsQueryImpl(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD maxRows,
                 std::wstring* diag) {
@@ -304,7 +310,7 @@ int WsQueryImpl(const Query& q, bool pathMode, std::vector<Hit>& out, DWORD maxR
                 if (!colOk(OFF_URL_ST)) url = L"";
                 if (!colOk(OFF_NAME_ST)) name = L"";
                 if (!colOk(OFF_TYPE_ST)) type = L"";
-                bool isFolder = _wcsicmp(type, L"Folder") == 0;
+                bool isFolder = IsFolderItemType(type);
                 if (q.isFile == isFolder) continue;  // f ææä»¶å¤¹ / d åªè¦æä»¶å¤¹
                 std::wstring path = ItemUrlToPath(url);
                 if (path.empty()) path = name ? name : L"";

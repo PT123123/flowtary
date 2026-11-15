@@ -55,6 +55,16 @@ int main() {
 
     Check(df::SqlEscape(L"a'b") == L"a''b", "catalog query quotes apostrophes");
     Check(df::ItemUrlToPath(L"file:///C:/fixture/a%20b.txt") == L"C:\\fixture\\a b.txt", "catalog URL decoding");
+    // Win10/11 目录里文件夹的 System.ItemType 实测是 "Directory"；只认 "Folder"
+    // 会把全部文件夹判成文件，d 搜索整片漏掉（2026-11-15 justbrowse 事故）。
+    Check(df::IsFolderItemType(L"Directory"), "catalog Directory entries are folders");
+    Check(df::IsFolderItemType(L"Folder"), "legacy Folder spelling remains a folder");
+    Check(df::IsFolderItemType(L"directory") && df::IsFolderItemType(L"FOLDER"),
+          "folder type comparison ignores case");
+    Check(!df::IsFolderItemType(L".zip") && !df::IsFolderItemType(L".lnk") &&
+          !df::IsFolderItemType(L"File folder"), "extension and other type values stay files");
+    Check(!df::IsFolderItemType(L"") && !df::IsFolderItemType(nullptr),
+          "missing ItemType stays a file");
     for (int i = 0; i < 32; ++i) {
         std::thread worker([] {
             APTTYPE apartment;
@@ -71,5 +81,5 @@ int main() {
         });
         worker.join();
     }
-    std::cout << "PASS: existing-index routing, bounded catalog fallback, cancellation, COM lifetime\n";
+    std::cout << "PASS: existing-index routing, bounded catalog fallback, folder type classification, cancellation, COM lifetime\n";
 }
