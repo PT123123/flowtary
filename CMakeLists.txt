@@ -114,6 +114,9 @@ else()
     target_include_directories(search_history_test PRIVATE src)
     target_link_libraries(search_history_test PRIVATE shell32)
     add_test(NAME search_history COMMAND search_history_test)
+    add_executable(search_policy_test tests/search_policy_test.cpp)
+    target_include_directories(search_policy_test PRIVATE src)
+    add_test(NAME search_policy COMMAND search_policy_test)
   endif()
 
   add_executable(flowtary WIN32

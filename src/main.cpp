@@ -3562,29 +3562,26 @@ static void PrependLearnedRows(const std::wstring& term) {
         std::wstring path;
         int count;
         long long last;
-        bool exact;   // 学习词与查询词完全一致（优先于前缀命中）
+        int rank;     // 学习词与查询词的匹配等级：精确 > 学习词前缀 > 查询词前缀
         bool isExe;
         bool isDir;
     };
     std::vector<Cand> cs;
-    size_t plen = term.size();
     for (auto& kv : g.learned) {
-        bool exact = kv.first == term;
-        if (!exact && (kv.first.size() <= plen ||
-                       wcsncmp(kv.first.c_str(), term.c_str(), plen) != 0))
-            continue;
+        int rank = ft::search::LearnedTermMatchRank(kv.first, term);
+        if (rank < 0) continue;
         for (auto& pv : kv.second) {
             if (!g.excludes.empty() && HasExcludeTerm(ToLowerW(pv.first))) continue;  // -关键字：学习项路径含排除词也不置顶
             DWORD attr = GetFileAttributesW(pv.first.c_str());
             if (attr == INVALID_FILE_ATTRIBUTES) continue;  // 目标暂不在：本次不展示
             bool isDir = (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
-            cs.push_back({pv.first, pv.second.count, pv.second.last, exact,
+            cs.push_back({pv.first, pv.second.count, pv.second.last, rank,
                           !isDir && EndsWithI(pv.first, L".exe"), isDir});
         }
     }
     if (cs.empty()) return;
     std::sort(cs.begin(), cs.end(), [](const Cand& a, const Cand& b) {
-        if (a.exact != b.exact) return a.exact;
+        if (a.rank != b.rank) return a.rank < b.rank;   // 匹配等级优先（精确 > 各类前缀）
         if (a.isExe != b.isExe) return a.isExe;   // exe 优先
         if (a.count != b.count) return a.count > b.count;
         return a.last > b.last;
