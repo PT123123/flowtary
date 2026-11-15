@@ -609,3 +609,24 @@ Run 31 数据位于 guest `logs/indexer/windows-sandbox-probe/indexer-vm-run-31/
 全窗口 pool tag 余额：`WCsc` 峰值较起点约 +12 KiB，`WCfc` +4 KiB，`FMwi` +4 KiB，`FMfc` 峰值 +101 KiB、结束 −33 KiB。重复第 4 轮的 8 秒窗口另有一次约 +1.03 GiB 提交量峰值及约 66 MiB/s 平均读写合计；它没有同步体现为目标四个 tag 的余额增长，而且采样不能识别分配者，因此作为未归因的整机/虚拟机瞬时峰值保留，不归给索引器。Sandbox 私有字节峰值也高于单轮测试；这项 VM 成本必须从产品实际运行成本中单独识别，不能把 Sandbox 负载曲线直接等同 Flowtary 自身成本。
 
 Run 32 输出：guest `logs/indexer/windows-sandbox-probe/indexer-vm-run-32/`（含 phase-history 与每轮报告）；整机和 1 秒 pool tag `logs/indexer/host-validation-goal-20261105-124100/host-sandbox-attribution-32/`；恢复窗口 `host-sandbox-attribution-32-recovery/`；保护门/boot time `host-sandbox-scale-32-preflight/`。目前这些重复扫描证据未显示 System 句柄或目标 wcifs/Filter Manager tag 随 5 轮初扫线性累积；它不能排除其他内核池标签、百万级真实卷形状或长时运行下的问题。
+
+## 2026-11-15：重启后无卷只读基线——异常绝对基线已消失，仅剩非分页池一项越线
+
+运行目录 `logs/indexer/host-baseline-20261115/`。只运行 `metrics`（8–10 秒、不开卷、不提权、不枚举），原始样本 `samples.jsonl`/`samples2.jsonl`，报告 `report2.json`。计数器错误 0。
+
+与 11-04/05 各节记录的异常绝对基线（System 句柄约 252 万、分页池约 9.8 GiB、非分页池约 5.7 GiB）相比，本机已重启，这些异常值全部消失：
+
+- System 句柄（`\Process(System)\Handle Count`）：**28,267**（门槛 ≤100,000，通过）。
+- 分页池：**3.06 GiB**（门槛 ≤4 GiB，通过）。
+- 非分页池：**2.22 GiB**（门槛 ≤2 GiB，**唯一越线项**，超约 0.22 GiB）。
+- 可用物理内存最低 **9.05 GiB**（≥2 GiB，通过）；提交率峰值 **0.565**（≤0.8，通过）；内存压力峰值 **0.714**（≤0.90，通过）。
+
+`native_host_violations` 现仅返回 `["nonpaged pool baseline exceeds 2 GiB"]`。即采集硬门槛从「三项绝对基线灾难性越线」收敛到「仅非分页池略超」；是否 transient 需在更空闲窗口复测确认。本轮没有打开卷、没有申请 UAC、没有运行采集，不构成对真实 C 卷采集的放行；真实卷完整性验证、经确认的有界采集与快照发布仍是前置条件。门槛本身不放宽。
+
+## 2026-11-15：纯 MFT 硬链接通道——C: 权限探针与真卷 VHD 验证
+
+为对标 Everything（MFT/USN、零目录遍历）把硬链接补名从逐文件 FindFirstFileNameW 改为纯 MFT 的 `FSCTL_GET_NTFS_FILE_RECORD`（base+extension 名称数量审计）。详见 `docs/SEARCH_ENGINE_SELECTION.md` 同日节。
+
+- C: 权限探针（提权，`logs/indexer/host-C-mft-privilege-fix-20261115-01/`，二进制 SHA256 ED55BCC2…）：在 `for_test` 开卷前补调 `enable_volume_privileges()` 后，`$MFT` 流打开仍 error 5、OpenFileById 仍 error 5、QUERY_FILE_LAYOUT 仍 error 50；`FSCTL_GET_NTFS_FILE_RECORD` 成功读出含 2 个硬链接名的 FILE 记录。结论：error 5 非缺备份权限（该判断已撤回），C: 第三方安全 minifilter（sysdiag/lrtp/LnvMSRIO 等）疑似拦截批量 $MFT/QUERY_FILE_LAYOUT；逐 FRN MFT 记录读可用。
+- 真卷 VHD 验证（`logs/indexer/host-vhd-pure-mft-20261115-01/`，`-VerifyInitialResume` 生产纯 MFT 路径）：exit 0、completed；初建查 flowtary exe 返回 3 名（含跨目录硬链接 alias），断点续建/USN 监听/增删改/回放/硬链接审计全过。io：hardlink_name_requests=0、file_record_requests=259、directory_handles_opened=0、directory_batch_requests=0。Rust 离线 48 项通过。
+- 本轮仅打开授权测试 VHD 与 C: 单记录探针，未做 C 卷全量采集；native_host_violations 门槛未放宽（非分页池仍略超）。

@@ -141,6 +141,7 @@ impl Catalog {
     }
     /// Resolve the volume-relative link names returned by
     /// FindFirstFileNameW/FindNextFileNameW back to exact parent FRNs.
+    #[cfg(test)]
     pub fn layout_name_for_api_link(&self, link:&[u16]) -> Result<LayoutName> {
         ensure!(link.len()>=2 && link.len()<=32767 && link[0]==b'\\' as u16,
             "hard-link API returned a non-rooted or oversized volume-relative name");

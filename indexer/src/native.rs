@@ -294,28 +294,37 @@ impl NativeSource {
         stats.hardlink_name_elapsed_us=stats.hardlink_name_elapsed_us.saturating_add(started.elapsed().as_micros() as u64);
         result
     }
-    /// Resolve every hard-link name for an already-indexed file. The supplied
-    /// path is checked against the API's returned volume-relative link set so
-    /// a reparse traversal to a different target fails closed.
-    pub fn file_layout_by_path_api(&mut self,catalog:&crate::catalog::Catalog,frn:Frn)->Result<LayoutFile> {
-        let path=catalog.api_path_for_frn(frn)?;
-        ensure!(path.len()>=3,"resolved API path has no drive root");
-        let expected=&path[2..];
-        let returned=self.enumerate_hardlink_paths(&path).with_context(||format!(
-            "enumerate hard-link names for FRN {:#018X} at {}",frn.0,String::from_utf16_lossy(&path)))?;
-        ensure!(!returned.is_empty() && returned.iter().any(|name|name.as_slice()==expected),
-            "hard-link API output does not contain the indexed input path; possible path race or reparse redirection");
-        let mut seen=std::collections::HashSet::new();let mut names=Vec::with_capacity(returned.len());
-        for link in returned {
+    /// Pure-MFT hard-link reconciliation. Reads the base FILE record and any
+    /// attribute-list extension records through FSCTL_GET_NTFS_FILE_RECORD and
+    /// returns every FILE_NAME attribute. No per-file handle is opened and no
+    /// directory is enumerated. This is the Everything-class channel that still
+    /// works on hosts whose minifilters deny raw $MFT reads / QUERY_FILE_LAYOUT.
+    fn file_layout_by_mft_record(&mut self,frn:Frn)->Result<LayoutFile> {
+        let fragment=self.mft_name_fragment(frn)?
+            .context("MFT base record vanished during hard-link reconciliation")?;
+        ensure!(fragment.is_base,"hard-link reconciliation requires the base FILE record");
+        ensure!(fragment.extension_records.len()<=1024,"MFT extension-record budget exceeded");
+        let expected=fragment.base_link_count;
+        let extensions=fragment.extension_records.clone();
+        let mut observed=fragment.file_name_attributes;
+        let mut names=fragment.names;
+        let mut seen=std::collections::HashSet::new();
+        for extension_frn in &extensions {
             self.cancel.check()?;
-            let resolved=catalog.layout_name_for_api_link(&link)?;
-            ensure!(seen.insert((resolved.parent_frn,resolved.name.clone())),"hard-link API returned a duplicate name");
-            names.push(resolved);
+            ensure!(seen.insert(extension_frn.0),"duplicate MFT extension FILE reference");
+            let extension=self.mft_name_fragment(*extension_frn)?
+                .with_context(||format!("MFT extension record {extension_frn:?} vanished during hard-link reconciliation"))?;
+            ensure!(!extension.is_base && extension.owner==frn,"MFT extension record does not belong to the requested base");
+            observed=observed.checked_add(extension.file_name_attributes)
+                .context("MFT FILE_NAME attribute count overflow")?;
+            names.extend(extension.names);
         }
-        let idx=catalog.index.head_of(frn).ok_or_else(||anyhow::anyhow!("file disappeared from the private catalog"))?;
-        let entry=catalog.index.entry(idx);
-        ensure!(!entry.is_dir() && !catalog.index.is_synthetic(idx),"path-based hard-link reconciliation requires a real file");
-        Ok(LayoutFile {frn,attributes:0,size:entry.size(),mtime_ft:entry.mtime(),names})
+        if let Some(expected)=expected {
+            ensure!(observed==usize::from(expected),
+                "MFT FILE_NAME coverage incomplete for {frn:?}: observed {observed}, base hard-link count {expected}");
+        }
+        ensure!(!names.is_empty(),"MFT record returned no searchable names");
+        Ok(LayoutFile {frn,attributes:0,size:None,mtime_ft:None,names})
     }
     /// Bounded probe of the documented path-based NTFS hard-link enumeration API.
     /// The caller must provide one explicit file path from an authorized test volume.
@@ -559,6 +568,11 @@ impl NativeSource {
     pub fn for_test(path: &Path, sample: &Sample, cancel: Cancellation,mode:TestMode) -> Result<(Self,VolumeMeta)> {
         let manifest: Manifest = serde_json::from_slice(&std::fs::read(path)?).context("read isolation manifest")?;
         let permit = preflight(manifest,sample,mode)?;
+        // Everything-class $MFT/journal access needs SeBackupPrivilege +
+        // SeManageVolumePrivilege enabled on the elevated token before the
+        // volume is opened; without them $MFT stream/file-ID opens fail with
+        // ERROR_ACCESS_DENIED. Fail closed rather than scan unprivileged.
+        goz_winfs::enable_volume_privileges().context("enable SeBackupPrivilege/SeManageVolumePrivilege before volume access")?;
         let force_enum_usn=permit.manifest.force_enum_usn;
         let directory_link_walk=permit.manifest.directory_link_walk;
         cancel.check()?;
@@ -977,13 +991,13 @@ impl MetadataSource for NativeSource {
         };
         walk_layout_buffer(&self.buf[..n])?.into_iter().find(|f| f.frn == frn).context("requested file ID was not returned")
     }
-    fn file_layout_with_catalog(&mut self,frn:Frn,catalog:&crate::catalog::Catalog)->Result<LayoutFile> {
-        if self.enum_layout_active { return self.file_layout_by_path_api(catalog,frn) }
+    fn file_layout_with_catalog(&mut self,frn:Frn,_catalog:&crate::catalog::Catalog)->Result<LayoutFile> {
+        if self.enum_layout_active { return self.file_layout_by_mft_record(frn) }
         match self.file_layout(frn) {
             Ok(file)=>Ok(file),
             Err(error) if error.downcast_ref::<goz_winfs::WinError>().is_some_and(|e|e.code==50) => {
                 self.enum_layout_active=true;
-                self.file_layout_by_path_api(catalog,frn)
+                self.file_layout_by_mft_record(frn)
             }
             Err(error)=>Err(error),
         }
@@ -1023,7 +1037,7 @@ impl MetadataSource for NativeSource {
                     self.enum_link_cursor=Some(frn.0);
                     continue;
                 }
-                let file=self.file_layout_by_path_api(catalog,*frn)?;
+                let file=self.file_layout_by_mft_record(*frn)?;
                 let mut targets=Vec::with_capacity(file.names.len());
                 for name in file.names {
                     let parent=catalog.index.head_of(name.parent_frn)
