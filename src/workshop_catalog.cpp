@@ -26,10 +26,14 @@ struct FindHandle {
 struct PendingDirectory { std::wstring path; unsigned depth = 0; };
 struct CachedPath { std::wstring path, foldedPath; };
 using CatalogSnapshot = std::vector<CachedPath>;
+struct CatalogData {
+    CatalogSnapshot files;   // .exe descendants (f-search)
+    CatalogSnapshot folders; // immediate child directories (d-search)
+};
 struct Cache {
     std::mutex mutex;
     std::mutex refreshMutex;
-    std::shared_ptr<const CatalogSnapshot> paths;
+    std::shared_ptr<const CatalogData> data;
     WorkshopWarmupSummary summary;
     ULONGLONG attemptedAt = 0;
 };
@@ -76,24 +80,43 @@ bool IsReparseDirectory(const std::wstring& path, DWORD& error) {
 bool RefreshCache(Cache& cache, const std::atomic<bool>* cancelled, bool force,
                   WorkshopWarmupSummary* summary);
 
-bool Snapshot(std::shared_ptr<const CatalogSnapshot>& paths, bool refreshIfStale) {
+bool Snapshot(std::shared_ptr<const CatalogData>& data, bool refreshIfStale) {
     Cache& cache = SharedCache();
     bool refreshNeeded = false;
     {
         std::lock_guard<std::mutex> lock(cache.mutex);
-        paths = cache.paths;
-        refreshNeeded = paths && refreshIfStale && GetTickCount64() - cache.attemptedAt >= kRefreshMilliseconds;
+        data = cache.data;
+        refreshNeeded = data && refreshIfStale && GetTickCount64() - cache.attemptedAt >= kRefreshMilliseconds;
     }
     if (refreshNeeded) {
         try { std::thread([&cache] { RefreshCache(cache, nullptr, true, nullptr); }).detach(); }
         catch (...) { /* Keep serving the immutable cached snapshot if scheduling fails. */ }
         return true;
     }
-    if (paths) return true;
+    if (data) return true;
     if (!RefreshCache(cache, nullptr, false, nullptr)) return false;
     std::lock_guard<std::mutex> lock(cache.mutex);
-    paths = cache.paths;
-    return !!paths;
+    data = cache.data;
+    return !!data;
+}
+
+// Immediate child directories of the workshop root. One FindFirstFile pass;
+// each is an application release folder such as "taskinformer-0.1.41".
+static std::vector<std::wstring> ScanWorkshopFolders(const std::wstring& root) {
+    std::vector<std::wstring> folders;
+    const std::wstring pattern = root + L"\\*";
+    WIN32_FIND_DATAW data{};
+    FindHandle find;
+    find.value = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &data,
+                                  FindExSearchNameMatch, nullptr, 0);
+    if (find.value == INVALID_HANDLE_VALUE) return folders;
+    do {
+        if (data.cFileName[0] == L'.') continue;   // "." and ".."
+        if (!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        if (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+        folders.push_back(root + L"\\" + data.cFileName);
+    } while (FindNextFileW(find.value, &data));
+    return folders;
 }
 
 bool RefreshCache(Cache& cache, const std::atomic<bool>* cancelled, bool force,
@@ -102,10 +125,10 @@ bool RefreshCache(Cache& cache, const std::atomic<bool>* cancelled, bool force,
     {
         std::lock_guard<std::mutex> lock(cache.mutex);
         const ULONGLONG now = GetTickCount64();
-        if (cache.paths && !force) { if (summary) *summary = cache.summary; return true; }
+        if (cache.data && !force) { if (summary) *summary = cache.summary; return true; }
         if (cache.attemptedAt && now - cache.attemptedAt < kRefreshMilliseconds) {
             if (summary) *summary = cache.summary;
-            return !!cache.paths;
+            return !!cache.data;
         }
         cache.attemptedAt = now;
     }
@@ -118,12 +141,18 @@ bool RefreshCache(Cache& cache, const std::atomic<bool>* cancelled, bool force,
         if (summary) *summary = result;
         return false;
     }
-    auto next = std::make_shared<CatalogSnapshot>();
-    next->reserve(scanned.paths.size());
-    for (auto& path : scanned.paths) next->push_back({std::move(path), {}});
-    for (auto& entry : *next) entry.foldedPath = Lower(entry.path);
+    auto next = std::make_shared<CatalogData>();
+    next->files.reserve(scanned.paths.size());
+    for (auto& path : scanned.paths) next->files.push_back({std::move(path), {}});
+    for (auto& entry : next->files) entry.foldedPath = Lower(entry.path);
+    for (auto& path : ScanWorkshopFolders(kWorkshopRoot)) {
+        CachedPath entry;
+        entry.foldedPath = Lower(path);
+        entry.path = std::move(path);
+        next->folders.push_back(std::move(entry));
+    }
     std::lock_guard<std::mutex> lock(cache.mutex);
-    cache.paths = std::move(next);
+    cache.data = std::move(next);
     cache.summary = result;
     if (summary) *summary = result;
     return true;
@@ -221,11 +250,17 @@ WorkshopScan ScanWorkshopExecutables(const std::wstring& root, WorkshopLimits li
 
 int WorkshopCatalogQuery(const Query& query, std::vector<Hit>& out) {
     out.clear();
-    if (!query.isFile || query.words.empty()) return 0;
-    std::shared_ptr<const CatalogSnapshot> paths;
-    if (!Snapshot(paths, true)) return -1;
-    for (const auto& entry : *paths) {
-        if (WorkshopQueryMatchesPath(query, entry.path)) out.push_back({entry.path, false, true});
+    if (query.words.empty()) return 0;
+    std::shared_ptr<const CatalogData> data;
+    if (!Snapshot(data, true)) return -1;
+    if (query.isFile) {
+        for (const auto& entry : data->files) {
+            if (WorkshopQueryMatchesPath(query, entry.path)) out.push_back({entry.path, false, true});
+        }
+    } else {
+        for (const auto& entry : data->folders) {
+            if (WorkshopFolderMatchesPath(query, entry.path)) out.push_back({entry.path, true, true});
+        }
     }
     return static_cast<int>(out.size());
 }
@@ -239,6 +274,27 @@ bool WorkshopQueryMatchesPath(const Query& query, const std::wstring& rawPath) {
 
     for (const auto& word : query.words) {
         if (!word.empty() && !TermMatchesPath(word, path)) return false;
+    }
+    for (const auto& exclude : query.excludes) {
+        if (!exclude.empty() && path.find(Lower(NormalizeSeparators(exclude))) != std::wstring::npos) return false;
+    }
+    return true;
+}
+
+bool WorkshopFolderMatchesPath(const Query& query, const std::wstring& rawPath) {
+    if (query.isFile || query.words.empty()) return false;
+    const std::wstring path = Lower(NormalizeSeparators(rawPath));
+    const std::wstring root = Lower(kWorkshopRoot);
+    // Must be an immediate child of C:\workshop: no further separator after root.
+    if (path.size() <= root.size() + 1 || path.compare(0, root.size(), root) != 0 ||
+        path[root.size()] != L'\\' ||
+        path.find(L'\\', root.size() + 1) != std::wstring::npos) return false;
+
+    const std::wstring leaf = path.substr(root.size() + 1);
+    for (const auto& word : query.words) {
+        if (word.empty()) continue;
+        const std::wstring term = Lower(NormalizeSeparators(word));
+        if (leaf.find(term) == std::wstring::npos) return false;
     }
     for (const auto& exclude : query.excludes) {
         if (!exclude.empty() && path.find(Lower(NormalizeSeparators(exclude))) != std::wstring::npos) return false;

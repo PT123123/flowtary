@@ -27,6 +27,30 @@ int main() {
     Check(!df::WorkshopQueryMatchesPath(query, L"C:\\workshop\\Flowtary-1.2.exe"),
           "excludes are applied to the complete custom path");
 
+    // d-search: immediate application folders under C:\workshop (seconds-out source).
+    df::Query folder;
+    folder.isFile = false;
+    folder.words = {L"taskinformer"};
+    Check(df::WorkshopFolderMatchesPath(folder, L"C:\\workshop\\taskinformer-0.1.41"),
+          "folder query matches an immediate release directory by name");
+    Check(df::WorkshopFolderMatchesPath(folder, L"C:/WORKSHOP/TASKINFORMER-0.1.41"),
+          "folder matching is case-insensitive and normalizes separators");
+    Check(!df::WorkshopFolderMatchesPath(folder, L"C:\\workshop\\foo\\taskinformer-0.1.41"),
+          "folder query rejects non-immediate (nested) directories");
+    Check(!df::WorkshopFolderMatchesPath(folder, L"C:\\workshop-old\\taskinformer-0.1.41"),
+          "folder query rejects sibling path prefixes");
+    Check(!df::WorkshopFolderMatchesPath(folder, L"C:\\workshop\\taskinformer-0.1.41\\x.exe"),
+          "folder query rejects files");
+    folder.words = {L"alpha", L"beta"};
+    Check(df::WorkshopFolderMatchesPath(folder, L"C:\\workshop\\alpha-beta-1.0") &&
+          !df::WorkshopFolderMatchesPath(folder, L"C:\\workshop\\alpha-1.0"),
+          "folder query ANDs all words");
+    folder.excludes = {L"beta"};
+    Check(!df::WorkshopFolderMatchesPath(folder, L"C:\\workshop\\alpha-beta-1.0"),
+          "folder query applies excludes");
+    Check(!df::WorkshopFolderMatchesPath(query /* isFile=true */, L"C:\\workshop\\taskinformer-0.1.41"),
+          "file query never matches folders");
+
     wchar_t temp[MAX_PATH]{};
     Check(GetTempPathW(MAX_PATH, temp) != 0, "temporary directory available");
     std::wstring root = std::wstring(temp) + L"FlowtaryWorkshopTest-" + std::to_wstring(GetCurrentProcessId());

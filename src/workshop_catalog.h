@@ -31,13 +31,17 @@ struct WorkshopWarmupSummary {
     DWORD error = ERROR_SUCCESS;
 };
 
-// This Flowtary-owned rule is deliberately scoped to C:\workshop\*.exe.
+// This Flowtary-owned rule is deliberately scoped to C:\workshop.
 bool WorkshopCatalogAvailable();
 WorkshopWarmupSummary WorkshopCatalogWarmup(const std::atomic<bool>* cancelled = nullptr);
 WorkshopScan ScanWorkshopExecutables(const std::wstring& root, WorkshopLimits limits = {},
                                      const std::atomic<bool>* cancelled = nullptr);
+// Matches .exe files (query.isFile=true) or the immediate application folders
+// directly under C:\workshop (query.isFile=false, d-search). Both are served
+// from the in-memory catalog; neither enumerates the directory tree per query.
 int WorkshopCatalogQuery(const Query& query, std::vector<Hit>& out);
-// Pure matcher used by the catalog and its regression tests. Matches only
-// canonical descendants of C:\workshop with a final .exe component.
+// Pure matcher for .exe descendants of C:\workshop (kept for regression tests).
 bool WorkshopQueryMatchesPath(const Query& query, const std::wstring& path);
+// Pure matcher for immediate child directories of C:\workshop (d-search).
+bool WorkshopFolderMatchesPath(const Query& query, const std::wstring& path);
 } // namespace df

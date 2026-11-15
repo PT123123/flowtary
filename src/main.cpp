@@ -1369,12 +1369,49 @@ static void StartFlowtaryIndexSearch() {
     }
 }
 
+// 把一条索引命中转换成展示行（与 HandleDfReply 同一套规则：标题=末段、副标题=父目录、
+// 排除词与全局排除路径过滤）。预填与异步回复共用，保证两路结果形态一致。
+static bool MakeDfRow(const df::Hit& h, Row& row) {
+    if (HasExcludeTerm(ToLowerW(h.path))) return false;
+    row = Row{};
+    row.kind = h.isFolder ? Row::Folder : Row::File;
+    row.action = h.path;
+    row.workshopHit = h.workshop;
+    size_t p = h.path.find_last_of(L'\\');
+    if (p == std::wstring::npos || p + 1 == h.path.size()) {
+        row.title = h.path;
+    } else {
+        row.title = h.path.substr(p + 1);
+        row.sub = h.path.substr(0, p);
+        if (row.sub.size() == 2 && row.sub[1] == L':') row.sub += L'\\';
+    }
+    if (row.title.empty()) row.title = h.path;
+    return !IsPathExcluded(row.action, true);
+}
+
 static void StartWindowsSearch(ft::search::Route route) {
     g.searchRoute = route;
     g.dfWsDone = false;
     g.dfWsFailed = false;
     g.dfBaseRows.clear();
     ArmHistoryClock(L"WS");
+
+    // 自动路由且没有 Flowtary 全盘快照时，WS 查询实测 2–13 秒。C:\workshop 是本机
+    // 自有、已 warmed 的内存目录：先把它的命中同步上屏（毫秒级），慢速 WS 结果
+    // 回来后 HandleDfReply 会按路径去重合并——这才是「workshop 秒出」的原意。
+    // 只对 Route::WindowsSearch 生效：显式「仅 WS」用户不要本地目录，其它路由自带后端。
+    if (route == ft::search::Route::WindowsSearch && df::WorkshopCatalogAvailable() &&
+        !g.dfQuery.words.empty()) {
+        std::vector<df::Hit> prefilled;
+        if (df::WorkshopCatalogQuery(g.dfQuery, prefilled) > 0) {
+            for (const auto& h : prefilled) {
+                Row row;
+                if (MakeDfRow(h, row)) g.dfBaseRows.push_back(std::move(row));
+            }
+        }
+        if (!g.dfBaseRows.empty()) RenderDfResults();  // 首屏立即呈现，dwWsDone 仍 false
+    }
+
     if (!WsEnqueue(g.dfGen.load(), g.dfQuery, route)) {
         g.dfWsDone = g.dfWsFailed = true;
         RenderDfResults();
