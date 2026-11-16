@@ -44,6 +44,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // comctl6：让公共控件（编辑框滚动条/组合框）走现代主题，配合 DarkMode_* 变体变暗
@@ -940,6 +941,42 @@ static void CopyAppCatalog(ft::apps::Result catalog,ProgramBuildReply& reply) {
 }
 static void BuildProgramsInto(ProgramBuildReply& reply,const std::atomic<bool>* stop) {
     CopyAppCatalog(ft::apps::Collect({},stop),reply);
+}
+
+// 目录扫描受预算截断时，权重表里点过多次的条目可能压根没被枚举到，
+// 这时"常用"只影响排序、救不回一个不在表里的程序。用权重/自学习的
+// 跨词累计次数把高频且仍存在的 exe/lnk 补回程序表，让搜索真正能兜底。
+// 只在主线程调用（读 g.weights / g.learned，并写 reply.programs）。
+static void RestoreFrequentPrograms(ProgramBuildReply& reply,bool catalogTruncated) {
+    if(!catalogTruncated)return;
+    std::vector<std::pair<std::wstring,int>> candidates;
+    candidates.reserve(g.weightCount+g.learnCount);
+    for(auto& kv:g.weights)
+        for(auto& pv:kv.second)candidates.emplace_back(pv.first,pv.second);
+    for(auto& kv:g.learned)
+        for(auto& pv:kv.second)candidates.emplace_back(pv.first,pv.second.count);
+    auto hot=ft::search::TopWeightedPaths(candidates,2,64);
+    if(hot.empty())return;
+    std::unordered_set<std::wstring> known;
+    known.reserve(reply.programs.size());
+    for(const auto& p:reply.programs)known.insert(ToLowerW(p.path));
+    for(const auto& hit:hot){
+        if(known.count(ToLowerW(hit.first)))continue;
+        DWORD attr=GetFileAttributesW(hit.first.c_str());
+        if(attr==INVALID_FILE_ATTRIBUTES || (attr&FILE_ATTRIBUTE_DIRECTORY))continue;
+        const bool isLnk=EndsWithI(hit.first,L".lnk");
+        if(!isLnk && !EndsWithI(hit.first,L".exe"))continue;
+        size_t slash=hit.first.find_last_of(L"\\/");
+        std::wstring name=(slash==std::wstring::npos)?hit.first:hit.first.substr(slash+1);
+        if(isLnk && name.size()>4)name.resize(name.size()-4);
+        if(name.empty())continue;
+        Program p;
+        p.name=std::move(name);
+        p.path=hit.first;
+        p.startMenu=isLnk;  // 与目录扫描一致：快捷方式交给 Shell 打开，工作目录留空
+        known.insert(ToLowerW(p.path));
+        reply.programs.push_back(std::move(p));
+    }
 }
 
 // 启动扫描放到工作线程：托盘图标先就位并可响应（右键显示「正在启动中」），
@@ -3399,8 +3436,11 @@ static void RecordLearned(const Row& r) {
 
     bool isFolder = (r.kind == Row::Folder);
     bool isExe = !isFolder && EndsWithI(path, L".exe");
-    if (g.learnScope == 0 && !isExe) return;
-    if (g.learnScope == 1 && !isExe && !isFolder) return;
+    // 程序快捷方式（.lnk）与 exe 等价：开始菜单里绝大多数入口都是 lnk，
+    // 旧逻辑只认 exe，导致"经常从 lnk 启动的程序"永远学不进记忆。
+    bool isProgramLink = !isFolder && EndsWithI(path, L".lnk");
+    if (g.learnScope == 0 && !isExe) return;  // 「仅 exe」维持原义
+    if (g.learnScope == 1 && !isExe && !isFolder && !isProgramLink) return;
 
     auto& m = g.learned[term];
     auto it = m.find(path);
@@ -3669,6 +3709,7 @@ static void PrependLearnedRows(const std::wstring& term) {
         r.kind = c.isDir ? Row::Folder : Row::File;
         size_t s = c.path.find_last_of(L"\\/");
         r.title = (s == std::wstring::npos) ? c.path : c.path.substr(s + 1);
+        if (!c.isDir && EndsWithI(r.title, L".lnk")) r.title.resize(r.title.size() - 4);  // 程序快捷方式显示应用名
         r.sub = c.path;
         r.action = c.path;
         // 插在「一键组」行之后（显式关键字命中的组动作保持最高位）
@@ -4473,6 +4514,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             ProgramBuildReply* p = (ProgramBuildReply*)lParam;
             if (p) {
                 g.items.erase(std::remove_if(g.items.begin(),g.items.end(),[](const Row& r){return r.kind==Row::Prog;}),g.items.end());
+                RestoreFrequentPrograms(*p,p->stats.truncated);  // 截断时用高频权重补回漏扫的程序
                 g.programs = std::move(p->programs);
                 s_programCatalogStats=std::move(p->stats);
                 s_programIcons.Reset(++s_programGeneration);

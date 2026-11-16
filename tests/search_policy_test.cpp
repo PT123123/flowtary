@@ -43,6 +43,36 @@ int main() {
           LearnedTermMatchRank(L"workshop", L"work") < LearnedTermMatchRank(L"work", L"workshop"),
           "rank ordering exact < forward < reverse");
 
+    // Catalog-truncation fallback: fold per-term weights into per-path totals,
+    // keep only genuinely frequent paths, hottest first.
+    using ft::search::TopWeightedPaths;
+    {
+        auto hot = TopWeightedPaths({
+            {L"C:\\a\\valorant.lnk", 3}, {L"C:\\a\\valorant.lnk", 4},   // 7 across two terms
+            {L"C:\\a\\once.exe", 1},                                    // clicked once: noise
+            {L"C:\\a\\editor.exe", 2},
+        });
+        Check(hot.size() == 2 && hot[0].first == L"C:\\a\\valorant.lnk" &&
+              hot[0].second == 7 && hot[1].first == L"C:\\a\\editor.exe" &&
+              hot[1].second == 2, "per-term weights fold into one hot path");
+    }
+    {
+        auto none = TopWeightedPaths({{L"C:\\a\\once.exe", 1}});
+        Check(none.empty(), "single click is not frequent enough to restore");
+    }
+    {
+        auto capped = TopWeightedPaths({
+            {L"C:\\a\\p1.exe", 9}, {L"C:\\a\\p2.exe", 8}, {L"C:\\a\\p3.exe", 7},
+        }, 2, 2);
+        Check(capped.size() == 2 && capped[0].first == L"C:\\a\\p1.exe" &&
+              capped[1].first == L"C:\\a\\p2.exe", "restore list respects the cap");
+    }
+    {
+        auto tied = TopWeightedPaths({{L"C:\\b\\z.exe", 5}, {L"C:\\a\\a.exe", 5}});
+        Check(tied.size() == 2 && tied[0].first == L"C:\\a\\a.exe" &&
+              tied[1].first == L"C:\\b\\z.exe", "equal weights sort by path");
+    }
+
     if (g_fail) { std::printf("\n%d FAILED\n", g_fail); return 1; }
     std::printf("\nall passed\n");
     return 0;

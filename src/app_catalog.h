@@ -16,10 +16,13 @@
 namespace ft::apps {
 struct Entry { std::wstring name, path, target; bool startMenu=false; };
 struct Limits {
-    size_t maxEntries=4096, maxInspected=8192, maxDirectories=256;
+    // 预算放宽到能覆盖常见机器：开始菜单 280+ 快捷方式、App Paths 注册项、
+    // AppsFolder 300+ 项。旧预算 1.5s/4096/8MB 会让排在后面的应用被漏扫，
+    // 搜索再常用也救不回一个根本没进表的条目。扫描仍在工作线程、托盘不阻塞。
+    size_t maxEntries=8192, maxInspected=16384, maxDirectories=512;
     unsigned maxDepth=6;
-    ULONGLONG maxMilliseconds=1500;
-    size_t maxEstimatedBytes=8*1024*1024;
+    ULONGLONG maxMilliseconds=3000;
+    size_t maxEstimatedBytes=16*1024*1024;
 };
 struct Stats {
     size_t inspected=0, directories=0, registrationKeys=0, shellItems=0, duplicates=0;
