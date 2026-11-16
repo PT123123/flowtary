@@ -225,6 +225,7 @@ struct App {
     std::wstring qPendingLayer;
     std::wstring qMissed;          // 本轮到最近一次上屏为止还没报齐的层（空=报齐）
     int qWsRows = 0;               // Windows Search 层行数
+    int qSettledMs = -1;           // 本轮报齐时定格的总耗时（-1=还没报齐）；底栏非秒出时显示
     bool startingUp = true;    // 程序扫描尚未完成：托盘提示/右键菜单显示「正在启动中」
     Theme* theme = nullptr;
     std::vector<Star> stars;   // 星空主题星点坐标
@@ -315,6 +316,8 @@ struct App {
 } g;
 
 constexpr int kBaseW = 600, kBaseInputH = 56, kBaseRowH = 30, kBasePad = 12;
+constexpr int kBaseFooterH = 22;  // 耗时底栏逻辑高度（仅非秒出时出现）
+constexpr int kSlowMs = 120;      // 超过这个毫秒数才报耗时；秒出的查询保持干净
 constexpr int kFontMin = 11, kFontMax = 24;  // 字体池逻辑字号范围
 constexpr UINT_PTR kTimerDebounce = 1;
 constexpr UINT_PTR kTimerBlink = 2;
@@ -323,6 +326,8 @@ constexpr UINT_PTR kTimerWeightSave = 4;   // 点击权重延迟合并写盘
 constexpr UINT_PTR kTimerTween = 5;        // 补间动画（与光标闪烁 kTimerBlink 区分，互不干扰）
 constexpr UINT_PTR kTimerHotkeyRetry = 6;  // 唤起快捷键被占用时定时重试回收
 constexpr UINT_PTR kTimerHistFlush = 8;    // 搜索历史：编辑静置后把攒着的 Q 行落盘
+constexpr UINT_PTR kTimerLatency = 9;      // 耗时底栏：pending 期间实时跳毫秒（~30fps）
+constexpr UINT kLatencyTickMs = 33;
 constexpr UINT kHistFlushMs = 4000;        // 静置 4s 视为这一轮打完了（程序搜索逐字同步出结果，不落盘会一行一个前缀）
 constexpr int kDebounceMs = 120;
 constexpr int kWeightSaveDelayMs = 3000;   // 延迟合并写盘的等待时间
@@ -1277,6 +1282,49 @@ static void AnnotateRowUsage() {
     }
 }
 
+// ---------------- 搜索耗时底栏 ----------------
+// 「秒出」的查询不占地方；一旦不是秒出（还在等 / 等完但超过阈值），底栏实时报已经多少毫秒。
+static bool SearchPending() {
+    if (g.mode == Mode::Files && !g.dfWsDone) return true;
+    if (g.mode == Mode::Programs && g.startingUp) return true;
+    return false;
+}
+
+// 返回底栏是否显示；ms=要报的毫秒数，live=是否还在跳（pending 实时累计 vs 报齐后定格）。
+static bool LatencyFooter(int& ms, bool& live) {
+    ms = 0; live = false;
+    if (g.qT0 == 0 || g.text.empty()) return false;
+    if (SearchPending()) {
+        ms = (int)(GetTickCount64() - g.qT0);
+        live = true;
+        return ms >= kSlowMs;
+    }
+    if (g.qSettledMs >= 0) { ms = g.qSettledMs; return ms >= kSlowMs; }
+    return false;
+}
+
+// 本轮报齐（没有还在等的层）时定格总耗时；只记第一次，后续重排不刷新它。
+static void NoteQuerySettled() {
+    if (g.qSettledMs < 0 && g.qT0 != 0 && !SearchPending())
+        g.qSettledMs = (int)(GetTickCount64() - g.qT0);
+}
+
+// 每次上屏后收尾：定格耗时；还在等就开跳毫秒的定时器，报齐就停（定格数字不需要重画）。
+static void FinishRefreshLatency() {
+    NoteQuerySettled();
+    if (SearchPending()) SetTimer(g.hwnd, kTimerLatency, kLatencyTickMs, nullptr);
+    else KillTimer(g.hwnd, kTimerLatency);
+}
+
+static std::wstring PendingLayerText() {
+    if (g.mode == Mode::Programs) return L"应用列表加载中";
+    switch (g.searchRoute) {
+        case ft::search::Route::FlowtaryIndex: return L"Flowtary 索引未回";
+        case ft::search::Route::WorkshopCatalog: return L"workshop 目录未回";
+        default: return L"Windows Search 未回";
+    }
+}
+
 static void Layout() {
     AnnotateRowUsage();
     RECT rc;
@@ -1286,7 +1334,9 @@ static void Layout() {
     GetCursorPos(&cur);
     HMONITOR mon = MonitorFromPoint(cur, MONITOR_DEFAULTTONEAREST);
     UpdateScale(mon);  // 按目标屏幕物理分辨率重算比例（字体随比例重建）
-    int W = S(kBaseW), H = S(kBaseInputH + rows * kBaseRowH);
+    int fm = 0; bool fl = false;
+    const bool footer = LatencyFooter(fm, fl);
+    int W = S(kBaseW), H = S(kBaseInputH + rows * kBaseRowH + (footer ? kBaseFooterH : 0));
     MONITORINFO mi{};
     mi.cbSize = sizeof(mi);
     GetMonitorInfoW(mon, &mi);
@@ -1334,7 +1384,10 @@ static void Show() {
     ++g.dfGen;
     g.searchRoute = ft::search::Route::Unavailable;
     g.caretOn = true;
+    g.qT0 = 0;
+    g.qSettledMs = -1;
     KillTimer(g.hwnd, kTimerDebounce);
+    KillTimer(g.hwnd, kTimerLatency);
     Layout();
     // 前台被其他进程占用时，借助 AttachThreadInput 提高抢占成功率
     DWORD myTid = GetCurrentThreadId();
@@ -1351,6 +1404,7 @@ static void Show() {
 static void Hide() {
     if (!IsWindowVisible(g.hwnd)) return;
     KillTimer(g.hwnd, kTimerDebounce);
+    KillTimer(g.hwnd, kTimerLatency);
     ++g.dfGen;
     g.searchRoute = ft::search::Route::Unavailable;
     g.dragging = false;
@@ -1646,6 +1700,7 @@ static void RenderDfResults() {
         SnapshotHistoryPending();
     }
     g.sel = 0;
+    FinishRefreshLatency();
     LayoutAndRepaint();
 }
 
@@ -2092,6 +2147,7 @@ static void Refresh() {
             LogHistoryQuery();   // 程序搜索在主线程同步完成，派发即有结果
         }
     }
+    FinishRefreshLatency();
     LayoutAndRepaint();
 }
 
@@ -3188,6 +3244,7 @@ static void ArmHistoryClock(const WCHAR* layer) {
     g.qText = g.text;
     g.qT0 = GetTickCount64();
     g.qFirstMs = -1;
+    g.qSettledMs = -1;
     g.qLogged = false;
     g.qMissed.clear();
     g.qWsRows = 0;
@@ -3991,6 +4048,30 @@ static void Paint(HDC hdc) {
         DrawTextW(mem, row.title.c_str(), (int)row.title.size(), &tr,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
     }
+    // 耗时底栏：非秒出才出现。pending 实时跳毫秒 + 还在等哪层；报齐后定格总耗时 + 首屏延迟。
+    {
+        int fm = 0; bool fl = false;
+        if (LatencyFooter(fm, fl)) {
+            int fy = inputH + rows * rowH;
+            RECT dl{0, fy, W, fy + 1};
+            PaintDivider(mem, dl, t.divider, 90);
+            SelectObject(mem, g.fontPool[FontSlot(kFontMin)]);
+            SetBkMode(mem, TRANSPARENT);
+            std::wstring left = (fl ? L"… " : L"") + std::to_wstring(fm) + L" ms";
+            std::wstring right = fl ? PendingLayerText()
+                : (g.qFirstMs >= 0 && g.qFirstMs < fm ? L"首屏 " + std::to_wstring(g.qFirstMs) + L" ms" : L"");
+            SetTextColor(mem, fl ? t.accent2 : t.textSec);
+            RECT lr{pad, fy, W - pad, H};
+            DrawTextW(mem, left.c_str(), (int)left.size(), &lr,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            if (!right.empty()) {
+                SetTextColor(mem, t.textDis);
+                DrawTextW(mem, right.c_str(), (int)right.size(), &lr,
+                          DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            }
+            SelectObject(mem, g.fList);
+        }
+    }
     DeleteObject(selBr);
 
     // 描边（DWM 边框不可用时回退 GDI 圆角描边）
@@ -4458,6 +4539,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 Shell_NotifyIconW(NIM_MODIFY, &g.nid);
             } else if (wParam == kTimerTween) {
                 TickTweens();
+            } else if (wParam == kTimerLatency) {
+                // 还在等：实时跳毫秒（跨阈值时底栏出现/长高，需要重新 Layout）；报齐就停。
+                if (SearchPending()) LayoutAndRepaint();
+                else KillTimer(hwnd, kTimerLatency);
             } else if (wParam == kTimerHotkeyRetry) {
                 // 唤起快捷键被占用后的自动恢复：优先抢注首选组合 Alt+Space
                 if (!g.hotkeyWake || g.wakeIndex == 0) {
