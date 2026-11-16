@@ -35,6 +35,7 @@
 #include <condition_variable>
 #include <map>
 #include <climits>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cwctype>
@@ -133,6 +134,7 @@ struct Row {
     std::wstring action;  // 打开目标；Shell 时为命令行文本；Window 时为 HWND 十六进制串
     Program* prog = nullptr;
     bool workshopHit = false; // Flowtary-owned C:\\workshop\\*.exe priority metadata
+    int usage = 0;            // 历史总使用次数（跨词点击权重 + 自学习打开次数），Layout 时统一回填
     // 一键组（Row::Group）：groupKill=false 启动 groupTargets 里的文件；
     // groupKill=true 结束 groupTargets 里的进程名
     bool groupKill = false;
@@ -169,6 +171,7 @@ struct App {
     HWND hwnd = nullptr;
     HFONT fInput = nullptr;
     HFONT fList = nullptr;
+    HFONT fListHot = nullptr;  // 常用项加粗字体（与 fList 同字号同字族，随主题/比例重建）
     HBRUSH brDivider = nullptr;
     HINSTANCE inst = nullptr;
     float scale = 1.0f;          // 全局比例：max(DPI, 屏幕物理高度/1080)，不写死像素
@@ -432,8 +435,8 @@ inline int S(int v) { return MulDiv(v, (int)(g.scale * 1000 + 0.5f), 1000); }
 static inline int FontSlot(int logSize) {
     return (std::max)(kFontMin, (std::min)(kFontMax, logSize)) - kFontMin;
 }
-static HFONT MakeFont(int logSize) {
-    return CreateFontW(-S(logSize), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+static HFONT MakeFont(int logSize, int weight = FW_NORMAL) {
+    return CreateFontW(-S(logSize), 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET,
                        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                        DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
 }
@@ -443,10 +446,15 @@ static void RebuildFontPool() {
         g.fontPool[i] = MakeFont(kFontMin + i);
     }
 }
+static void RebuildHotFont() {
+    if (g.fListHot) { DeleteObject(g.fListHot); g.fListHot = nullptr; }
+    if (g.theme) g.fListHot = MakeFont(g.theme->fontList, FW_BOLD);
+}
 static void ResetFonts() {
     if (!g.theme) return;
     g.fInput = g.fontPool[FontSlot(g.theme->fontInput)];
     g.fList = g.fontPool[FontSlot(g.theme->fontList)];
+    RebuildHotFont();
 }
 
 // 比例 = max(系统 DPI 缩放, 屏幕物理高度/1080p)。
@@ -473,6 +481,7 @@ static void UpdateScale(HMONITOR mon) {
     const Theme& t = *g.theme;
     g.fInput = g.fontPool[FontSlot(t.fontInput)];
     g.fList = g.fontPool[FontSlot(t.fontList)];
+    RebuildHotFont();
     if (g.hwnd) {
         if (g.brDivider) { DeleteObject(g.brDivider); g.brDivider = nullptr; }
         g.brDivider = CreateSolidBrush(t.divider);
@@ -578,6 +587,20 @@ static void StrokeRoundRect(HDC h, const RECT& r, int rad, HPEN p) {
     SelectObject(h, op);
 }
 
+// 垂直渐变圆角矩形（path  clip + GradientFill）：色条胶囊用
+static void FillRoundRectVGradient(HDC h, const RECT& r, int rad, COLORREF c0, COLORREF c1) {
+    if (r.right <= r.left || r.bottom <= r.top) return;
+    SaveDC(h);
+    BeginPath(h);
+    // GDI 圆角/矩形 path 不含右/下边缘，+1 补回，保证 clip 宽度=请求宽度
+    if (rad > 0) RoundRect(h, r.left, r.top, r.right + 1, r.bottom + 1, 2 * rad, 2 * rad);
+    else Rectangle(h, r.left, r.top, r.right + 1, r.bottom + 1);
+    EndPath(h);
+    SelectClipPath(h, RGN_COPY);
+    FillVGradient(h, r.left, r.top, r.right - r.left, r.bottom - r.top, c0, c1);
+    RestoreDC(h, -1);
+}
+
 // 软外阴影：在 r 外侧偏移 (ox,oy) 画一张带 alpha 的圆角矩形（无模糊，靠低 alpha 模拟海拔）
 static void PaintOutShadow(HDC h, const RECT& r, int rad, int ox, int oy, int /*blur*/, int a, COLORREF col) {
     RECT sr{r.left + ox, r.top + oy, r.right + ox, r.bottom + oy};
@@ -604,7 +627,10 @@ static void PaintOutShadow(HDC h, const RECT& r, int rad, int ox, int oy, int /*
     for (int y = 0; y < hh; ++y) {
         for (int x = 0; x < w; ++x) {
             int i = y * w + x;
-            bits[i].rgbRed = GetRValue(col); bits[i].rgbGreen = GetGValue(col); bits[i].rgbBlue = GetBValue(col);
+            // AC_SRC_ALPHA 要求预乘：不预乘时 src+dst*(1-a) 会溢出回绕（亮色辉光变杂色）
+            bits[i].rgbRed = (BYTE)(GetRValue(col) * a / 255);
+            bits[i].rgbGreen = (BYTE)(GetGValue(col) * a / 255);
+            bits[i].rgbBlue = (BYTE)(GetBValue(col) * a / 255);
             bits[i].rgbReserved = inside(x, y) ? (BYTE)a : 0;
         }
     }
@@ -1172,7 +1198,50 @@ static HICON GetPathIcon(const std::wstring& path) {
 }
 
 // ---------------- UI 布局 ----------------
+// 常用阈值：历史总使用次数达到该行数才进入醒目样式；
+// 没用过/偶尔用的行保持原样（哪怕同在开始菜单这类规定目录下）。
+constexpr int kHotUsageMin = 3;
+
+// 使用分档：0=原样(0-2 次)，2=常用(3-9)，3=高频(10-29)，4=重度(>=30)。
+// 档决定字体/色条宽度/徽章形态；档内再由 UsageHeat 连续驱动颜色强度，
+// 同档里 15 次和 25 次看起来也不一样，避免一刀切的粗粒度。
+static int UsageTier(int usage) {
+    if (usage < kHotUsageMin) return 0;
+    if (usage < 10) return 2;
+    if (usage < 30) return 3;
+    return 4;
+}
+// 热度 0..1：log 曲线，次数边际递减（1→0.17，3→0.33，15→0.66，29→0.82，64+→1）
+static float UsageHeat(int usage) {
+    if (usage <= 0) return 0.f;
+    float h = logf(1.f + (float)usage) / logf(65.f);
+    return h > 1.f ? 1.f : h;
+}
+
+// 给当前结果行回填历史总使用次数：点击权重按搜索词分桶，这里跨全部词求和，
+// 再叠加自学习的打开次数——衡量的是「这个目标平时用不用」，与当前输入的词无关。
+// 每次 Layout 全量重算（条目上限 5000+500，一次哈希遍历 <1ms），不做增量缓存。
+static void AnnotateRowUsage() {
+    bool any = false;
+    for (auto& r : g.items) {
+        r.usage = 0;
+        if (r.kind == Row::Prog || r.kind == Row::File || r.kind == Row::Folder) any = true;
+    }
+    if (!any) return;
+    std::unordered_map<std::wstring, int> total;
+    for (auto& kv : g.weights)
+        for (auto& pv : kv.second) total[ToLowerW(pv.first)] += pv.second;
+    for (auto& kv : g.learned)
+        for (auto& pv : kv.second) total[ToLowerW(pv.first)] += pv.second.count;
+    for (auto& r : g.items) {
+        if (r.kind != Row::Prog && r.kind != Row::File && r.kind != Row::Folder) continue;
+        auto it = total.find(ToLowerW(r.action));
+        if (it != total.end()) r.usage = it->second;
+    }
+}
+
 static void Layout() {
+    AnnotateRowUsage();
     RECT rc;
     GetClientRect(g.hwnd, &rc);
     int rows = (std::min)((int)g.items.size(), (int)kMaxVisibleResults);
@@ -3729,6 +3798,23 @@ static void Paint(HDC hdc) {
         Row& row = g.items[i];
         int y = inputH + i * rowH;
         RECT rr{0, y, W, y + rowH};
+        const int tier = (row.kind == Row::Prog || row.kind == Row::File || row.kind == Row::Folder)
+                             ? UsageTier(row.usage) : 0;
+        const bool hot = tier >= 2;
+        const float heat = UsageHeat(row.usage);
+        // 浅色主题把热度映射成「更深的墨色」保证对比；深色主题映射成「更纯的强调色」
+        const COLORREF titleBase = tier >= 4 ? (t.dark ? t.accent2 : Darken(t.accent, 25)) : t.accent;
+        const float titleMix = t.dark ? (0.42f - 0.34f * heat) : (0.30f + 0.40f * heat);
+        const COLORREF hotTitle = Blend(titleBase, t.textBody, titleMix);
+        const COLORREF rowBase = hot ? Blend(t.bgCard, t.accent, 0.04f + 0.14f * heat) : t.bgCard;
+        // 染色/选中叠色只落在卡片横向范围内：边距留给窗体底与卡片外影，
+        // 整行铺满会把浅色主题右侧/底部的软影切出缺口
+        RECT cardRow{S(kBasePad), y, W - S(kBasePad), y + rowH};
+        if (hot && i != g.sel) {
+            HBRUSH hb = CreateSolidBrush(rowBase);
+            FillRect(mem, &cardRow, hb);
+            DeleteObject(hb);
+        }
         if (i == g.sel) {
             FillRect(mem, &rr, selBr);
             // 悬停高亮随动画进度叠加（鼠标移到某行 = 选中该行，hoverT 驱动轻微提亮）
@@ -3737,13 +3823,29 @@ static void Paint(HDC hdc) {
                 FillRect(mem, &rr, hb);
                 DeleteObject(hb);
             }
+            // 选中态也保留热度：selBg 上叠一层随热度加深的强调色
+            if (hot) {
+                HBRUSH hb = CreateSolidBrush(Blend(t.selBg, t.accent, 0.06f + 0.10f * heat));
+                FillRect(mem, &cardRow, hb);
+                DeleteObject(hb);
+            }
         } else if (i == g.hoverRow) {
-            HBRUSH hb = CreateSolidBrush(Blend(t.bgCard, t.accent2, (float)(0.10 + 0.12 * g.hoverT)));
+            HBRUSH hb = CreateSolidBrush(Blend(rowBase, t.accent2, (float)(0.10 + 0.12 * g.hoverT)));
             FillRect(mem, &rr, hb);
             DeleteObject(hb);
         }
         if (i == g.pressRow && i != g.sel) {
-            PaintInsetShadow(mem, rr, 0, t.bgCard);
+            PaintInsetShadow(mem, rr, 0, rowBase);
+        }
+        if (hot) {
+            // 左侧强调色条：圆角胶囊 + 垂直渐变，重度档外再罩一层软辉光。
+            // 画在行最左缘外侧边距（图标从 pad 起，会盖住卡片左缘的同位置色条）
+            RECT barR{S(2), y + S(6), S(2) + S(1) + S(tier), y + rowH - S(6)};
+            if (tier >= 4) {
+                RECT gr{barR.left - S(2), barR.top - S(2), barR.right + S(2), barR.bottom + S(2)};
+                PaintOutShadow(mem, gr, S(3), 0, 0, 0, 46, t.accent2);
+            }
+            FillRoundRectVGradient(mem, barR, (barR.right - barR.left) / 2, t.accent2, t.accent);
         }
         int x = pad;
         if (row.kind == Row::Prog && row.prog) {
@@ -3760,6 +3862,7 @@ static void Paint(HDC hdc) {
         x += S(16) + S(8);
 
         // 结果项快捷键徽章（右侧小方框，按当前方案 Alt+数字 / Alt+字母；关闭时无徽章）
+        SelectObject(mem, g.fList);  // 徽章固定常规字重（上一行可能是常用加粗行）
         int hkReserved = 0;
         WCHAR hk = HotkeyChar(i);
         if (hk) {
@@ -3777,6 +3880,42 @@ static void Paint(HDC hdc) {
             hkReserved = bw + S(6);
         }
 
+        // 档位徽章（快捷键徽章左侧）：档名 + 历史总使用次数直接摆在行上，判定依据可见。
+        // 常用=淡底胶囊，高频=浓底+描边，重度=强调色实底反白字
+        int hotReserved = 0;
+        if (hot) {
+            const WCHAR* lab = tier >= 4 ? L"重度" : tier == 3 ? L"高频" : L"常用";
+            std::wstring tag = std::wstring(lab) + L" ×" + std::to_wstring(row.usage);
+            SelectObject(mem, g.fontPool[FontSlot(kFontMin)]);
+            SIZE ts{};
+            GetTextExtentPoint32W(mem, tag.c_str(), (int)tag.size(), &ts);
+            int bw = S(6) + S(5) + S(4) + ts.cx + S(8), bh = S(18);
+            int bx = W - pad - hkReserved - bw;
+            RECT br{bx, y + (rowH - bh) / 2, bx + bw, y + (rowH - bh) / 2 + bh};
+            COLORREF badgeBg = tier >= 4 ? t.accent
+                             : Blend(t.bgCard, t.accent, tier == 3 ? 0.32f : 0.20f);
+            HBRUSH bg = CreateSolidBrush(badgeBg);
+            FillRoundRect(mem, br, bh / 2, bg);  // 胶囊：半径=半高
+            DeleteObject(bg);
+            if (tier == 3) {
+                HPEN fp = CreatePen(PS_SOLID, 1, Blend(t.bgCard, t.accent, 0.55f));
+                StrokeRoundRect(mem, br, bh / 2, fp);
+                DeleteObject(fp);
+            }
+            // 档点：胶囊左端小圆点，重度档与文字同用反白
+            HBRUSH db = CreateSolidBrush(tier >= 4 ? t.bgCard : titleBase);
+            RECT dr{bx + S(6), y + (rowH - S(5)) / 2, bx + S(6) + S(5), y + (rowH - S(5)) / 2 + S(5)};
+            FillRoundRect(mem, dr, S(3), db);
+            DeleteObject(db);
+            SetTextColor(mem, tier >= 4 ? t.bgCard : hotTitle);
+            RECT tr2{dr.right + S(4), br.top, br.right - S(8), br.bottom};
+            DrawTextW(mem, tag.c_str(), (int)tag.size(), &tr2,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            hotReserved = bw + S(6);
+        }
+        // 常用行标题加粗；副标题的标题宽度测量也用同一字体，保证让位预算准确
+        SelectObject(mem, hot && g.fListHot ? g.fListHot : g.fList);
+
         // 副标题（右侧灰色；有徽章时让位）
         int subReserved = 0;
         if (!row.sub.empty()) {
@@ -3785,12 +3924,12 @@ static void Paint(HDC hdc) {
             GetTextExtentPoint32W(mem, row.title.c_str(), (int)row.title.size(), &tsz);
             // 路径栏宽度按「标题完整显示后剩多少」给，上限 3/4、下限 1/4：
             // 标题短时深路径能整条看完，标题长时也不会把路径压成几个字。
-            const int budget = W - pad - hkReserved - S(12);
+            const int budget = W - pad - hkReserved - hotReserved - S(12);
             int room = budget - (std::min)((int)tsz.cx, budget * 3 / 4) - S(12);
             if (room > budget * 3 / 4) room = budget * 3 / 4;
             if (room < budget / 4) room = budget / 4;
             int subW = (std::min)((int)sz.cx + 2, room);
-            RECT sr{W - pad - hkReserved - subW, y, W - pad - hkReserved, y + rowH};
+            RECT sr{W - pad - hkReserved - hotReserved - subW, y, W - pad - hkReserved - hotReserved, y + rowH};
             SetTextColor(mem, t.textSec);
             // DT_PATH_ELLIPSIS（需配 DT_LEFT）：放不下时省略中段、保住最深一层目录——
             // 应用版本号就在那一层，尾部截断等于把最有用的信息裁掉
@@ -3798,9 +3937,16 @@ static void Paint(HDC hdc) {
                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_PATH_ELLIPSIS);
             subReserved = subW + S(8);
         }
-        // 标题
-        RECT tr{x, y, W - pad - subReserved - hkReserved, y + rowH};
-        SetTextColor(mem, row.kind == Row::Hint ? t.textDis : t.textBody);
+        // 标题（常用行：加粗 + 强调色向正文色靠拢，热度越高越纯；深/浅主题都保持可读对比）
+        RECT tr{x, y, W - pad - subReserved - hkReserved - hotReserved, y + rowH};
+        if (tier >= 4) {
+            // 重度档：字后罩一层低 alpha 圆角辉光，把最高档从普通加粗里托出来
+            SIZE tsz{};
+            GetTextExtentPoint32W(mem, row.title.c_str(), (int)row.title.size(), &tsz);
+            RECT hr{tr.left, tr.top, (std::min)(tr.right, tr.left + tsz.cx + S(4)), tr.bottom};
+            PaintOutShadow(mem, hr, S(4), 0, 0, 0, 26, t.accent2);
+        }
+        SetTextColor(mem, row.kind == Row::Hint ? t.textDis : hot ? hotTitle : t.textBody);
         DrawTextW(mem, row.title.c_str(), (int)row.title.size(), &tr,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
     }
@@ -4146,6 +4292,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             for (int i = 0; i < kFontMax - kFontMin + 1; ++i) {
                 if (g.fontPool[i]) { DeleteObject(g.fontPool[i]); g.fontPool[i] = nullptr; }
             }
+            if (g.fListHot) { DeleteObject(g.fListHot); g.fListHot = nullptr; }
             if (g.brDivider) { DeleteObject(g.brDivider); g.brDivider = nullptr; }
             if (g.brMenuBg) { DeleteObject(g.brMenuBg); g.brMenuBg = nullptr; }
             PostQuitMessage(0);
