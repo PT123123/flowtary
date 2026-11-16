@@ -3,12 +3,14 @@
 #include <windows.h>
 
 #include "workshop_catalog.h"
+#include "app_ver.h"
 
 #include <algorithm>
 #include <cwctype>
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 
 namespace df {
@@ -268,6 +270,56 @@ WorkshopScan ScanWorkshopExecutables(const std::wstring& root, WorkshopLimits li
     if (!pending.empty()) result.complete = false;
     result.elapsedMilliseconds = GetTickCount64() - started;
     return result;
+}
+
+std::vector<ProgramEntry> WorkshopProgramEntries(const std::vector<std::wstring>& exePaths) {
+    struct Candidate {
+        std::wstring name, key, path;
+        unsigned long long ver = 0;
+        bool plain = true;
+    };
+    std::unordered_map<std::wstring, Candidate> best;
+    for (const auto& path : exePaths) {
+        if (!IsExe(path.c_str())) continue;
+        const size_t slash = path.find_last_of(L"\\/");
+        if (slash == std::wstring::npos || slash + 5 > path.size()) continue;
+        const std::wstring stem = path.substr(slash + 1, path.size() - slash - 5);
+        if (stem.empty()) continue;
+        // Strip a version trailing the exe stem so "flowtary-1.1.37.10.exe"
+        // is one row named "flowtary". The release directory still supplies
+        // the version used to pick the newest build of that row.
+        size_t vs = 0, ve = 0;
+        std::wstring base = appver::SegVersion(stem, vs, ve) ? stem.substr(0, vs) : stem;
+        while (!base.empty() && (base.back() == L'-' || base.back() == L'_' || base.back() == L' '))
+            base.pop_back();
+        if (base.empty()) continue;
+        const appver::Info info = appver::Parse(path);
+        Candidate candidate{base, Lower(base), path, info.ver, info.plain};
+        auto found = best.find(candidate.key);
+        if (found == best.end()) {
+            best.emplace(candidate.key, std::move(candidate));
+            continue;
+        }
+        Candidate& current = found->second;
+        // Official release beats a snapshot even at a lower version, matching
+        // the appver::Table ranking used by f/d search. Ties fall back to the
+        // lexicographically smaller path so the choice is deterministic.
+        const bool better = candidate.plain != current.plain
+            ? candidate.plain
+            : (candidate.ver != current.ver ? candidate.ver > current.ver
+                                            : candidate.path < current.path);
+        if (better) current = std::move(candidate);
+    }
+    std::vector<Candidate> ordered;
+    ordered.reserve(best.size());
+    for (auto& kv : best) ordered.push_back(std::move(kv.second));
+    std::sort(ordered.begin(), ordered.end(), [](const Candidate& a, const Candidate& b) {
+        return a.key < b.key;
+    });
+    std::vector<ProgramEntry> out;
+    out.reserve(ordered.size());
+    for (auto& c : ordered) out.push_back({std::move(c.name), std::move(c.path)});
+    return out;
 }
 
 int WorkshopCatalogQuery(const Query& query, std::vector<Hit>& out) {

@@ -98,4 +98,34 @@ int main() {
     Check(!stopped.complete && stopped.error == ERROR_CANCELLED, "startup prewarm honors cancellation before traversal");
     std::filesystem::remove_all(root);
     std::cout << "PASS: workshop traversal, filtering, and resource limits\n";
+
+    // Program mode: workshop exes become launcher rows. Same exe name across
+    // release dirs collapses to the newest official build; auxiliary exes keep
+    // their full stem; the displayed name strips a trailing version.
+    const std::vector<std::wstring> exePaths = {
+        L"C:\\workshop\\Flowtary-1.1.34.10\\flowtary-1.1.34.10.exe",
+        L"C:\\workshop\\Flowtary-1.1.36.10\\flowtary-1.1.36.10.exe",
+        L"C:\\workshop\\Flowtary-1.1.37.10\\flowtary-1.1.37.10.exe",
+        L"C:\\workshop\\Flowtary-1.1.37.10\\flowtary-indexer.exe",
+        L"C:\\workshop\\Flowtary-1.1.36.10\\flowtary-indexer.exe",
+        L"C:\\workshop\\taskinformer-0.1.44\\taskinformer.exe",
+        L"C:\\workshop\\taskinformer-0.1.45\\taskinformer.exe",
+        L"C:\\workshop\\taskinformer-0.1.45\\peview.exe",
+    };
+    auto programs = df::WorkshopProgramEntries(exePaths);
+    Check(programs.size() == 4, "workshop programs collapse to one row per exe name");
+    auto find = [&programs](const std::wstring& name) -> const df::ProgramEntry* {
+        for (const auto& p : programs) if (p.name == name) return &p;
+        return nullptr;
+    };
+    Check(find(L"flowtary") && find(L"flowtary")->path.find(L"1.1.37.10") != std::wstring::npos,
+          "newest official release wins, and the name drops its version");
+    Check(find(L"flowtary-indexer") && find(L"flowtary-indexer")->path.find(L"1.1.37.10") != std::wstring::npos,
+          "auxiliary exe is its own row, also deduped to newest version");
+    Check(find(L"taskinformer") && find(L"taskinformer")->path.find(L"0.1.45") != std::wstring::npos,
+          "version-less exe name dedupes by its release directory version");
+    Check(find(L"peview") != nullptr, "other exes in a release dir remain searchable");
+    Check(df::WorkshopProgramEntries({L"C:\\workshop\\a.txt", L"C:\\workshop\\noext"}).empty(),
+          "non-exe paths never become program rows");
+    std::cout << "PASS: workshop exe program rows, version dedupe, and clean names\n";
 }

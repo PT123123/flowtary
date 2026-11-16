@@ -17,6 +17,8 @@ bool FlowtaryIndexPrewarm() { return false; }
 bool WorkshopCatalogAvailable() { return false; }
 WorkshopWarmupSummary WorkshopCatalogWarmup(const std::atomic<bool>*) { return {}; }
 int WorkshopCatalogQuery(const Query&, std::vector<Hit>& out) { out.clear(); return 0; }
+WorkshopScan ScanWorkshopExecutables(const std::wstring&, WorkshopLimits, const std::atomic<bool>*) { WorkshopScan s; s.complete = true; return s; }
+std::vector<ProgramEntry> WorkshopProgramEntries(const std::vector<std::wstring>&) { return {}; }
 int FlowtaryIndexQuery(const Query&, bool, std::vector<Hit>& out) { out.clear(); return 0; }
 int WindowsSearchQuery(const Query&, bool, std::vector<Hit>& out) { out.clear(); return 0; }
 }

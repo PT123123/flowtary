@@ -24,6 +24,8 @@ int WorkshopCatalogQuery(const Query& q, std::vector<Hit>& out) {
         out.push_back({L"C:\\workshop\\Flowtary-1.2.exe", false, true});
     return (int)out.size();
 }
+WorkshopScan ScanWorkshopExecutables(const std::wstring&, WorkshopLimits, const std::atomic<bool>*) { WorkshopScan s; s.complete = true; return s; }
+std::vector<ProgramEntry> WorkshopProgramEntries(const std::vector<std::wstring>&) { return {}; }
 int FlowtaryIndexQuery(const Query&, bool, std::vector<Hit>& out) {
     ++flowtaryCalls;
     out = {{L"C:\\fixture\\current.exe", false, false},

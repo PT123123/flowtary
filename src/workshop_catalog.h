@@ -45,4 +45,12 @@ int WorkshopCatalogQuery(const Query& query, std::vector<Hit>& out);
 bool WorkshopQueryMatchesPath(const Query& query, const std::wstring& path);
 // Pure matcher for an immediate child directory of any local hot root (d-search).
 bool WorkshopFolderMatchesPath(const Query& query, const std::wstring& path);
+
+// Program-mode entries distilled from the C:\workshop exe tree. One row per exe
+// name: when several release directories coexist (Flowtary-1.1.34 … -1.1.37),
+// only the newest official release survives. The name strips the trailing
+// version so "flowtary-1.1.37.10.exe" is searchable as "flowtary"; auxiliary
+// exes (indexer/settings/…) keep their full stem under their own row.
+struct ProgramEntry { std::wstring name, path; };
+std::vector<ProgramEntry> WorkshopProgramEntries(const std::vector<std::wstring>& exePaths);
 } // namespace df

@@ -946,6 +946,25 @@ static void CopyAppCatalog(ft::apps::Result catalog,ProgramBuildReply& reply) {
 }
 static void BuildProgramsInto(ProgramBuildReply& reply,const std::atomic<bool>* stop) {
     CopyAppCatalog(ft::apps::Collect({},stop),reply);
+    if(stop && stop->load(std::memory_order_acquire))return;
+    // C:\workshop 是 Flowtary 自研应用的发布目录，里面的 exe 是「程序」而非普通文件。
+    // 复用 f-search 的同一个有界扫描器把这些 exe 也并进程序目录，默认模式搜名字即可
+    // 启动，不用先敲 f 进文件搜索。同名按 exe 名分组只留最新正式版（四个 Flowtary
+    // 版本目录不会刷屏），辅助 exe（indexer/settings…）各占一行、用全名可搜。
+    df::WorkshopScan scan=df::ScanWorkshopExecutables(L"C:\\workshop",{},stop);
+    if(scan.paths.empty())return;
+    std::unordered_set<std::wstring> known;
+    known.reserve(reply.programs.size()+scan.paths.size());
+    for(const auto& p:reply.programs)known.insert(ToLowerW(p.path));
+    for(auto& entry:df::WorkshopProgramEntries(scan.paths)){
+        Program p;
+        p.name=std::move(entry.name);
+        p.path=std::move(entry.path);
+        if(known.count(ToLowerW(p.path)))continue;
+        p.startMenu=false;  // 直接 exe：CreateProcess 启动，不交 Shell 解析快捷方式
+        known.insert(ToLowerW(p.path));
+        reply.programs.push_back(std::move(p));
+    }
 }
 
 // 目录扫描受预算截断时，权重表里点过多次的条目可能压根没被枚举到，
