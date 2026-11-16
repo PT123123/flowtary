@@ -51,6 +51,28 @@ int main() {
     Check(!df::WorkshopFolderMatchesPath(query /* isFile=true */, L"C:\\workshop\\taskinformer-0.1.41"),
           "file query never matches folders");
 
+    // d-search: personal project roots (Desktop / project / WorkBuddy) are hot too.
+    wchar_t profile[MAX_PATH]{};
+    const DWORD profileLen = GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH);
+    Check(profileLen > 0 && profileLen < MAX_PATH, "USERPROFILE available for hot-root tests");
+    const std::wstring desktop = std::wstring(profile) + L"\\Desktop";
+    df::Query personal;
+    personal.isFile = false;
+    personal.words = {L"aw-flutterui"};
+    Check(df::WorkshopFolderMatchesPath(personal, desktop + L"\\aw-flutterui"),
+          "folder query matches an immediate Desktop child");
+    Check(!df::WorkshopFolderMatchesPath(personal, desktop + L"\\parent\\aw-flutterui"),
+          "folder query rejects nested Desktop directories");
+    Check(!df::WorkshopFolderMatchesPath(personal, std::wstring(profile) + L"\\DesktopX\\aw-flutterui"),
+          "folder query rejects sibling root prefixes");
+    personal.words = {L"project"};
+    Check(df::WorkshopFolderMatchesPath(personal, std::wstring(profile) + L"\\project\\my-project"),
+          "folder query matches an immediate project child");
+    personal.words = {L"aw"};
+    personal.excludes = {L"android"};
+    Check(!df::WorkshopFolderMatchesPath(personal, desktop + L"\\aw-android-native"),
+          "folder query applies excludes to personal-root paths");
+
     wchar_t temp[MAX_PATH]{};
     Check(GetTempPathW(MAX_PATH, temp) != 0, "temporary directory available");
     std::wstring root = std::wstring(temp) + L"FlowtaryWorkshopTest-" + std::to_wstring(GetCurrentProcessId());

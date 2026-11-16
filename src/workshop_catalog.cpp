@@ -16,6 +16,23 @@ namespace {
 constexpr wchar_t kWorkshopRoot[] = L"C:\\workshop";
 constexpr ULONGLONG kRefreshMilliseconds = 30000;
 
+// Local hot roots whose immediate child directories are served from memory for
+// d-search. C:\workshop is Flowtary's own app catalog; the profile roots are the
+// user's common project homes. Nothing here is enumerated recursively, so this
+// stays cheap (one FindFirstFile pass per root). Windows Search remains the
+// fallback for anything not directly under one of these roots.
+std::vector<std::wstring> HotFolderRoots() {
+    std::vector<std::wstring> roots;
+    roots.push_back(kWorkshopRoot);
+    wchar_t profile[MAX_PATH]{};
+    const DWORD n = GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) {
+        static const wchar_t* kids[] = {L"Desktop", L"project", L"WorkBuddy"};
+        for (const wchar_t* kid : kids) roots.push_back(std::wstring(profile) + L"\\" + kid);
+    }
+    return roots;
+}
+
 struct FindHandle {
     HANDLE value = INVALID_HANDLE_VALUE;
     ~FindHandle() { if (value != INVALID_HANDLE_VALUE) FindClose(value); }
@@ -145,11 +162,13 @@ bool RefreshCache(Cache& cache, const std::atomic<bool>* cancelled, bool force,
     next->files.reserve(scanned.paths.size());
     for (auto& path : scanned.paths) next->files.push_back({std::move(path), {}});
     for (auto& entry : next->files) entry.foldedPath = Lower(entry.path);
-    for (auto& path : ScanWorkshopFolders(kWorkshopRoot)) {
-        CachedPath entry;
-        entry.foldedPath = Lower(path);
-        entry.path = std::move(path);
-        next->folders.push_back(std::move(entry));
+    for (const auto& root : HotFolderRoots()) {
+        for (auto& path : ScanWorkshopFolders(root)) {
+            CachedPath entry;
+            entry.foldedPath = Lower(path);
+            entry.path = std::move(path);
+            next->folders.push_back(std::move(entry));
+        }
     }
     std::lock_guard<std::mutex> lock(cache.mutex);
     cache.data = std::move(next);
@@ -161,9 +180,12 @@ bool RefreshCache(Cache& cache, const std::atomic<bool>* cancelled, bool force,
 } // namespace
 
 bool WorkshopCatalogAvailable() {
-    const DWORD attributes = GetFileAttributesW(kWorkshopRoot);
-    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) &&
-           !(attributes & FILE_ATTRIBUTE_REPARSE_POINT);
+    for (const auto& root : HotFolderRoots()) {
+        const DWORD attributes = GetFileAttributesW(root.c_str());
+        if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) &&
+            !(attributes & FILE_ATTRIBUTE_REPARSE_POINT)) return true;
+    }
+    return false;
 }
 
 WorkshopWarmupSummary WorkshopCatalogWarmup(const std::atomic<bool>* cancelled) {
@@ -284,13 +306,22 @@ bool WorkshopQueryMatchesPath(const Query& query, const std::wstring& rawPath) {
 bool WorkshopFolderMatchesPath(const Query& query, const std::wstring& rawPath) {
     if (query.isFile || query.words.empty()) return false;
     const std::wstring path = Lower(NormalizeSeparators(rawPath));
-    const std::wstring root = Lower(kWorkshopRoot);
-    // Must be an immediate child of C:\workshop: no further separator after root.
-    if (path.size() <= root.size() + 1 || path.compare(0, root.size(), root) != 0 ||
-        path[root.size()] != L'\\' ||
-        path.find(L'\\', root.size() + 1) != std::wstring::npos) return false;
+    // Must be an immediate child of one of the hot roots: no separator after the
+    // root's leaf. Try each root; the entry's real parent matches exactly one.
+    std::wstring leaf;
+    bool immediateChild = false;
+    for (const auto& rawRoot : HotFolderRoots()) {
+        const std::wstring root = Lower(NormalizeSeparators(rawRoot));
+        if (path.size() > root.size() + 1 && path.compare(0, root.size(), root) == 0 &&
+            path[root.size()] == L'\\' &&
+            path.find(L'\\', root.size() + 1) == std::wstring::npos) {
+            leaf = path.substr(root.size() + 1);
+            immediateChild = true;
+            break;
+        }
+    }
+    if (!immediateChild) return false;
 
-    const std::wstring leaf = path.substr(root.size() + 1);
     for (const auto& word : query.words) {
         if (word.empty()) continue;
         const std::wstring term = Lower(NormalizeSeparators(word));

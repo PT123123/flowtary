@@ -36,12 +36,13 @@ bool WorkshopCatalogAvailable();
 WorkshopWarmupSummary WorkshopCatalogWarmup(const std::atomic<bool>* cancelled = nullptr);
 WorkshopScan ScanWorkshopExecutables(const std::wstring& root, WorkshopLimits limits = {},
                                      const std::atomic<bool>* cancelled = nullptr);
-// Matches .exe files (query.isFile=true) or the immediate application folders
-// directly under C:\workshop (query.isFile=false, d-search). Both are served
-// from the in-memory catalog; neither enumerates the directory tree per query.
+// Files (query.isFile=true) are Flowtary's C:\workshop\*.exe catalog. Folders
+// (query.isFile=false, d-search) are the immediate child directories of every
+// local hot root: C:\workshop plus %USERPROFILE%\{Desktop,project,WorkBuddy}.
+// Both are served from memory; neither enumerates the directory tree per query.
 int WorkshopCatalogQuery(const Query& query, std::vector<Hit>& out);
 // Pure matcher for .exe descendants of C:\workshop (kept for regression tests).
 bool WorkshopQueryMatchesPath(const Query& query, const std::wstring& path);
-// Pure matcher for immediate child directories of C:\workshop (d-search).
+// Pure matcher for an immediate child directory of any local hot root (d-search).
 bool WorkshopFolderMatchesPath(const Query& query, const std::wstring& path);
 } // namespace df
