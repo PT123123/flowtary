@@ -14,11 +14,11 @@
 
 #define FT_VER_MAJOR 1
 #define FT_VER_MINOR 1
-#define FT_VER_PATCH 38
+#define FT_VER_PATCH 44
 #define FT_VER_BUILD 10
 
-#define FT_VER_COMMA 1,1,38,10    /* rc: FILEVERSION / PRODUCTVERSION */
-#define FT_VER_DOT   "1.1.38.10"  /* rc string fields + release 流程 */
+#define FT_VER_COMMA 1,1,44,10    /* rc: FILEVERSION / PRODUCTVERSION */
+#define FT_VER_DOT   "1.1.44.10"  /* rc string fields + release 流程 */
 
 #define FT_PRODUCT_NAME "Flowtary"
 #define FT_FILE_DESC    "Flowtary Launcher"

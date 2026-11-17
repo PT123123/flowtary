@@ -44,7 +44,7 @@ class AsyncIcons {
             if(s->extract)icon.reset(s->extract(path));
             else if(SUCCEEDED(initialized)){
                 SHFILEINFOW info{};
-                if(SHGetFileInfoW(path.c_str(),0,&info,sizeof(info),SHGFI_ICON|SHGFI_SMALLICON))icon.reset(info.hIcon);
+                if(SHGetFileInfoW(path.c_str(),0,&info,sizeof(info),SHGFI_ICON|SHGFI_LARGEICON))icon.reset(info.hIcon);
             }
             {
                 std::lock_guard<std::mutex> lock(s->mutex);

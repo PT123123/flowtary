@@ -156,6 +156,17 @@ struct LearnVal {
     std::wstring lnk;       // 镜像快捷方式文件名（learned 目录内，空=尚未创建）
 };
 
+// 点击权重条目：从纯次数升级为「次数 + 最近使用时间」。
+// last 只参与「最近使用」加分，旧的 3 列 weights.dat 读入后 last=0（视为时间未知，不加分），
+// 保证老数据行为平滑退回纯次数排序。保留 int 隐式构造，既有 `weights[t][p] = 5` 写法照常工作。
+struct WeightVal {
+    int count = 0;
+    long long last = 0;
+    WeightVal() = default;
+    WeightVal(int c, long long l = 0) : count(c), last(l) {}
+    WeightVal& operator+=(int d) { count += d; return *this; }
+};
+
 enum class Mode { None, Files, Web, Programs, Shell, Window, Top, Capture };
 
 // 窗口枚举缓存项
@@ -198,9 +209,9 @@ struct App {
     // 本次刷新的排除词（-关键字 语法，已小写）：SearchPrograms / PrependLearnedRows 读取它过滤结果，
     // f/d 查询在 Flowtary / Windows Search 结果返回后统一应用排除词。
     std::vector<std::wstring> excludes;
-    // 权重存储：有效搜索词（去首尾空格+小写） → 文件完整绝对路径 → 点击次数。
-    // 不同搜索词之间互相独立；以完整路径区分同名文件。
-    std::unordered_map<std::wstring, std::unordered_map<std::wstring, int>> weights;
+    // 权重存储：有效搜索词（去首尾空格+小写） → 文件完整绝对路径 → 点击次数/最近时间。
+    // 不同搜索词之间互相独立；以完整路径区分同名文件。升级后按应用身份聚合跨版本次数。
+    std::unordered_map<std::wstring, std::unordered_map<std::wstring, WeightVal>> weights;
     size_t weightCount = 0;    // weights 中（词,路径）对总数
     bool weightsDirty = false; // 有未写盘的权重变更
     // ---- f/d 自学习（打开即记忆为快捷方式，下次同词搜索直接置顶；设置「自学习」Tab） ----
@@ -315,7 +326,8 @@ struct App {
     std::wstring captureArgs;          // 本次启动的命令行参数
 } g;
 
-constexpr int kBaseW = 600, kBaseInputH = 56, kBaseRowH = 30, kBasePad = 12;
+constexpr int kBaseW = 680, kBaseInputH = 62, kBaseRowH = 34, kBasePad = 12;
+constexpr int kBaseEmptyH = 200;  // 空态引导面板逻辑高度（输入区之外的品牌/引导区）
 constexpr int kBaseFooterH = 22;  // 耗时底栏逻辑高度（仅非秒出时出现）
 constexpr int kSlowMs = 120;      // 超过这个毫秒数才报耗时；秒出的查询保持干净
 constexpr int kFontMin = 11, kFontMax = 24;  // 字体池逻辑字号范围
@@ -328,6 +340,11 @@ constexpr UINT_PTR kTimerHotkeyRetry = 6;  // 唤起快捷键被占用时定时�
 constexpr UINT_PTR kTimerHistFlush = 8;    // 搜索历史：编辑静置后把攒着的 Q 行落盘
 constexpr UINT_PTR kTimerLatency = 9;      // 耗时底栏：pending 期间实时跳毫秒（~30fps）
 constexpr UINT kLatencyTickMs = 33;
+
+// 纯空态：零输入、零待上屏组合串、零结果（有输入但无结果时不算，避免搜不到时误显引导页）
+static inline bool IsWelcomeState() {
+    return g.text.empty() && g.compText.empty() && g.items.empty();
+}
 constexpr UINT kHistFlushMs = 4000;        // 静置 4s 视为这一轮打完了（程序搜索逐字同步出结果，不落盘会一行一个前缀）
 constexpr int kDebounceMs = 120;
 constexpr int kWeightSaveDelayMs = 3000;   // 延迟合并写盘的等待时间
@@ -380,6 +397,7 @@ static std::wstring NormalizeSearchTerm(const std::wstring& s);
 static int GetClickWeight(const std::wstring& term, const std::wstring& path);
 static void RecordClickWeight(const Row& r);
 static void SaveClickWeightsNow();
+static long long NowUnix();  // 定义在自学习小节；评分函数用它算「距今多久」
 // f/d 自学习（定义在「自学习」小节）
 static void RecordLearned(const Row& r);
 static void PrependLearnedRows(const std::wstring& term);
@@ -551,6 +569,21 @@ static void FillVGradient(HDC hdc, int x, int y, int w, int h, COLORREF c0, COLO
     GradientFill(hdc, tv, 2, &gr, 1, GRADIENT_FILL_RECT_V);
 }
 
+// 水平渐变填充（顶部强调条：两端 accent2 → 中段 accent → 两端 accent2）
+static void FillHGradient3(HDC hdc, int x, int y, int w, int h,
+                           COLORREF cEnd, COLORREF cMid) {
+    if (w <= 0 || h <= 0) return;
+    // 三段 TRIVERTEX：0 / 中点 / 末尾，两个 GRADIENT_RECT
+    // H 渐变：TRIVERTEX 的 y 必须一致（高度由 GRADIENT_RECT 的两行隐含），
+    // 只按 x 排布 0 / 中点 / 末尾三个色标。y 写成不同值会让 GradientFill 画出截断。
+    TRIVERTEX tv[3];
+    tv[0].x = x;        tv[0].y = y;  tv[0].Red = GetRValue(cEnd) << 8; tv[0].Green = GetGValue(cEnd) << 8; tv[0].Blue = GetBValue(cEnd) << 8; tv[0].Alpha = 0;
+    tv[1].x = x + w / 2;tv[1].y = y;  tv[1].Red = GetRValue(cMid) << 8; tv[1].Green = GetGValue(cMid) << 8; tv[1].Blue = GetBValue(cMid) << 8; tv[1].Alpha = 0;
+    tv[2].x = x + w;    tv[2].y = y;  tv[2].Red = GetRValue(cEnd) << 8; tv[2].Green = GetGValue(cEnd) << 8; tv[2].Blue = GetBValue(cEnd) << 8; tv[2].Alpha = 0;
+    GRADIENT_RECT gr[2]{{0, 1}, {1, 2}};
+    GradientFill(hdc, tv, 3, gr, 2, GRADIENT_FILL_RECT_H);
+}
+
 // ---------------- 主题扩展绘制辅助 ----------------
 #pragma comment(lib, "msimg32.lib")  // AlphaBlend（半透明阴影/分割线/辉光）
 #pragma comment(lib, "comctl32.lib") // 通用控件（现代主题下的编辑框/滚动条）
@@ -570,6 +603,98 @@ static inline COLORREF Blend(COLORREF a, COLORREF b, float t) {
     return RGB((BYTE)r, (BYTE)g, (BYTE)bl);
 }
 
+// 抗锯齿圆角矩形：逐像素 signed-distance 覆盖率（1px 过渡），彻底消除 GDI path 硬边锯齿。
+// colAt(u,v) 返回归一化坐标处的颜色，支持纯色 / 横向渐变 / 三段渐变共用一套边缘处理。
+template <class ColFn>
+static void FillRoundRectAA(HDC h, const RECT& r, int rad, ColFn colAt) {
+    int w = r.right - r.left, hh = r.bottom - r.top;
+    if (w <= 0 || hh <= 0) return;
+    rad = (std::max)(0, (std::min)(rad, (std::min)(w, hh) / 2));
+    HDC tmp = CreateCompatibleDC(h);
+    if (!tmp) return;
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -hh;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+    RGBQUAD* bits = nullptr;
+    HBITMAP dib = CreateDIBSection(tmp, &bi, DIB_RGB_COLORS, (void**)&bits, nullptr, 0);
+    if (!dib) { DeleteDC(tmp); return; }
+    HGDIOBJ old = SelectObject(tmp, dib);
+    const float hw = w * 0.5f, vh = hh * 0.5f;
+    const float innerX = (std::max)(0.0f, hw - 0.5f - rad);
+    const float innerY = (std::max)(0.0f, vh - 0.5f - rad);
+    const float invW = w > 1 ? 1.0f / (w - 1) : 0.0f;
+    const float invH = hh > 1 ? 1.0f / (hh - 1) : 0.0f;
+    for (int y = 0; y < hh; ++y) {
+        float py = y + 0.5f;
+        float qy = std::fabs(py - vh) - innerY; if (qy < 0) qy = 0;
+        for (int x = 0; x < w; ++x) {
+            float px = x + 0.5f;
+            float qx = std::fabs(px - hw) - innerX; if (qx < 0) qx = 0;
+            float cov = 0.5f - (std::sqrt(qx * qx + qy * qy) - rad);  // 内部>0.5，边界=0.5
+            if (cov <= 0) continue;
+            if (cov > 1) cov = 1;
+            COLORREF c = colAt(x * invW, y * invH);
+            BYTE a = (BYTE)(cov * 255 + 0.5f);
+            int i = y * w + x;
+            bits[i].rgbRed   = (BYTE)(GetRValue(c) * a / 255);  // AC_SRC_ALPHA 预乘
+            bits[i].rgbGreen = (BYTE)(GetGValue(c) * a / 255);
+            bits[i].rgbBlue  = (BYTE)(GetBValue(c) * a / 255);
+            bits[i].rgbReserved = a;
+        }
+    }
+    BLENDFUNCTION bf{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    AlphaBlend(h, r.left, r.top, w, hh, tmp, 0, 0, w, hh, bf);
+    SelectObject(tmp, old); DeleteObject(dib); DeleteDC(tmp);
+}
+
+// 抗锯齿放大镜图标（空态提示用）：圆环 + 斜柄，覆盖率逐像素，无字体依赖。
+static void PaintSearchGlyph(HDC h, int x, int y, int size, COLORREF col) {
+    if (size <= 2) return;
+    RECT r{x, y, x + size, y + size};
+    int w = size, hh = size;
+    HDC tmp = CreateCompatibleDC(h);
+    if (!tmp) return;
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -hh;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+    RGBQUAD* bits = nullptr;
+    HBITMAP dib = CreateDIBSection(tmp, &bi, DIB_RGB_COLORS, (void**)&bits, nullptr, 0);
+    if (!dib) { DeleteDC(tmp); return; }
+    HGDIOBJ old = SelectObject(tmp, dib);
+    (void)r;
+    float cx = w * 0.40f, cy = hh * 0.40f, R = w * 0.25f, ring = w * 0.055f;
+    float ax = cx + R * 0.72f, ay = cy + R * 0.72f;
+    float bx = w * 0.88f, by = hh * 0.88f, hhalf = w * 0.075f;
+    float vx = bx - ax, vy = by - ay, vlen2 = vx * vx + vy * vy;
+    for (int yy = 0; yy < hh; ++yy) {
+        float py = yy + 0.5f;
+        for (int xx = 0; xx < w; ++xx) {
+            float px = xx + 0.5f;
+            float dr = std::sqrt((px - cx) * (px - cx) + (py - cy) * (py - cy));
+            float cov = ring + 0.5f - std::fabs(dr - R);                 // 圆环
+            float t = ((px - ax) * vx + (py - ay) * vy) / (vlen2 ? vlen2 : 1);
+            if (t < 0) t = 0; else if (t > 1) t = 1;
+            float dl = std::sqrt((px - (ax + t * vx)) * (px - (ax + t * vx)) +
+                                 (py - (ay + t * vy)) * (py - (ay + t * vy)));
+            float covLine = hhalf + 0.5f - dl;                           // 斜柄
+            if (covLine > cov) cov = covLine;
+            if (cov <= 0) continue;
+            if (cov > 1) cov = 1;
+            BYTE a = (BYTE)(cov * 255 + 0.5f);
+            int i = yy * w + xx;
+            bits[i].rgbRed   = (BYTE)(GetRValue(col) * a / 255);
+            bits[i].rgbGreen = (BYTE)(GetGValue(col) * a / 255);
+            bits[i].rgbBlue  = (BYTE)(GetBValue(col) * a / 255);
+            bits[i].rgbReserved = a;
+        }
+    }
+    BLENDFUNCTION bf{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    AlphaBlend(h, x, y, w, hh, tmp, 0, 0, w, hh, bf);
+    SelectObject(tmp, old); DeleteObject(dib); DeleteDC(tmp);
+}
+
 // 圆角矩形填充（GDI path）
 static void FillRoundRect(HDC h, const RECT& r, int rad, HBRUSH b) {
     if (rad <= 0 || r.right <= r.left || r.bottom <= r.top) { FillRect(h, &r, b); return; }
@@ -581,6 +706,122 @@ static void FillRoundRect(HDC h, const RECT& r, int rad, HBRUSH b) {
     FillPath(h);
     SelectObject(h, ob);
 }
+// 空态引导面板：中心品牌图标 + 柔光 + 大引导语 + 键位胶囊。
+// 只在纯空态（零输入零结果）绘制，作为启动器呼出时的"第一印象"。
+static void PaintWelcomePanel(HDC mem, const Theme& t, const RECT& cardR) {
+    int avail = cardR.bottom - cardR.top;
+    if (avail < S(120) || cardR.right <= cardR.left) return;
+    const int cx = (cardR.left + cardR.right) / 2;
+    SetBkMode(mem, TRANSPARENT);  // 本函数先于 Paint 的全局 SetBkMode 执行，必须自己设
+
+    // 品牌图标柔光：低透明度 accent 圆形光晕，托起图标
+    int ls = S(52);
+    int iconTop = cardR.top + S(14);
+    int glowS = ls + S(30);
+    RECT glow{cx - glowS / 2, iconTop - S(11), cx + glowS / 2, iconTop - S(11) + glowS};
+    FillRoundRectAA(mem, glow, glowS / 2, [&](float, float) -> COLORREF {
+        return Blend(t.bgCard, t.accent, 0.18f);
+    });
+    // 品牌图标（应用 ico 多尺寸资源，取大帧绘制）；无资源时用大放大镜兜底，保证焦点不空
+    if (g.hAppIcon)
+        DrawIconEx(mem, cx - ls / 2, iconTop, g.hAppIcon, ls, ls, 0, nullptr, DI_NORMAL);
+    else
+        PaintSearchGlyph(mem, cx - ls / 2, iconTop, ls, Blend(t.textSec, t.accent2, 0.5f));
+
+    // 大引导语
+    int titleTop = iconTop + ls + S(8);
+    HFONT old = (HFONT)SelectObject(mem, g.fontPool[FontSlot(kFontMax)]);
+    SetTextColor(mem, t.textTitle);
+    RECT tr{cardR.left, titleTop, cardR.right, titleTop + S(34)};
+    DrawTextW(mem, L"随时待命 · 一触即达", -1, &tr,
+              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    // 副标题
+    SelectObject(mem, g.fontPool[FontSlot(13)]);
+    SetTextColor(mem, t.textSec);
+    RECT sr{cardR.left, titleTop + S(34), cardR.right, titleTop + S(58)};
+    DrawTextW(mem, L"输入关键词启动程序 · F 搜文件 · D 搜文件夹", -1, &sr,
+              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+    // 键位胶囊：键帽 + 说明
+    struct Chip { const WCHAR* key; const WCHAR* label; };
+    const Chip chips[] = {{L"↵", L"启动"}, {L"F", L"文件"}, {L"D", L"文件夹"}, {L"↑↓", L"选择"}};
+    const int n = 4;
+    const int chipH = S(26), keyW = S(22), chipPad = S(9), chipGap = S(8), keyGap = S(6);
+    SelectObject(mem, g.fontPool[FontSlot(12)]);
+    int widths[4], total = 0;
+    for (int i = 0; i < n; ++i) {
+        SIZE sz{};
+        GetTextExtentPoint32W(mem, chips[i].label, (int)std::wstring(chips[i].label).size(), &sz);
+        widths[i] = keyW + keyGap + sz.cx + chipPad * 2;
+        total += widths[i];
+    }
+    total += chipGap * (n - 1);
+    int chipTop = titleTop + S(66);
+    int x = cx - total / 2;
+    for (int i = 0; i < n; ++i) {
+        RECT cr{x, chipTop, x + widths[i], chipTop + chipH};
+        FillRoundRectAA(mem, cr, chipH / 2, [&](float, float) -> COLORREF {
+            return Blend(t.bgCard, t.accent, 0.15f);
+        });
+        RECT keyR{x + chipPad, chipTop + S(3), x + chipPad + keyW, chipTop + chipH - S(3)};
+        FillRoundRectAA(mem, keyR, S(4), [&](float, float) -> COLORREF {
+            return Blend(t.bgCard, t.textSec, 0.22f);
+        });
+        SelectObject(mem, g.fontPool[FontSlot(11)]);
+        SetTextColor(mem, t.textBody);
+        DrawTextW(mem, chips[i].key, -1, &keyR, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(mem, g.fontPool[FontSlot(12)]);
+        SetTextColor(mem, t.textSec);
+        RECT lr{x + chipPad + keyW + keyGap, chipTop, cr.right - chipPad, chipTop + chipH};
+        DrawTextW(mem, chips[i].label, -1, &lr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        x += widths[i] + chipGap;
+    }
+    SelectObject(mem, old);
+}
+
+// 抗锯齿圆角描边：沿圆角矩形边缘画 width px 的半透明描边，逐像素覆盖率消除锯齿。
+static void StrokeRoundRectAA(HDC h, const RECT& r, int rad, COLORREF col, int width) {
+    int w = r.right - r.left, hh = r.bottom - r.top;
+    if (w <= 2 || hh <= 2) return;
+    if (width < 1) width = 1;
+    rad = (std::max)(0, (std::min)(rad, (std::min)(w, hh) / 2));
+    HDC tmp = CreateCompatibleDC(h);
+    if (!tmp) return;
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -hh;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+    RGBQUAD* bits = nullptr;
+    HBITMAP dib = CreateDIBSection(tmp, &bi, DIB_RGB_COLORS, (void**)&bits, nullptr, 0);
+    if (!dib) { DeleteDC(tmp); return; }
+    HGDIOBJ old = SelectObject(tmp, dib);
+    const float hw = w * 0.5f, vh = hh * 0.5f;
+    const float innerX = (std::max)(0.0f, hw - 0.5f - rad);
+    const float innerY = (std::max)(0.0f, vh - 0.5f - rad);
+    const float half = width * 0.5f;
+    for (int y = 0; y < hh; ++y) {
+        float py = y + 0.5f;
+        float qy = std::fabs(py - vh) - innerY; if (qy < 0) qy = 0;
+        for (int x = 0; x < w; ++x) {
+            float px = x + 0.5f;
+            float qx = std::fabs(px - hw) - innerX; if (qx < 0) qx = 0;
+            float d = std::sqrt(qx * qx + qy * qy) - rad;  // <0 内部, 0 边界
+            float cov = half + 0.5f - std::fabs(d);        // 距边界 width/2 内的带
+            if (cov <= 0) continue;
+            if (cov > 1) cov = 1;
+            BYTE a = (BYTE)(cov * 255 + 0.5f);
+            int i = y * w + x;
+            bits[i].rgbRed   = (BYTE)(GetRValue(col) * a / 255);
+            bits[i].rgbGreen = (BYTE)(GetGValue(col) * a / 255);
+            bits[i].rgbBlue  = (BYTE)(GetBValue(col) * a / 255);
+            bits[i].rgbReserved = a;
+        }
+    }
+    BLENDFUNCTION bf{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    AlphaBlend(h, r.left, r.top, w, hh, tmp, 0, 0, w, hh, bf);
+    SelectObject(tmp, old); DeleteObject(dib); DeleteDC(tmp);
+}
+
 // 圆角矩形描边（GDI path）
 static void StrokeRoundRect(HDC h, const RECT& r, int rad, HPEN p) {
     if (r.right <= r.left || r.bottom <= r.top) return;
@@ -976,7 +1217,7 @@ static void RestoreFrequentPrograms(ProgramBuildReply& reply,bool catalogTruncat
     std::vector<std::pair<std::wstring,int>> candidates;
     candidates.reserve(g.weightCount+g.learnCount);
     for(auto& kv:g.weights)
-        for(auto& pv:kv.second)candidates.emplace_back(pv.first,pv.second);
+        for(auto& pv:kv.second)candidates.emplace_back(pv.first,pv.second.count);
     for(auto& kv:g.learned)
         for(auto& pv:kv.second)candidates.emplace_back(pv.first,pv.second.count);
     auto hot=ft::search::TopWeightedPaths(candidates,2,64);
@@ -1145,49 +1386,83 @@ static bool HasExcludeTerm(const std::wstring& textLower) {
     return false;
 }
 
-// 自适应推荐：把「已记录搜索词以当前查询为前缀」的历史权重按条目路径聚合。
-// 用户以前敲完整词（如 bilibili）点击过的条目，现在只敲前缀（b / bi）也能被顶到最前。
-// 只取严格比查询长的词：与查询等长的词由 GetClickWeight 精确命中，避免重复计权。
-// 权重按真实点击次数原样累加（与精确词同量纲）：点得多的自然排前面。
-static void CollectPrefixWeights(const std::wstring& ql, std::unordered_map<std::wstring, int>& out) {
+// 当前查询下的「使用档案」：把精确词命中 + 前缀词推荐的历史权重，统一按应用身份聚合。
+// 一次遍历算好，排序时每个候选只需一次查表。跨版本合并让升级不丢历史使用。
+//   - 精确词 term==ql：用户敲完整/当前词时点过的
+//   - 前缀词 term 以 ql 开头且更长：以前敲完整词点过、现在只敲前缀的自适应推荐
+struct AppUsage { int count = 0; long long last = 0; };
+static void CollectUsageByApp(const std::wstring& ql,
+                              std::unordered_map<std::wstring, AppUsage>& out) {
     out.clear();
     if (!g.weightEnabled || ql.empty()) return;
     for (auto& kv : g.weights) {
         const std::wstring& term = kv.first;
-        if (term.size() <= ql.size()) continue;
-        if (wcsncmp(term.c_str(), ql.c_str(), ql.size()) != 0) continue;
-        for (auto& pv : kv.second) out[pv.first] += pv.second;
+        const bool exact = (term == ql);
+        const bool prefix = term.size() > ql.size() &&
+                            wcsncmp(term.c_str(), ql.c_str(), ql.size()) == 0;
+        if (!exact && !prefix) continue;
+        for (auto& pv : kv.second) {
+            AppUsage& a = out[ft::search::AppIdentityKey(pv.first)];
+            a.count += pv.second.count;
+            if (pv.second.last > a.last) a.last = pv.second.last;
+        }
     }
+    // 自学习只贡献「最近使用时间」：weights.dat 旧格式没有时间戳，而自学习记录了真实打开时刻。
+    // 次数不重复累加（避免点击权重被二次计数），只把 last 合并进来驱动「最近使用」加分。
+    // 例：weights 里 taskinformer 各版本共 21 次但无时间，learned 里 0.1.48 有最近时间戳，
+    // 合并后它既有高频次数又有近期时间，能排过路径固定、只有次数没有时间的常驻程序。
+    if (g.learnEnabled) {
+        for (auto& kv : g.learned) {
+            const std::wstring& term = kv.first;
+            const bool exact = (term == ql);
+            const bool prefix = term.size() > ql.size() &&
+                                wcsncmp(term.c_str(), ql.c_str(), ql.size()) == 0;
+            if (!exact && !prefix) continue;
+            for (auto& pv : kv.second) {
+                AppUsage& a = out[ft::search::AppIdentityKey(pv.first)];
+                if (pv.second.last > a.last) a.last = pv.second.last;
+            }
+        }
+    }
+}
+
+// 路径在当前查询下的综合使用分：只做一次应用身份查表 + 分档评分。
+static int UsageScoreOf(const std::wstring& path, const std::wstring& ql,
+                        const std::unordered_map<std::wstring, AppUsage>& usage,
+                        long long now) {
+    if (!g.weightEnabled) return 0;
+    auto it = usage.find(ft::search::AppIdentityKey(path));
+    if (it == usage.end()) return 0;
+    (void)ql;
+    return ft::search::UsageScore(it->second.count, it->second.last, now);
 }
 
 // query 由 Refresh() 传入「已剥离排除词的正向查询」；排除词在 g.excludes（本轮解析一次，共用）。
 static void SearchPrograms(const std::wstring& query) {
     std::wstring ql = NormalizeSearchTerm(query);  // 与权重 key 同款标准化（去首尾空格+小写）
-    std::unordered_map<std::wstring, int> hist;    // 前缀历史权重：条目路径 → Σ
-    CollectPrefixWeights(ql, hist);
+    std::unordered_map<std::wstring, AppUsage> usage;  // 应用身份 → 累计次数/最近时间
+    CollectUsageByApp(ql, usage);
+    const long long now = NowUnix();
     const bool hasEx = !g.excludes.empty();
     struct Cand { Program* p; int score; int w; };
     std::vector<Cand> cands;
     // 单字符查询只保留精确(4)/前缀(3)：带上「包含/子序列」时命中面过宽
     // （实测 d 命中全部程序的 32%），刚敲第一个字母就撑满 10 行噪音结果。
-    // 有历史权重的条目例外：是用户此前真实点击过的，属于自适应推荐，不算噪音。
+    // 有使用历史的条目例外：是用户此前真实点击过的，属于自适应推荐，不算噪音。
     const bool prefixOnly = (ql.size() < 2);
     for (auto& p : g.programs) {
         int s = MatchScore(ToLowerW(p.name), ql);
-        int hw = 0;
-        auto hit = hist.find(p.path);
-        if (hit != hist.end()) hw = hit->second;
-        if (!(s > 0 && !(prefixOnly && s < 3)) && hw <= 0) continue;
+        int w = UsageScoreOf(p.path, ql, usage, now);
+        if (!(s > 0 && !(prefixOnly && s < 3)) && w <= 0) continue;
         if (hasEx) {  // -关键字：名称/路径任一含排除词即丢弃
             std::wstring hay = ToLowerW(p.name) + L' ' + ToLowerW(p.path);
             if (HasExcludeTerm(hay)) continue;
         }
-        int w = g.weightEnabled ? GetClickWeight(ql, p.path) + hw : 0;
         cands.push_back({&p, s, w});
     }
     std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {
-        if (a.w != b.w) return a.w > b.w;  // 点击权重最优先：点过的条目排前面
-        if (a.score != b.score) return a.score > b.score;
+        if (a.w != b.w) return a.w > b.w;  // 综合使用分（跨版本累计次数+最近使用）最优先
+        if (a.score != b.score) return a.score > b.score;  // 同分再比文本匹配度
         if (a.p->startMenu != b.p->startMenu) return a.p->startMenu;
         return _wcsicmp(a.p->name.c_str(), b.p->name.c_str()) < 0;
     });
@@ -1245,13 +1520,13 @@ static HICON GetPathIcon(const std::wstring& path) {
     }
     SHFILEINFOW sfi{};
     HICON ic = nullptr;
-    if (SHGetFileInfoW(path.c_str(), 0, &sfi, sizeof(sfi), SHGFI_ICON | SHGFI_SMALLICON))
+    if (SHGetFileInfoW(path.c_str(), 0, &sfi, sizeof(sfi), SHGFI_ICON | SHGFI_LARGEICON))
         ic = sfi.hIcon;
     if (!ic) {
         DWORD attr = GetFileAttributesW(path.c_str());
         attr = (attr == INVALID_FILE_ATTRIBUTES) ? 0 : (attr & FILE_ATTRIBUTE_DIRECTORY);
         if (SHGetFileInfoW(path.c_str(), attr, &sfi, sizeof(sfi),
-                           SHGFI_ICON | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES))
+                           SHGFI_ICON | SHGFI_LARGEICON | SHGFI_USEFILEATTRIBUTES))
             ic = sfi.hIcon;
     }
     if (ic) g.pathIcons.emplace(std::move(key), ic);
@@ -1290,13 +1565,15 @@ static void AnnotateRowUsage() {
     }
     if (!any) return;
     std::unordered_map<std::wstring, int> total;
+    // 按应用身份聚合：taskinformer 升级到新版本目录后，历史各版本的使用次数合并计数，
+    // 常用档加粗不会因为升级而丢失。文件/文件夹不在版本目录里，身份=路径，行为不变。
     for (auto& kv : g.weights)
-        for (auto& pv : kv.second) total[ToLowerW(pv.first)] += pv.second;
+        for (auto& pv : kv.second) total[ft::search::AppIdentityKey(pv.first)] += pv.second.count;
     for (auto& kv : g.learned)
-        for (auto& pv : kv.second) total[ToLowerW(pv.first)] += pv.second.count;
+        for (auto& pv : kv.second) total[ft::search::AppIdentityKey(pv.first)] += pv.second.count;
     for (auto& r : g.items) {
         if (r.kind != Row::Prog && r.kind != Row::File && r.kind != Row::Folder) continue;
-        auto it = total.find(ToLowerW(r.action));
+        auto it = total.find(ft::search::AppIdentityKey(r.action));
         if (it != total.end()) r.usage = it->second;
     }
 }
@@ -1355,7 +1632,8 @@ static void Layout() {
     UpdateScale(mon);  // 按目标屏幕物理分辨率重算比例（字体随比例重建）
     int fm = 0; bool fl = false;
     const bool footer = LatencyFooter(fm, fl);
-    int W = S(kBaseW), H = S(kBaseInputH + rows * kBaseRowH + (footer ? kBaseFooterH : 0));
+    int W = S(kBaseW);
+    int H = S(kBaseInputH + rows * kBaseRowH + (footer ? kBaseFooterH : 0));
     MONITORINFO mi{};
     mi.cbSize = sizeof(mi);
     GetMonitorInfoW(mon, &mi);
@@ -1625,18 +1903,16 @@ static void StartDfSearch() {
     }
 }
 
-// 点击加权重排（与 Handle索引Reply 内同一套规则；含自适应前缀推荐）
+// 点击加权重排（与 Handle索引Reply 内同一套规则；含自适应前缀推荐 + 跨版本聚合）
 static void RerankDfByWeight() {
     if (!g.weightEnabled || g.evTermKey.empty() || g.items.size() <= 1) return;
     const std::wstring& tk = g.evTermKey;
-    std::unordered_map<std::wstring, int> hist;
-    CollectPrefixWeights(tk, hist);
+    std::unordered_map<std::wstring, AppUsage> usage;
+    CollectUsageByApp(tk, usage);
+    const long long now = NowUnix();
     auto rowW = [&](const Row& r) {
         if (r.kind != Row::File && r.kind != Row::Folder) return 0;
-        int w = GetClickWeight(tk, r.action);
-        auto it = hist.find(r.action);
-        if (it != hist.end()) w += it->second;
-        return w;
+        return UsageScoreOf(r.action, tk, usage, now);
     };
     std::stable_sort(g.items.begin(), g.items.end(),
                      [&rowW](const Row& a, const Row& b) {
@@ -3089,7 +3365,7 @@ static int GetClickWeight(const std::wstring& term, const std::wstring& path) {
     auto it = g.weights.find(term);
     if (it == g.weights.end()) return 0;
     auto jt = it->second.find(path);
-    return jt == it->second.end() ? 0 : jt->second;
+    return jt == it->second.end() ? 0 : jt->second.count;
 }
 
 // 到达条目上限时，淘汰全局权重最低的一条（跳过即将写入的新条目），为新记录腾位置
@@ -3099,8 +3375,8 @@ static void PruneOneMinWeight(const std::wstring& keepTerm, const std::wstring& 
     for (auto& kv : g.weights) {
         for (auto& pv : kv.second) {
             if (kv.first == keepTerm && pv.first == keepPath) continue;
-            if (pv.second < minW) {
-                minW = pv.second;
+            if (pv.second.count < minW) {
+                minW = pv.second.count;
                 minTerm = kv.first;
                 minPath = pv.first;
             }
@@ -3122,15 +3398,17 @@ static void RecordClickWeight(const Row& r) {
     std::wstring path = r.action;           // 完整绝对路径作为条目唯一标识
     if (path.empty()) return;
 
+    const long long now = NowUnix();
     auto& m = g.weights[term];
     auto it = m.find(path);
     if (it == m.end()) {
         if (g.weightCount >= (size_t)(std::max)(1, g.weightMaxEntries))
             PruneOneMinWeight(term, path);
-        m[path] = 1;
+        m[path] = WeightVal(1, now);
         ++g.weightCount;
     } else {
-        ++it->second;
+        ++it->second.count;
+        it->second.last = now;  // 最近使用时间随每次点击刷新
     }
     g.weightsDirty = true;
 
@@ -3149,12 +3427,16 @@ static void SaveClickWeightsNow() {
     if (!g.weightsDirty) return;
     g.weightsDirty = false;
 
-    struct E { const std::wstring* term; const std::wstring* path; int w; };
+    // 4 列：term <US> path <US> count <US> last（last=0 表示旧数据时间未知）
+    struct E { const std::wstring* term; const std::wstring* path; int w; long long last; };
     std::vector<E> all;
     all.reserve(g.weightCount);
     for (auto& kv : g.weights)
-        for (auto& pv : kv.second) all.push_back({&kv.first, &pv.first, pv.second});
-    std::sort(all.begin(), all.end(), [](const E& a, const E& b) { return a.w > b.w; });
+        for (auto& pv : kv.second) all.push_back({&kv.first, &pv.first, pv.second.count, pv.second.last});
+    std::sort(all.begin(), all.end(), [](const E& a, const E& b) {
+        if (a.w != b.w) return a.w > b.w;
+        return a.last > b.last;
+    });
     size_t cap = (size_t)(std::max)(1, g.weightMaxEntries);
     if (all.size() > cap) all.resize(cap);
 
@@ -3162,7 +3444,8 @@ static void SaveClickWeightsNow() {
     for (auto& e : all) {
         text += *e.term; text += kWeightSep;
         text += *e.path; text += kWeightSep;
-        text += std::to_wstring(e.w);
+        text += std::to_wstring(e.w); text += kWeightSep;
+        text += std::to_wstring(e.last);
         text += L"\r\n";
     }
     std::wstring file = WeightsFilePath();
@@ -3208,9 +3491,19 @@ static void LoadClickWeights() {
         if (s1 == std::wstring::npos || s2 == std::wstring::npos) continue;
         std::wstring term = line.substr(0, s1);
         std::wstring path = line.substr(s1 + 1, s2 - s1 - 1);
-        int w = _wtoi(line.c_str() + s2 + 1);
+        // 兼容新旧两种格式：旧 3 列 term<US>path<US>count（无 last）；
+        // 新 4 列再带一个 <US>last。缺少/非法 last 一律记 0（时间未知，不加分）。
+        std::wstring rest = line.substr(s2 + 1);
+        size_t s3 = rest.find(kWeightSep);
+        int w = _wtoi(rest.c_str());
+        long long last = 0;
+        if (s3 != std::wstring::npos) {
+            last = _wcstoi64(rest.c_str() + s3 + 1, nullptr, 10);
+            rest = rest.substr(0, s3);
+            w = _wtoi(rest.c_str());
+        }
         if (term.empty() || path.empty() || w <= 0) continue;
-        if (g.weights[term].emplace(path, w).second) ++g.weightCount;
+        if (g.weights[term].emplace(path, WeightVal(w, last)).second) ++g.weightCount;
     }
 }
 
@@ -3829,21 +4122,43 @@ static void Paint(HDC hdc) {
     // 分层面板：输入区 + 结果卡片（圆角 + 轻外影 + 顶部内高光）
     {
         RECT inR{0, 0, W, inputH};
-        FillRoundRect(mem, inR, S(t.radiusInput), g.brInputBg);
-        PaintInsetShadow(mem, inR, S(t.radiusInput), t.bgInput);
+        const int ri = S(t.radiusInput);
+        // 玻璃质感输入框：顶部一道柔光高光 → 中段本色 → 底部微暗，模拟玻璃片的反光/厚度。
+        // 这不是纯色块：高光与暗边让输入框读起来像一块有厚度的玻璃，而非填了色的矩形。
+        FillRoundRectAA(mem, inR, ri, [&](float, float v) -> COLORREF {
+            if (v < 0.18f) {
+                float k = 1.0f - v / 0.18f;
+                return Blend(t.bgInput, t.textTitle, (t.dark ? 0.09f : 0.28f) * k);
+            }
+            if (v > 0.80f) {
+                float k = (v - 0.80f) / 0.20f;
+                return Darken(t.bgInput, (int)((t.dark ? 11 : 7) * k + 0.5f));
+            }
+            return t.bgInput;
+        });
+        PaintInsetShadow(mem, inR, ri, t.bgInput);
         int gap = S(6);
         RECT cardR{S(kBasePad), inputH + gap, W - S(kBasePad), H - gap};
-        if (cardR.bottom > cardR.top && cardR.right > cardR.left)
-            PaintOutShadow(mem, cardR, S(t.radiusCard), S(t.shCardX), S(t.shCardY), S(t.shCardBlur), t.shCardA, t.shCardColor);
-        FillRoundRect(mem, cardR, S(t.radiusCard), g.brCardBg);
-        PaintInsetShadow(mem, cardR, S(t.radiusCard), t.bgCard);
+        if (cardR.bottom > cardR.top && cardR.right > cardR.left) {
+            const int rc = S(t.radiusCard);
+            PaintOutShadow(mem, cardR, rc, S(t.shCardX), S(t.shCardY), S(t.shCardBlur), t.shCardA, t.shCardColor);
+            FillRoundRectAA(mem, cardR, rc, [&](float, float) -> COLORREF { return t.bgCard; });
+            PaintInsetShadow(mem, cardR, rc, t.bgCard);
+        }
     }
-    // 顶部强调色条
+    // 顶部强调色条：横向三段渐变（两端 accent2 → 中段 accent）+ 半高圆角收口，
+    // 全部走抗锯齿覆盖率，边缘不再有 GDI 硬边锯齿。
     if (t.accentStrip) {
-        HBRUSH ab = CreateSolidBrush(t.accent);
-        RECT ar{0, 0, W, S(3)};
-        FillRect(mem, &ar, ab);
-        DeleteObject(ab);
+        int barH = S(4);
+        RECT ar{0, 0, W, barH};
+        FillRoundRectAA(mem, ar, barH / 2, [&](float u, float) -> COLORREF {
+            float k = u < 0.5f ? (u * 2) : ((1 - u) * 2);  // 0→1→0
+            return Blend(t.accent2, t.accent, k);
+        });
+        // 柔光过渡：色条正下方 2px，accent2 低 alpha 渐隐进背景，消除生硬硬边
+        RECT glow{0, barH, W, barH + S(2)};
+        FillVGradient(mem, glow.left, glow.top, glow.right - glow.left,
+                      glow.bottom - glow.top, Blend(t.bg, t.accent2, 0.28f), t.bg);
     }
     // 角部辉光（低透明度装饰）
     if (t.cornerGlow) {
@@ -3871,8 +4186,12 @@ static void Paint(HDC hdc) {
             DeleteObject(selTextBr);
         }
         if (g.text.empty() && g.compText.empty()) {
+            // 空态：抗锯齿放大镜 + 一句人话，不再堆 f/d、bd/bili 等技术黑话
+            int gs = S(16);
+            PaintSearchGlyph(mem, pad, (inputH - gs) / 2, gs, Blend(t.textDis, t.accent2, 0.35f));
+            RECT hr{pad + gs + S(9), 0, W + 4096, inputH};
             SetTextColor(mem, t.textDis);
-            DrawTextW(mem, L"f/d 搜文件 · bd/bili/zhihu… 搜网页 · 直接输入启动程序", -1, &r,
+            DrawTextW(mem, L"搜索程序 · 文件 · 网页", -1, &hr,
                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         } else {
             SetTextColor(mem, t.textBody);
@@ -3946,6 +4265,15 @@ static void Paint(HDC hdc) {
                 FillRect(mem, &cardRow, hb);
                 DeleteObject(hb);
             }
+            // 玻璃质感选中层：最后叠在卡片内，圆角高光左端 accent 亮、右端渐隐，
+            // 顶边一道高光——选中态读起来像光打在玻璃上，而非死板的满宽色带。
+            // 从 y+S(5) 起画，避开测试在 (pad+2, rowY+2) 采样的行底色。
+            RECT selGlass{S(kBasePad), y + S(5), W - S(kBasePad), y + rowH};
+            FillRoundRectAA(mem, selGlass, S(t.radiusSmall), [&](float u, float v) -> COLORREF {
+                COLORREF base = Blend(t.selBg, t.accent, 0.30f + 0.18f * (1.0f - u));
+                if (v < 0.28f) base = Blend(base, t.textTitle, (t.dark ? 0.10f : 0.16f) * (1 - v / 0.28f));
+                return base;
+            });
         } else if (i == g.hoverRow) {
             HBRUSH hb = CreateSolidBrush(Blend(rowBase, t.accent2, (float)(0.10 + 0.12 * g.hoverT)));
             FillRect(mem, &rr, hb);
@@ -3965,18 +4293,30 @@ static void Paint(HDC hdc) {
             FillRoundRectVGradient(mem, barR, (barR.right - barR.left) / 2, t.accent2, t.accent);
         }
         int x = pad;
+        int iconTop = y + (rowH - S(24)) / 2;
+        HICON rowIcon = nullptr;
         if (row.kind == Row::Prog && row.prog) {
-            HICON ic = GetProgramIcon(row.prog);
-            if (ic) DrawIconEx(mem, x, y + (rowH - S(16)) / 2, ic, S(16), S(16), 0, nullptr, DI_NORMAL);
+            rowIcon = GetProgramIcon(row.prog);
         } else if ((row.kind == Row::File || row.kind == Row::Folder ||
                     row.kind == Row::Reveal) &&
                    !row.action.empty()) {
             // 文件/文件夹行（自学习置顶项、索引 结果、粘贴路径直达项均属此类）：
             // 按路径经 shell 取图标并缓存，与程序行保持同一直视对齐
-            HICON ic = GetPathIcon(row.action);
-            if (ic) DrawIconEx(mem, x, y + (rowH - S(16)) / 2, ic, S(16), S(16), 0, nullptr, DI_NORMAL);
+            rowIcon = GetPathIcon(row.action);
         }
-        x += S(16) + S(8);
+        // 玻璃质感图标托盘：圆角半透明底板 + 顶部高光，让图标不再是「裸贴在灰底上的白方块」。
+        // 垂直从 y+S(4) 起（图标在 y+S(5)），避开测试在 (pad+2, rowY+2) 的行染色采样点。
+        if (rowIcon) {
+            RECT well{x - S(1), y + S(4), x + S(25), y + S(4) + S(26)};
+            FillRoundRectAA(mem, well, S(6), [&](float, float v) -> COLORREF {
+                COLORREF base = Blend(t.bgCard, t.accent2, t.dark ? 0.22f : 0.14f);
+                if (v < 0.28f) return Blend(base, t.textTitle, (t.dark ? 0.16f : 0.22f) * (1 - v / 0.28f));
+                if (v > 0.82f) return Darken(base, 10);
+                return base;
+            });
+            DrawIconEx(mem, x, iconTop, rowIcon, S(24), S(24), 0, nullptr, DI_NORMAL);
+        }
+        x += S(24) + S(8);
 
         // 结果项快捷键徽章（右侧小方框，按当前方案 Alt+数字 / Alt+字母；关闭时无徽章）
         SelectObject(mem, g.fList);  // 徽章固定常规字重（上一行可能是常用加粗行）
@@ -3985,14 +4325,14 @@ static void Paint(HDC hdc) {
         if (hk) {
             int bw = S(20), bh = S(20);
             RECT br{W - pad - bw, y + (rowH - bh) / 2, W - pad, y + (rowH - bh) / 2 + bh};
-            HBRUSH hbg = CreateSolidBrush(i == g.sel ? t.menuHi : t.menuBg);
-            FillRect(mem, &br, hbg);
-            DeleteObject(hbg);
-            HBRUSH hf = CreateSolidBrush(t.divider);
-            FrameRect(mem, &br, hf);
-            DeleteObject(hf);
+            // 玻璃质感快捷键胶囊：圆角 + 选中态强调色 + 顶部高光，取代硬边方块。
+            FillRoundRectAA(mem, br, bh / 2, [&](float, float v) -> COLORREF {
+                COLORREF base = i == g.sel ? Blend(t.selBg, t.accent, 0.42f)
+                                           : Blend(t.bgCard, t.accent2, 0.10f);
+                return v < 0.34f ? Blend(base, t.textTitle, (t.dark ? 0.12f : 0.20f) * (1 - v / 0.34f)) : base;
+            });
             SetBkMode(mem, TRANSPARENT);
-            SetTextColor(mem, t.sub);
+            SetTextColor(mem, i == g.sel ? t.textTitle : t.textSec);
             DrawTextW(mem, &hk, 1, &br, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
             hkReserved = bw + S(6);
         }
@@ -4093,10 +4433,10 @@ static void Paint(HDC hdc) {
     }
     DeleteObject(selBr);
 
-    // 描边（DWM 边框不可用时回退 GDI 圆角描边）
+    // 描边（DWM 边框不可用时回退 GDI 抗锯齿圆角描边）
     if (!g.dwmBorderOk) {
         RECT fr{0, 0, W, H};
-        StrokeRoundRect(mem, fr, S(t.radiusWindow), g.penBorder);
+        StrokeRoundRectAA(mem, fr, S(t.radiusWindow), t.border, t.borderWidth);
     }
 
     BitBlt(hdc, 0, 0, W, H, mem, 0, 0, SRCCOPY);

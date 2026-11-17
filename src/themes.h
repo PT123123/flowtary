@@ -60,23 +60,32 @@ struct Theme {
 };
 
 inline Theme kThemes[] = {
-    {L"黑色简洁", true, 255, 16, 13,
+    {L"黑色简洁", true, 255, 18, 15,
      RGB(0, 0, 0), RGB(0, 0, 0), RGB(255, 255, 255), RGB(140, 140, 140),
      RGB(150, 150, 150), RGB(51, 51, 51), RGB(34, 34, 34), RGB(28, 28, 28),
      RGB(51, 51, 51), RGB(24, 24, 24), RGB(80, 80, 80), false},
-    {L"透明Mac黑暗", true, 224, 16, 13,
+    {L"透明Mac黑暗", true, 224, 18, 15,
      RGB(16, 16, 16), RGB(12, 12, 12), RGB(255, 255, 255), RGB(153, 153, 153),
      RGB(135, 135, 135), RGB(42, 42, 42), RGB(33, 33, 33), RGB(28, 28, 28),
      RGB(51, 51, 51), RGB(18, 18, 18), RGB(85, 85, 85), false},
-    {L"透明蓝色", true, 224, 16, 13,
+    {L"透明蓝色", true, 224, 18, 15,
      RGB(26, 52, 96), RGB(12, 23, 48), RGB(234, 243, 255), RGB(127, 163, 201),
      RGB(110, 143, 186), RGB(31, 58, 92), RGB(40, 72, 110), RGB(20, 39, 63),
      RGB(31, 58, 92), RGB(15, 30, 54), RGB(63, 107, 150), false},
-    {L"星空风格", true, 250, 17, 14,
-     RGB(12, 16, 48), RGB(4, 5, 15), RGB(232, 236, 255), RGB(138, 146, 200),
-     RGB(112, 119, 173), RGB(30, 36, 72), RGB(40, 48, 92), RGB(13, 18, 38),
-     RGB(30, 36, 72), RGB(9, 13, 32), RGB(74, 86, 160), true},
-    {L"日出浅白", false, 255, 16, 13,
+    {L"星空风格", true, 250, 19, 16,
+     RGB(12, 16, 44), RGB(5, 7, 24), RGB(236, 240, 255), RGB(150, 160, 214),
+     RGB(112, 122, 180), RGB(32, 42, 88), RGB(44, 56, 104), RGB(14, 20, 48),
+     RGB(32, 42, 88), RGB(10, 15, 38), RGB(84, 98, 172), true,
+     12, 9, 7, 8, 4, 1, false,
+     RGB(88, 146, 222), RGB(128, 184, 244),
+     RGB(20, 27, 60), RGB(15, 21, 50),
+     RGB(242, 245, 255), RGB(216, 224, 250), RGB(146, 158, 210), RGB(96, 108, 160),
+     RGB(76, 190, 126), RGB(232, 170, 70), RGB(232, 96, 92),
+     6, 7, 18, 60, RGB(0, 0, 0),
+     1, 2, 8, 26, RGB(0, 0, 0),
+     3, 5, 14, 46, RGB(0, 0, 0),
+     6, 200, 0, true, false, false},
+    {L"日出浅白", false, 255, 18, 15,
      RGB(244, 244, 244), RGB(244, 244, 244), RGB(26, 26, 26), RGB(110, 110, 110),
      RGB(155, 160, 166), RGB(223, 223, 223), RGB(208, 208, 208), RGB(255, 255, 255),
      RGB(228, 228, 228), RGB(243, 243, 243), RGB(196, 196, 196), false,
@@ -91,7 +100,7 @@ inline Theme kThemes[] = {
      6, 220, 0, true, false, false},
 
     // 6. Ice-Quartz（浅冷色，真实 Mica / Win10 回退哑光）
-    {L"Ice-Quartz", false, 255, 16, 13,
+    {L"Ice-Quartz", false, 255, 18, 15,
      RGB(0xEE,0xF3,0xF7), RGB(0xEE,0xF3,0xF7), RGB(0x1A,0x27,0x33), RGB(0x64,0x74,0x84),
      RGB(0x9A,0xA8,0xB6), RGB(0xDD,0xE6,0xEE), RGB(0xC8,0xD6,0xE2), RGB(0xFF,0xFF,0xFF),
      RGB(0xE7,0xEE,0xF3), RGB(0xF4,0xF8,0xFB), RGB(0xB9,0xC9,0xD8), false,
@@ -106,7 +115,7 @@ inline Theme kThemes[] = {
      6, 220, 0, true, false, false},
 
     // 7. Obsidian（极深暗黑工具风，真实 Mica + 微弱蓝辉光）
-    {L"Obsidian", true, 255, 16, 13,
+    {L"Obsidian", true, 255, 18, 15,
      RGB(0x0D,0x0F,0x14), RGB(0x0D,0x0F,0x14), RGB(0xFF,0xFF,0xFF), RGB(0x88,0x96,0xB0),
      RGB(0x50,0x5A,0x6E), RGB(0x1A,0x1E,0x27), RGB(0x2C,0x34,0x42), RGB(0x1A,0x1E,0x27),
      RGB(0x10,0x13,0x18), RGB(0x12,0x15,0x1C), RGB(0x3A,0x44,0x55), false,
@@ -121,7 +130,7 @@ inline Theme kThemes[] = {
      6, 200, 0, true, true, false},
 
     // 8. Honey-Amber（暖暗色，真实 Mica / Win10 回退哑光）
-    {L"Honey-Amber", true, 255, 16, 13,
+    {L"Honey-Amber", true, 255, 18, 15,
      RGB(0x1C,0x19,0x17), RGB(0x1C,0x19,0x17), RGB(0xF8,0xE9,0xD7), RGB(0xB8,0xA4,0x8C),
      RGB(0x7E,0x6E,0x5A), RGB(0x2D,0x28,0x23), RGB(0x3E,0x36,0x2E), RGB(0x2D,0x28,0x23),
      RGB(0x18,0x15,0x12), RGB(0x22,0x1E,0x19), RGB(0x4A,0x40,0x34), false,

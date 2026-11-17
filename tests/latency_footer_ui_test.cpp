@@ -172,12 +172,17 @@ int main() {
     Layout();
     Check(ClientH() == baseH, "settled fast keeps window clean");
 
-    // ---- 对照臂：空输入 ⇒ 无论耗时都不显示（生产 Refresh 会清空结果） ----
+    // ---- 对照臂：空输入 ⇒ 无论耗时都不显示 footer（生产 Refresh 会清空结果） ----
+    // 空态是紧凑输入框（无引导面板），高度回落到一个输入框，底部仍不应有 footer 文字
     g.qSettledMs = 300; g.text = L""; g.items.clear();
     Layout();
-    Check(ClientH() == S(kBaseInputH), "empty input has no footer");
+    Check(ClientH() == S(kBaseInputH), "empty input compact, no footer");
     Pixels pe = RenderAndGrab(L"latency_control.bmp");
-    (void)pe; (void)pad; (void)inputH; (void)rowH;
+    // 紧凑空态底部不应有 footer 的 accent2 实时色（footer 未显示）
+    RECT bottomStrip{0, ClientH() - S(kBaseFooterH), pc.w, ClientH()};
+    if (bottomStrip.top < 0) bottomStrip.top = 0;
+    Check(pe.CountColor(t.accent2, bottomStrip) == 0, "empty input has no footer ink");
+    (void)pad; (void)inputH; (void)rowH;
 
     { std::lock_guard<std::mutex> lock(s_wsMu); s_wsQuit = true; } s_wsCv.notify_one();
     DestroyWindow(g.hwnd);

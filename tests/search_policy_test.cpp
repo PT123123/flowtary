@@ -73,6 +73,50 @@ int main() {
               tied[1].first == L"C:\\b\\z.exe", "equal weights sort by path");
     }
 
+    // 应用身份归一化：同一应用的不同版本目录归到同一个 key，升级不丢历史使用。
+    using ft::search::AppIdentityKey;
+    {
+        auto k1 = AppIdentityKey(L"C:\\workshop\\taskinformer-0.1.11\\taskinformer.exe");
+        auto k2 = AppIdentityKey(L"C:\\workshop\\taskinformer-0.1.48\\taskinformer.exe");
+        Check(!k1.empty() && k1 == k2, "version dirs collapse to one app identity");
+    }
+    {
+        auto ka = AppIdentityKey(L"C:\\workshop\\aura-1.2.25\\aura.exe");
+        auto kb = AppIdentityKey(L"C:\\workshop\\taskinformer-0.1.11\\taskinformer.exe");
+        Check(ka != kb, "different apps keep different identities");
+    }
+    {
+        // 无版本号的普通程序：身份=小写全路径，大小写不敏感但路径不同则不同
+        auto k1 = AppIdentityKey(L"C:\\Apps\\Trae\\Trae.exe");
+        auto k2 = AppIdentityKey(L"c:\\apps\\trae\\trae.exe");
+        auto k3 = AppIdentityKey(L"C:\\Apps\\Trae CN\\TraeCN.exe");
+        Check(k1 == k2 && k1 != k3, "non-versioned programs use lowercased full path");
+    }
+
+    // 最近使用加分：越近越高，时间未知(<=0)不加分，30 天以上不加分。
+    using ft::search::RecencyBonus;
+    const long long NOW = 1000000000LL;
+    const long long DAY = 86400;
+    {
+        Check(RecencyBonus(0, NOW) == 0, "unknown last time gets no bonus");
+        Check(RecencyBonus(NOW, NOW) == 8, "used today gets highest bonus");
+        Check(RecencyBonus(NOW - 2 * DAY, NOW) == 5, "used within 3 days");
+        Check(RecencyBonus(NOW - 6 * DAY, NOW) == 3, "used within 7 days");
+        Check(RecencyBonus(NOW - 20 * DAY, NOW) == 1, "used within 30 days");
+        Check(RecencyBonus(NOW - 90 * DAY, NOW) == 0, "used long ago gets no bonus");
+        Check(RecencyBonus(NOW + DAY, NOW) == 8, "future timestamp clamped to today");
+    }
+
+    // 综合分：次数仍是主因，最近使用只温和加权；taskinformer 场景——
+    // 版本分散导致每版 4 次，聚合后 5 版=20 次，压过单次常驻程序 23 次中近期用过的那一档。
+    using ft::search::UsageScore;
+    {
+        Check(UsageScore(4, 0, NOW) == 4, "no recency info: score is pure count");
+        Check(UsageScore(4, NOW, NOW) == 12, "count plus today bonus");
+        Check(UsageScore(20, NOW - DAY, NOW) > UsageScore(23, 0, NOW),
+              "aggregated recent usage outranks a higher static count");
+    }
+
     if (g_fail) { std::printf("\n%d FAILED\n", g_fail); return 1; }
     std::printf("\nall passed\n");
     return 0;

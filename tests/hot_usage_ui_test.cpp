@@ -139,17 +139,18 @@ static void SeedUsage() {
     g.weights.clear(); g.weightCount = 0;
     g.learned.clear(); g.learnCount = 0;
     // Trae：两个搜索词的权重 5+7，再叠自学习 3 次 ⇒ 15（高频档）
-    g.weights[L"tra"][L"C:\\Apps\\Trae\\Trae.exe"] = 5;
-    g.weights[L"trae"][L"C:\\Apps\\Trae\\Trae.exe"] = 7;
+    // 注意：usage 档位只看累计次数，last 只影响排序加分，这里统一给当前时间。
+    g.weights[L"tra"][L"C:\\Apps\\Trae\\Trae.exe"] = WeightVal(5, NowUnix());
+    g.weights[L"trae"][L"C:\\Apps\\Trae\\Trae.exe"] = WeightVal(7, NowUnix());
     LearnVal v; v.count = 3; v.last = NowUnix();
     g.learned[L"trae"][L"C:\\Apps\\Trae\\Trae.exe"] = v;
     // Trae CN：同在开始菜单目录，但只点过 1 次 ⇒ 保持原样
-    g.weights[L"trae"][L"C:\\Apps\\Trae\\TraeCN.exe"] = 1;
+    g.weights[L"trae"][L"C:\\Apps\\Trae\\TraeCN.exe"] = WeightVal(1, NowUnix());
     // projects：恰好进入常用档 3
     LearnVal f; f.count = kHotUsageMin; f.last = NowUnix();
     g.learned[L"proj"][L"C:\\Users\\demo\\projects"] = f;
     // aura：与 Trae 同档但次数更高 ⇒ 同档内连续渐变必须可见
-    g.weights[L"au"][L"C:\\workshop\\aura-1.2.25"] = 25;
+    g.weights[L"au"][L"C:\\workshop\\aura-1.2.25"] = WeightVal(25, NowUnix());
     // workshop：重度档 40
     LearnVal w; w.count = 40; w.last = NowUnix();
     g.learned[L"work"][L"C:\\workshop"] = w;
@@ -223,7 +224,7 @@ int main() {
     int barX = S(2);
     auto midY = [&](int i) { return rowY(i) + rowH / 2; };
     auto rightBox = [&](int i) { return RECT{px.w / 2, rowY(i), px.w, rowY(i) + rowH}; };
-    auto titleBox = [&](int i) { return RECT{pad + S(24), rowY(i), px.w / 2, rowY(i) + rowH}; };
+    auto titleBox = [&](int i) { return RECT{pad + S(24) + S(8), rowY(i), px.w / 2, rowY(i) + rowH}; };
 
     // 色条宽度随档位：常用 3px / 高频 4px / 重度 5px（逻辑）
     Check(Near(px.At(barX + S(1), midY(2)), barMid, 12), "tier2 bar present");
@@ -273,7 +274,7 @@ int main() {
     Check(px.CountColor(t.accent, rightBox(2)) > 3, "tier2 badge tier dot");
     Check(px.CountColor(t.accent, rightBox(4)) > 3, "tier3 badge tier dot");
     // 重度档标题后软辉光（字上方采样 = 染色底叠 accent2 低 alpha）
-    Check(Near(px.At(inCardX + S(24) + S(2), rowY(5) + S(2)),
+    Check(Near(px.At(inCardX + S(24) + S(8) + S(2), rowY(5) + S(2)),
                Blend(tintOf(5), t.accent2, 26 / 255.f), 2), "tier4 title halo");
     for (int i : {1, 3}) {
         Check(px.CountColor(badge2, rightBox(i)) == 0, "plain row no tier2 badge");
@@ -310,7 +311,7 @@ int main() {
     Check(cp.At(barX + S(1), midY(0)) == t.selBg, "control: selected row plain, no bar");
     Check(cp.At(barX + S(1), midY(5)) == t.bg, "control: no bar without usage data");
     Check(cp.At(pad + S(2), rowY(4) + S(2)) == t.bgCard, "control: no tint without usage data");
-    Check(cp.At(pad + S(2) + S(24) + S(2), rowY(5) + S(2)) == t.bgCard, "control: no halo without data");
+    Check(cp.At(pad + S(2) + S(24) + S(8) + S(2), rowY(5) + S(2)) == t.bgCard, "control: no halo without data");
     Check(cp.CountColor(titleOf(0), titleBox(0)) == 0, "control: no accent title without data");
     Check(cp.CountColor(badge2, rightBox(2)) == 0, "control: no tier2 badge without data");
     Check(cp.CountColor(badge3, rightBox(0)) == 0, "control: no tier3 badge without data");
