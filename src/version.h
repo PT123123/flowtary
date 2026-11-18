@@ -3,7 +3,8 @@
 //     把产物命名为 flowtary-<版本>.exe
 //   · exe 的版本信息资源 src\flowtary.rc 引用 FT_VER_COMMA 与 FT_VER_DOT
 //
-// 升级版本号时：FT_VER_COMMA（数值四元组）与 FT_VER_DOT（点号分隔）要一起改。
+// 升级版本号时：FT_VER_COMMA（数值三元组）与 FT_VER_DOT（点号分隔）要一起改。
+//   版本号就是三段（MAJOR.MINOR.PATCH），不再带第四段 build 号。
 //
 // 注意：下面各宏的「取值」必须保持纯 ASCII，中文只能出现在注释里。
 //   原因：rc.exe 按系统 ANSI 代码页读取源文件（中文 Windows 是 GBK），
@@ -14,11 +15,10 @@
 
 #define FT_VER_MAJOR 1
 #define FT_VER_MINOR 1
-#define FT_VER_PATCH 51
-#define FT_VER_BUILD 10
+#define FT_VER_PATCH 52
 
-#define FT_VER_COMMA 1,1,51,10    /* rc: FILEVERSION / PRODUCTVERSION */
-#define FT_VER_DOT   "1.1.51.10"  /* rc string fields + release 流程 */
+#define FT_VER_COMMA 1,1,52       /* rc: FILEVERSION / PRODUCTVERSION */
+#define FT_VER_DOT   "1.1.52"     /* rc string fields + release 流程 */
 
 #define FT_PRODUCT_NAME "Flowtary"
 #define FT_FILE_DESC    "Flowtary Launcher"

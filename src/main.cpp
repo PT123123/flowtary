@@ -4288,13 +4288,16 @@ static void Paint(HDC hdc) {
     // 全部走抗锯齿覆盖率，边缘不再有 GDI 硬边锯齿。
     if (t.accentStrip) {
         int barH = S(4);
-        RECT ar{0, 0, W, barH};
+        // 强调条必须内缩出圆角区：条若顶到窗口圆角，会和圆框描边糊成一个
+        // 「蓝色钩子」，视觉上就是蓝线溢出圆框。内缩后角上只剩干净的圆框弧线。
+        int inset = S(t.radiusWindow) + S(5);
+        RECT ar{inset, 0, W - inset, barH};
         FillRoundRectAA(mem, ar, barH / 2, [&](float u, float) -> COLORREF {
             float k = u < 0.5f ? (u * 2) : ((1 - u) * 2);  // 0→1→0
             return Blend(t.accent2, t.accent, k);
         });
         // 柔光过渡：色条正下方 2px，accent2 低 alpha 渐隐进背景，消除生硬硬边
-        RECT glow{0, barH, W, barH + S(2)};
+        RECT glow{inset, barH, W - inset, barH + S(2)};
         FillVGradient(mem, glow.left, glow.top, glow.right - glow.left,
                       glow.bottom - glow.top, Blend(t.bg, t.accent2, 0.28f), t.bg);
     }
