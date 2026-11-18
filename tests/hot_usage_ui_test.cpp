@@ -249,17 +249,19 @@ int main() {
     int inCardX = pad + S(2);
     Check(px.At(inCardX, rowY(4) + S(2)) == tintOf(4), "tier3 higher count tint rendered");
     Check(px.At(inCardX, rowY(2) + S(2)) == tintOf(2), "tier2 tint rendered");
-    // 选中行玻璃高亮与整行对齐（上缘=rowY，不再下移 S(5)）：
-    // 顶部 2px 处已是玻璃色（含顶缘高光混色），不再是热度叠加层颜色
+    // 选中行玻璃胶囊与卡片对齐（iOS 内嵌列表选中态，高亮不再满宽铺出卡片）：
+    // 胶囊内采样玻璃色（左浓右淡 + 顶缘 specular）；卡外边距保持窗体底色
     {
         int gw = px.w - 2 * pad;
-        float ug = (float)(inCardX - pad) / (float)(gw - 1);
-        COLORREF glassBase = Blend(t.selBg, t.accent, 0.30f + 0.18f * (1.0f - ug));
+        int sx = pad + S(24) + S(8) + S(2);  // 文字起点右侧，远离胶囊圆角区
+        float ug = (float)(sx - pad) / (float)(gw - 1);
+        COLORREF glassBase = Blend(t.selBg, t.accent, 0.28f + 0.20f * (1.0f - ug));
         float vg = 2.0f / (float)(rowH - 1);
         COLORREF glassTop = Blend(glassBase, t.textTitle,
-                                  (t.dark ? 0.10f : 0.16f) * (1.0f - vg / 0.28f));
-        Check(Near(px.At(inCardX, rowY(0) + S(2)), glassTop, 2),
-              "selected glass aligned to row top edge");
+                                  (t.dark ? 0.14f : 0.20f) * (1.0f - vg / 0.22f));
+        Check(Near(px.At(sx, rowY(0) + S(2)), glassTop, 2),
+              "selected glass pill aligned inside card");
+        Check(px.At(S(8), midY(0)) == t.bg, "selection stays inside card (no full-width band)");
     }
     Check(px.At(barX + S(1), rowY(2) + S(2)) == t.bg, "tint stays inside card bounds");
     Check(Dist(tintOf(4), t.bgCard) > Dist(tintOf(0), t.bgCard) &&
@@ -318,7 +320,15 @@ int main() {
     Layout();
     for (auto& r : g.items) Check(r.usage == 0, "control arm usage cleared");
     Pixels cp = RenderAndGrab(L"hot_usage_control.bmp");
-    Check(cp.At(barX + S(1), midY(0)) == t.selBg, "control: selected row plain, no bar");
+    {
+        int gw = px.w - 2 * pad;
+        int sx = pad + S(24) + S(8) + S(2);
+        float uc = (float)(sx - pad) / (float)(gw - 1);
+        COLORREF glassMid = Blend(t.selBg, t.accent, 0.28f + 0.20f * (1.0f - uc));
+        Check(Near(cp.At(sx, midY(0)), glassMid, 2),
+              "control: selected row plain glass inside card");
+        Check(cp.At(barX + S(1), midY(0)) == t.bg, "control: selection does not spill outside card");
+    }
     Check(cp.At(barX + S(1), midY(5)) == t.bg, "control: no bar without usage data");
     Check(cp.At(pad + S(2), rowY(4) + S(2)) == t.bgCard, "control: no tint without usage data");
     Check(cp.At(pad + S(2) + S(24) + S(8) + S(2), rowY(5) + S(2)) == t.bgCard, "control: no halo without data");

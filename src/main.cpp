@@ -4217,6 +4217,11 @@ static void Paint(HDC hdc) {
     }
 
     // 分层面板：输入区 + 结果卡片（圆角 + 轻外影 + 顶部内高光）
+    // iOS 内嵌分组列表逻辑：卡片顶边与输入栏底边相接（无缝隙），
+    // 行背景与卡片边缘完全对齐——高亮不再越过卡片顶缘。
+    RECT cardR{S(kBasePad), inputH, W - S(kBasePad), H - S(6)};
+    int cardRad = 0;
+    HRGN hCardRgn = nullptr;
     {
         RECT inR{0, 0, W, inputH};
         const int ri = S(t.radiusInput);
@@ -4225,19 +4230,19 @@ static void Paint(HDC hdc) {
         // ② 中上部一团 accent 环境光（椭圆径向衰减），像控制中心那块「被光照亮的玻璃」。
         FillRoundRectAA(mem, inR, ri, [&](float u, float v) -> COLORREF {
             COLORREF base = t.bgInput;
-            if (v < 0.18f) {
-                float k = 1.0f - v / 0.18f;
-                base = Blend(base, t.textTitle, (t.dark ? 0.09f : 0.28f) * k);
-            } else if (v > 0.80f) {
-                float k = (v - 0.80f) / 0.20f;
-                base = Darken(base, (int)((t.dark ? 11 : 7) * k + 0.5f));
+            if (v < 0.14f) {
+                float k = 1.0f - v / 0.14f;
+                base = Blend(base, t.textTitle, (t.dark ? 0.12f : 0.30f) * k);
+            } else if (v > 0.84f) {
+                float k = (v - 0.84f) / 0.16f;
+                base = Darken(base, (int)((t.dark ? 13 : 8) * k + 0.5f));
             }
             // 环境光：以 (0.5, 0.40) 为中心的椭圆高斯衰减，边缘严格归零
-            float du = (u - 0.5f) / 0.62f, dv = (v - 0.40f) / 0.62f;
+            float du = (u - 0.5f) / 0.66f, dv = (v - 0.40f) / 0.66f;
             float d2 = du * du + dv * dv;
             if (d2 < 1.0f) {
                 float fall = (1.0f - d2) * (1.0f - d2);  // 平滑二次衰减
-                base = Blend(base, t.accent2, (t.dark ? 0.14f : 0.10f) * fall);
+                base = Blend(base, t.accent2, (t.dark ? 0.16f : 0.11f) * fall);
             }
             return base;
         });
@@ -4247,16 +4252,19 @@ static void Paint(HDC hdc) {
         StrokeRoundRectAA(mem, inR, ri,
                           Blend(t.bgInput, t.textTitle, t.dark ? 0.10f : 0.26f), 1);
         int gap = S(6);
-        RECT cardR{S(kBasePad), inputH + gap, W - S(kBasePad), H - gap};
+        (void)gap;
         if (cardR.bottom > cardR.top && cardR.right > cardR.left) {
-            const int rc = S(t.radiusCard);
-            PaintOutShadow(mem, cardR, rc, S(t.shCardX), S(t.shCardY), S(t.shCardBlur), t.shCardA, t.shCardColor);
-            FillRoundRectAA(mem, cardR, rc, [&](float, float) -> COLORREF { return t.bgCard; });
-            PaintInsetShadow(mem, cardR, rc, t.bgCard);
+            cardRad = S(t.radiusCard);
+            PaintOutShadow(mem, cardR, cardRad, S(t.shCardX), S(t.shCardY), S(t.shCardBlur), t.shCardA, t.shCardColor);
+            FillRoundRectAA(mem, cardR, cardRad, [&](float, float) -> COLORREF { return t.bgCard; });
+            PaintInsetShadow(mem, cardR, cardRad, t.bgCard);
             // 手机卡片细节：整圈 1px 玻璃描边（iOS 列表卡片的 hairline edge），
             // 让卡片从背景里「立」出来而不只是色块差
-            StrokeRoundRectAA(mem, cardR, rc,
+            StrokeRoundRectAA(mem, cardR, cardRad,
                               Blend(t.bgCard, t.textTitle, t.dark ? 0.09f : 0.22f), 1);
+            // 裁剪区：热行染色（方角矩形）不许溢出卡片圆角
+            hCardRgn = CreateRoundRectRgn(cardR.left, cardR.top, cardR.right, cardR.bottom,
+                                          cardRad * 2, cardRad * 2);
         }
     }
     // 顶部强调色条：横向三段渐变（两端 accent2 → 中段 accent）+ 半高圆角收口，
@@ -4333,20 +4341,15 @@ static void Paint(HDC hdc) {
         FillRect(mem, &cr, carBr);
         DeleteObject(carBr);
     }
-    // 分隔线（半透明，避免纯黑/纯白硬线）
-    if (!g.items.empty()) {
-        RECT lr{0, inputH, W, inputH + 1};
-        PaintDivider(mem, lr, t.divider, 120);
-    }
+    // 输入栏与结果卡之间不再画分隔线：两张玻璃片相接处的 hairline 就是天然边界（iOS 分层逻辑）
 
     // 结果列表
     SelectObject(mem, g.fList);
     int rows = (std::min)((int)g.items.size(), (int)kMaxVisibleResults);
-    HBRUSH selBr = CreateSolidBrush(t.selBg);
+    const int kSelPillR = S(12);  // 选中胶囊：接近半高的 iOS 列表选中高亮
     for (int i = 0; i < rows; ++i) {
         Row& row = g.items[i];
         int y = inputH + i * rowH;
-        RECT rr{0, y, W, y + rowH};
         const int tier = (row.kind == Row::Prog || row.kind == Row::File || row.kind == Row::Folder)
                              ? UsageTier(row.usage) : 0;
         const bool hot = tier >= 2;
@@ -4360,40 +4363,35 @@ static void Paint(HDC hdc) {
         // 整行铺满会把浅色主题右侧/底部的软影切出缺口
         RECT cardRow{S(kBasePad), y, W - S(kBasePad), y + rowH};
         if (hot && i != g.sel) {
+            // iOS 染色只落在卡片圆角内：方角 FillRect 经裁剪区约束，不越过卡片圆角
+            SaveDC(mem);
+            if (hCardRgn) ExtSelectClipRgn(mem, hCardRgn, RGN_AND);
             HBRUSH hb = CreateSolidBrush(rowBase);
             FillRect(mem, &cardRow, hb);
             DeleteObject(hb);
+            RestoreDC(mem, -1);
         }
         if (i == g.sel) {
-            FillRect(mem, &rr, selBr);
-            // 悬停高亮随动画进度叠加（鼠标移到某行 = 选中该行，hoverT 驱动轻微提亮）
-            if (i == g.hoverRow && g.hoverT > 0.001) {
-                HBRUSH hb = CreateSolidBrush(Blend(t.selBg, t.accent, (float)(0.14 * g.hoverT)));
-                FillRect(mem, &rr, hb);
-                DeleteObject(hb);
-            }
-            // 选中态也保留热度：selBg 上叠一层随热度加深的强调色
-            if (hot) {
-                HBRUSH hb = CreateSolidBrush(Blend(t.selBg, t.accent, 0.06f + 0.10f * heat));
-                FillRect(mem, &cardRow, hb);
-                DeleteObject(hb);
-            }
-            // 玻璃质感选中层：最后叠在卡片内，圆角高光左端 accent 亮、右端渐隐，
-            // 顶边一道高光——选中态读起来像光打在玻璃上，而非死板的满宽色带。
-            // 与行矩形完全对齐（上缘=y、下缘=y+rowH），不再向下偏移造成高亮错位。
-            RECT selGlass{S(kBasePad), y, W - S(kBasePad), y + rowH};
-            FillRoundRectAA(mem, selGlass, S(t.radiusSmall), [&](float u, float v) -> COLORREF {
-                COLORREF base = Blend(t.selBg, t.accent, 0.30f + 0.18f * (1.0f - u));
-                if (v < 0.28f) base = Blend(base, t.textTitle, (t.dark ? 0.10f : 0.16f) * (1 - v / 0.28f));
+            // iOS 内嵌列表选中态：液态玻璃胶囊只落在卡片内，不再满宽铺出卡片外。
+            // 左端 accent 浓、右端渐隐；顶缘 specular 高光、底缘玻璃厚度；悬停轻微提亮。
+            FillRoundRectAA(mem, cardRow, kSelPillR, [&](float u, float v) -> COLORREF {
+                COLORREF base = Blend(t.selBg, t.accent, 0.28f + 0.20f * (1.0f - u));
+                if (i == g.hoverRow && g.hoverT > 0.001)
+                    base = Blend(base, t.accent2, (float)(0.14 * g.hoverT));
+                if (v < 0.22f)
+                    base = Blend(base, t.textTitle, (t.dark ? 0.14f : 0.20f) * (1 - v / 0.22f));
+                else if (v > 0.86f)
+                    base = Darken(base, t.dark ? 6 : 4);
                 return base;
             });
         } else if (i == g.hoverRow) {
-            HBRUSH hb = CreateSolidBrush(Blend(rowBase, t.accent2, (float)(0.10 + 0.12 * g.hoverT)));
-            FillRect(mem, &rr, hb);
-            DeleteObject(hb);
+            RECT hp = cardRow;
+            FillRoundRectAA(mem, hp, kSelPillR, [&](float, float) -> COLORREF {
+                return Blend(rowBase, t.accent2, (float)(0.10 + 0.12 * g.hoverT));
+            });
         }
         if (i == g.pressRow && i != g.sel) {
-            PaintInsetShadow(mem, rr, 0, rowBase);
+            PaintInsetShadow(mem, cardRow, kSelPillR, rowBase);
         }
         if (hot) {
             // 左侧强调色条：圆角胶囊 + 垂直渐变，重度档外再罩一层软辉光。
@@ -4421,10 +4419,10 @@ static void Paint(HDC hdc) {
         // 垂直从 y+S(4) 起（图标在 y+S(5)），避开测试在 (pad+2, rowY+2) 的行染色采样点。
         if (rowIcon) {
             RECT well{x - S(1), y + S(4), x + S(25), y + S(4) + S(26)};
-            FillRoundRectAA(mem, well, S(6), [&](float, float v) -> COLORREF {
+            FillRoundRectAA(mem, well, S(8), [&](float, float v) -> COLORREF {
                 COLORREF base = Blend(t.bgCard, t.accent2, t.dark ? 0.22f : 0.14f);
-                if (v < 0.28f) return Blend(base, t.textTitle, (t.dark ? 0.16f : 0.22f) * (1 - v / 0.28f));
-                if (v > 0.82f) return Darken(base, 10);
+                if (v < 0.22f) return Blend(base, t.textTitle, (t.dark ? 0.16f : 0.22f) * (1 - v / 0.22f));
+                if (v > 0.84f) return Darken(base, 10);
                 return base;
             });
             DrawIconEx(mem, x, iconTop, rowIcon, S(24), S(24), 0, nullptr, DI_NORMAL);
@@ -4448,7 +4446,7 @@ static void Paint(HDC hdc) {
                 return base;
             });
             StrokeRoundRectAA(mem, br, bh / 2,
-                              Blend(i == g.sel ? t.selBg : t.bgCard, t.textTitle, t.dark ? 0.14f : 0.26f), 1);
+                              Blend(i == g.sel ? t.selBg : t.bgCard, t.textTitle, t.dark ? 0.10f : 0.20f), 1);
             SetBkMode(mem, TRANSPARENT);
             SetTextColor(mem, i == g.sel ? t.textTitle : t.textSec);
             DrawTextW(mem, &hk, 1, &br, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
@@ -4528,19 +4526,20 @@ static void Paint(HDC hdc) {
         // 选中行上下两段都跳过——让选中态保持完整一块。1px、极低对比，只提供「行有边界」的暗示。
         if (i + 1 < rows && i != g.sel && i + 1 != g.sel) {
             int sy = y + rowH - 1;
-            RECT sep{pad + S(24) + S(8), sy, W - pad - S(24), sy + 1};
-            HBRUSH sb = CreateSolidBrush(Blend(t.bgCard, t.textSec, t.dark ? 0.10f : 0.14f));
+            RECT sep{pad + S(24) + S(8), sy, W - pad - S(30), sy + 1};
+            HBRUSH sb = CreateSolidBrush(Blend(t.bgCard, t.textSec, t.dark ? 0.06f : 0.09f));
             FillRect(mem, &sep, sb);
             DeleteObject(sb);
         }
     }
+    if (hCardRgn) DeleteObject(hCardRgn);
     // 耗时底栏：非秒出才出现。pending 实时跳毫秒 + 还在等哪层；报齐后定格总耗时 + 首屏延迟。
     {
         int fm = 0; bool fl = false;
         if (LatencyFooter(fm, fl)) {
             int fy = inputH + rows * rowH;
-            RECT dl{0, fy, W, fy + 1};
-            PaintDivider(mem, dl, t.divider, 90);
+            RECT dl{pad, fy, W - pad, fy + 1};
+            PaintDivider(mem, dl, t.divider, 55);
             SelectObject(mem, g.fontPool[FontSlot(kFontMin)]);
             SetBkMode(mem, TRANSPARENT);
             std::wstring left = (fl ? L"… " : L"") + std::to_wstring(fm) + L" ms";
@@ -4558,7 +4557,6 @@ static void Paint(HDC hdc) {
             SelectObject(mem, g.fList);
         }
     }
-    DeleteObject(selBr);
 
     // 描边（DWM 边框不可用时回退 GDI 抗锯齿圆角描边）
     if (!g.dwmBorderOk) {
