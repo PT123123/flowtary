@@ -1496,6 +1496,9 @@ static int UsageScoreOf(const std::wstring& path, const std::wstring& ql,
     return ft::search::UsageScore(it->second.count, it->second.last, now);
 }
 
+static std::wstring UrlHostOf(const std::wstring& url);
+static std::wstring ShortLocationLabel(const std::wstring& path);
+
 // query 由 Refresh() 传入「已剥离排除词的正向查询」；排除词在 g.excludes（本轮解析一次，共用）。
 static void SearchPrograms(const std::wstring& query) {
     std::wstring ql = NormalizeSearchTerm(query);  // 与权重 key 同款标准化（去首尾空格+小写）
@@ -1537,11 +1540,42 @@ static void SearchPrograms(const std::wstring& query) {
         r.kind = Row::Prog;
         r.prog = cands[i].p;
         r.title = cands[i].p->name;
-        r.sub = cands[i].p->path;
+        r.sub = ShortLocationLabel(cands[i].p->path);
         r.action = cands[i].p->path;
         if (IsPathExcluded(r.action)) continue;  // 排除命中：跳过该程序
         g.items.push_back(std::move(r));
     }
+}
+
+// 副标题减字：完整路径在启动器列表里是纯噪音（半屏灰字、尾部还和标题重复）。
+// 只保留 2-4 字的「来源」标签，让一行回到「图标 + 名称 + 极简注脚」的 iOS 层级。
+// 没有明确来源的条目返回空串——留白比塞满更高级。
+static std::wstring UrlHostOf(const std::wstring& url) {
+    size_t a = url.find(L"://");
+    if (a == std::wstring::npos) return L"";
+    a += 3;
+    size_t b = url.find_first_of(L"/?", a);
+    return b == std::wstring::npos ? url.substr(a) : url.substr(a, b - a);
+}
+static std::wstring ShortLocationLabel(const std::wstring& path) {
+    if (path.empty()) return L"";
+    if (path.size() > 8 && _wcsnicmp(path.c_str(), L"http", 4) == 0)
+        return UrlHostOf(path);
+    std::wstring p;
+    p.reserve(path.size());
+    for (WCHAR ch : path) {
+        if (ch == L'/') ch = L'\\';
+        if (ch >= L'A' && ch <= L'Z') ch = (WCHAR)(ch - L'A' + L'a');
+        p.push_back(ch);
+    }
+    auto contains = [&](const WCHAR* s) { return p.find(s) != std::wstring::npos; };
+    if (contains(L"\\start menu\\"))  return L"开始菜单";
+    if (contains(L"\\desktop\\"))     return L"桌面";
+    if (contains(L"\\downloads\\"))   return L"下载";
+    if (contains(L"\\documents\\"))   return L"文档";
+    if (contains(L"\\workshop\\"))    return L"工作区";
+    if (contains(L"\\program files")) return L"程序";
+    return L"";
 }
 
 static HICON GetProgramIcon(Program* p) {
@@ -2495,7 +2529,7 @@ static void Refresh() {
                 r.kind = Row::Web;
                 r.title = std::wstring(L"用 ") + w->prefix + L" 搜索：" + rest;
                 r.action = BuildUrl(w->urlTemplate.c_str(), rest);
-                r.sub = r.action;
+                r.sub = UrlHostOf(r.action);  // 只留域名，不铺整条 URL
                 g.items.push_back(std::move(r));
             }
         } else {
@@ -2515,7 +2549,7 @@ static void Refresh() {
                     if (i) sub += L"、";
                     sub += gp->targets[i];
                 }
-                r.sub = sub;
+                r.sub = std::to_wstring(gp->targets.size()) + L" 个目标";  // 行上只给数量，清单留给右键复制
                 r.action = sub;  // 右键「复制路径」时复制目标清单
                 g.items.push_back(std::move(r));
             };
@@ -4256,7 +4290,7 @@ static void PrependLearnedRows(const std::wstring& term) {
         size_t s = c.path.find_last_of(L"\\/");
         r.title = (s == std::wstring::npos) ? c.path : c.path.substr(s + 1);
         if (!c.isDir && EndsWithI(r.title, L".lnk")) r.title.resize(r.title.size() - 4);  // 程序快捷方式显示应用名
-        r.sub = c.path;
+        r.sub = ShortLocationLabel(c.path);
         r.action = c.path;
         // 插在「一键组」行之后（显式关键字命中的组动作保持最高位）
         size_t pos = 0;
@@ -4590,100 +4624,84 @@ static void Paint(HDC hdc) {
         }
         x += S(24) + S(8);
 
-        // 结果项快捷键徽章（右侧小方框，按当前方案 Alt+数字 / Alt+字母；关闭时无徽章）
+        // 快捷键提示：扁平描边键帽。去掉顶部高光 / 底部 lip——那层塑料凸起是
+        // 一整列小按钮的「廉价感」来源。保留 1px 轮廓让键位仍可辨认。
         SelectObject(mem, g.fList);  // 徽章固定常规字重（上一行可能是常用加粗行）
         int hkReserved = 0;
         WCHAR hk = HotkeyChar(i);
         // 快捷键徽章右缘离卡片边缘 S(4)：贴死边缘会显得憋屈
         const int kBadgeRight = W - pad - S(4);
         if (hk) {
-            int bw = S(20), bh = S(20);
+            int bw = S(18), bh = S(18);
             RECT br{kBadgeRight - bw, y + (rowH - bh) / 2, kBadgeRight, y + (rowH - bh) / 2 + bh};
-            // 手机键帽质感（iOS 键盘按键参考）：圆角方形（非正圆——正圆会把数字
-            // 两角和上下的留白吃掉，字形贴边）+ 顶部高光 + 底部 lip + 内描边。
-            FillRoundRectAA(mem, br, S(6), [&](float, float v) -> COLORREF {
-                COLORREF base = i == g.sel ? Blend(t.selBg, t.accent, 0.42f)
-                                           : Blend(t.bgCard, t.accent2, 0.10f);
-                if (v < 0.34f) return Blend(base, t.textTitle, (t.dark ? 0.12f : 0.20f) * (1 - v / 0.34f));
-                if (v > 0.86f) return Darken(base, (int)((t.dark ? 16 : 10) * (v - 0.86f) / 0.14f + 0.5f));  // 底部 lip：连续加深
-                return base;
-            });
-            StrokeRoundRectAA(mem, br, S(6),
-                              Blend(i == g.sel ? t.selBg : t.bgCard, t.textTitle, t.dark ? 0.10f : 0.20f), 1);
+            COLORREF keyBg = i == g.sel ? Blend(t.selBg, t.accent, 0.30f)
+                                        : Blend(t.bgCard, t.accent2, 0.07f);
+            FillRoundRectAA(mem, br, S(5), [&](float, float) -> COLORREF { return keyBg; });
+            StrokeRoundRectAA(mem, br, S(5),
+                              Blend(t.bgCard, t.textSec, t.dark ? 0.42f : 0.50f), 1);
             SetBkMode(mem, TRANSPARENT);
             SetTextColor(mem, i == g.sel ? t.textTitle : t.textSec);
             DrawTextW(mem, &hk, 1, &br, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
             hkReserved = bw + S(6);
         }
 
-        // 档位徽章（快捷键徽章左侧）：档名 + 历史总使用次数直接摆在行上，判定依据可见。
-        // 常用=淡底胶囊，高频=浓底+描边，重度=强调色实底反白字
+        // 档位徽章：只留档名（重度额外带 ×N；次数是重度唯一有信息增量的数字）。
+        // 去掉左侧小圆点与垂直高光/lip；常用档靠染色 + 加粗表达，不再塞「常用 ×4」。
         int hotReserved = 0;
         if (hot) {
             const WCHAR* lab = tier >= 4 ? L"重度" : tier == 3 ? L"高频" : L"常用";
-            std::wstring tag = std::wstring(lab) + L" ×" + std::to_wstring(row.usage);
+            std::wstring tag = tier >= 4 ? std::wstring(lab) + L" ×" + std::to_wstring(row.usage)
+                                         : std::wstring(lab);
             SelectObject(mem, g.fontPool[FontSlot(kFontMin)]);
             SIZE ts{};
             GetTextExtentPoint32W(mem, tag.c_str(), (int)tag.size(), &ts);
-            int bw = S(6) + S(5) + S(4) + ts.cx + S(8), bh = S(18);
+            int bw = S(9) + ts.cx + S(9), bh = S(17);
             int bx = kBadgeRight - hkReserved - bw;
             RECT br{bx, y + (rowH - bh) / 2, bx + bw, y + (rowH - bh) / 2 + bh};
             COLORREF badgeBg = tier >= 4 ? t.accent
                              : Blend(t.bgCard, t.accent, tier == 3 ? 0.32f : 0.20f);
-            // 手机状态胶囊质感：垂直渐变（顶部微亮）+ 重度档底部 lip，拒绝平面色块
-            FillRoundRectAA(mem, br, bh / 2, [&](float, float v) -> COLORREF {
-                COLORREF base = badgeBg;
-                if (v < 0.30f) return Blend(base, t.textTitle, (tier >= 4 ? 0.16f : 0.10f) * (1 - v / 0.30f));
-                if (v > 0.85f) return Darken(base, (int)((tier >= 4 ? 14 : 8) * (v - 0.85f) / 0.15f + 0.5f));  // 底部 lip 连续加深
-                return base;
-            });
-            // 档点：胶囊左端小圆点，重度档与文字同用反白
-            HBRUSH db = CreateSolidBrush(tier >= 4 ? t.bgCard : titleBase);
-            RECT dr{bx + S(6), y + (rowH - S(5)) / 2, bx + S(6) + S(5), y + (rowH - S(5)) / 2 + S(5)};
-            FillRoundRect(mem, dr, S(3), db);
-            DeleteObject(db);
+            FillRoundRectAA(mem, br, bh / 2, [&](float, float) -> COLORREF { return badgeBg; });
             SetTextColor(mem, tier >= 4 ? t.bgCard : hotTitle);
-            RECT tr2{dr.right + S(4), br.top, br.right - S(8), br.bottom};
+            RECT tr2{br.left + S(9), br.top, br.right - S(9), br.bottom};
             DrawTextW(mem, tag.c_str(), (int)tag.size(), &tr2,
-                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
             hotReserved = bw + S(6);
         }
-        // 常用行标题加粗；副标题的标题宽度测量也用同一字体，保证让位预算准确
-        SelectObject(mem, hot && g.fListHot ? g.fListHot : g.fList);
 
-        // 副标题（右侧灰色；有徽章时让位）
-        int subReserved = 0;
-        if (!row.sub.empty()) {
-            SIZE sz{}, tsz{};
-            GetTextExtentPoint32W(mem, row.sub.c_str(), (int)row.sub.size(), &sz);
-            GetTextExtentPoint32W(mem, row.title.c_str(), (int)row.title.size(), &tsz);
-            // 路径栏宽度按「标题完整显示后剩多少」给，上限 3/4、下限 1/4：
-            // 标题短时深路径能整条看完，标题长时也不会把路径压成几个字。
-            const int budget = W - x - hkReserved - hotReserved - S(12);
-            int room = budget - (std::min)((int)tsz.cx, budget * 3 / 4) - S(12);
-            if (room > budget * 3 / 4) room = budget * 3 / 4;
-            if (room < budget / 4) room = budget / 4;
-            int subW = (std::min)((int)sz.cx + 2, room);
-            RECT sr{W - pad - hkReserved - hotReserved - subW, y, W - pad - hkReserved - hotReserved, y + rowH};
-            SetTextColor(mem, t.textSec);
-            // DT_PATH_ELLIPSIS（需配 DT_LEFT）：放不下时省略中段、保住最深一层目录——
-            // 应用版本号就在那一层，尾部截断等于把最有用的信息裁掉
-            DrawTextW(mem, row.sub.c_str(), (int)row.sub.size(), &sr,
-                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_PATH_ELLIPSIS);
-            subReserved = subW + S(8);
-        }
         // 标题（常用行：加粗 + 强调色向正文色靠拢，热度越高越纯；深/浅主题都保持可读对比）
-        RECT tr{x, y, W - pad - subReserved - hkReserved - hotReserved, y + rowH};
+        SelectObject(mem, hot && g.fListHot ? g.fListHot : g.fList);
+        SIZE tsz{};
+        GetTextExtentPoint32W(mem, row.title.c_str(), (int)row.title.size(), &tsz);
+        const int trailingRight = W - pad - hkReserved - hotReserved - S(8);
+        int titleRoom = trailingRight - x - S(8);
+        if (titleRoom < S(40)) titleRoom = S(40);
+        RECT tr{x, y, x + (std::min)((int)tsz.cx, titleRoom) + S(2), y + rowH};
         if (tier >= 4) {
             // 重度档：字后罩一层低 alpha 圆角辉光，把最高档从普通加粗里托出来
-            SIZE tsz{};
-            GetTextExtentPoint32W(mem, row.title.c_str(), (int)row.title.size(), &tsz);
             RECT hr{tr.left, tr.top, (std::min)(tr.right, tr.left + tsz.cx + S(4)), tr.bottom};
             PaintOutShadow(mem, hr, S(4), 0, 0, 0, 26, t.accent2);
         }
         SetTextColor(mem, row.kind == Row::Hint ? t.textDis : hot ? hotTitle : t.textBody);
         DrawTextW(mem, row.title.c_str(), (int)row.title.size(), &tr,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+
+        // 副标题：小一号浅灰字，紧跟标题尾部——不再甩到行尾占掉半屏。
+        // 标题优先：放不下就整条不画，留白比堆字高级。
+        if (!row.sub.empty()) {
+            int sx = tr.right + S(9);
+            int avail = trailingRight - sx;
+            if (avail > S(28)) {
+                HFONT hOld = (HFONT)SelectObject(
+                    mem, g.fontPool[FontSlot((g.theme ? g.theme->fontList : 15) - 1)]);
+                SIZE sz{};
+                GetTextExtentPoint32W(mem, row.sub.c_str(), (int)row.sub.size(), &sz);
+                RECT sr{sx, y, sx + (std::min)((int)sz.cx, avail), y + rowH};
+                SetTextColor(mem, t.textSec);
+                DrawTextW(mem, row.sub.c_str(), (int)row.sub.size(), &sr,
+                          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+                SelectObject(mem, hOld);
+            }
+        }
 
         // 行间发丝分隔线（iOS 设置列表细节）：从文字起点起画、右端给键帽让位，
         // 选中行上下两段都跳过——让选中态保持完整一块。1px、极低对比，只提供「行有边界」的暗示。

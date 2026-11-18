@@ -300,8 +300,9 @@ int main() {
     Check(px.CountColor(badge3, rightBox(4)) > 30, "tier3 badge on second row");
     Check(px.CountColor(t.accent, rightBox(5)) > 30, "tier4 solid accent badge");
     Check(px.CountColor(t.bgCard, rightBox(5)) > 5, "tier4 badge inverted text");
-    Check(px.CountColor(t.accent, rightBox(2)) > 3, "tier2 badge tier dot");
-    Check(px.CountColor(t.accent, rightBox(4)) > 3, "tier3 badge tier dot");
+    // 徽章已平面化：胶囊左端的孤立小圆点必须消失（重度实底行除外）
+    Check(px.CountColor(t.accent, rightBox(2)) == 0, "no tier dot on light badge");
+    Check(px.CountColor(t.accent, rightBox(4)) == 0, "no tier dot on strong badge");
     // 重度档标题后软辉光（字上方采样 = 染色底叠 accent2 低 alpha）
     Check(Near(px.At(textX + S(2), rowY(5) + S(2)),
                Blend(tintOf(5), t.accent2, 26 / 255.f), 2), "tier4 title halo");
