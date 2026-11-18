@@ -248,9 +248,19 @@ int main() {
     Check(tintOf(0) != tintOf(4), "same tier different counts tint differently");
     int inCardX = pad + S(2);
     Check(px.At(inCardX, rowY(4) + S(2)) == tintOf(4), "tier3 higher count tint rendered");
-    Check(px.At(inCardX, rowY(0) + S(2)) == Blend(t.selBg, t.accent, 0.06f + 0.10f * UsageHeat(15)),
-          "selected hot row keeps heat overlay");
     Check(px.At(inCardX, rowY(2) + S(2)) == tintOf(2), "tier2 tint rendered");
+    // 选中行玻璃高亮与整行对齐（上缘=rowY，不再下移 S(5)）：
+    // 顶部 2px 处已是玻璃色（含顶缘高光混色），不再是热度叠加层颜色
+    {
+        int gw = px.w - 2 * pad;
+        float ug = (float)(inCardX - pad) / (float)(gw - 1);
+        COLORREF glassBase = Blend(t.selBg, t.accent, 0.30f + 0.18f * (1.0f - ug));
+        float vg = 2.0f / (float)(rowH - 1);
+        COLORREF glassTop = Blend(glassBase, t.textTitle,
+                                  (t.dark ? 0.10f : 0.16f) * (1.0f - vg / 0.28f));
+        Check(Near(px.At(inCardX, rowY(0) + S(2)), glassTop, 2),
+              "selected glass aligned to row top edge");
+    }
     Check(px.At(barX + S(1), rowY(2) + S(2)) == t.bg, "tint stays inside card bounds");
     Check(Dist(tintOf(4), t.bgCard) > Dist(tintOf(0), t.bgCard) &&
           Dist(tintOf(0), t.bgCard) > Dist(tintOf(2), t.bgCard),

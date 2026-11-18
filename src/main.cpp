@@ -193,6 +193,7 @@ struct App {
     bool hotkeyWake = true;    // 唤起快捷键总开关（托盘菜单切换；关闭时不再注册 Alt+Space 等）
     int themeIdx = 0;          // 当前主题索引
     bool beautify = true;      // 界面美化：强制暗色菜单（设置窗风格由 sidecar 自己施加）
+    bool glassEnabled = true;  // 系统亚克力玻璃：分层窗口 alpha 透出背后 + DWM 模糊（注册表 Glass，默认开）
     // 点开头过滤（默认开，UI 在设置「排除路径」Tab）：搜索文件/文件夹时，
     // 路径中任一层名以 '.' 开头（目录 .git / .vscode，或文件 .gitignore）即过滤该行。
     bool skipDotFolders = true;
@@ -3030,6 +3031,72 @@ static void ApplyRoundCorners(HWND h) {
         g.dwmBorderOk = true;
 }
 
+// ---------------- 系统亚克力玻璃 ----------------
+// 真玻璃 = 两件事同时成立：
+//   ① 分层窗口（WS_EX_LAYERED + LWA_ALPHA）——让窗口真正透出背后桌面；
+//   ② DWM 合成模糊（SetWindowCompositionAttribute / ACCENT_ENABLE_ACRYLICBLURBEHIND）
+//      ——把透出来的桌面模糊成毛玻璃。缺①则②被不透明 BitBlt 盖住看不见。
+// 未公开 API，用 GetProcAddress 动态取，取不到就安全降级（只保留不透明绘制）。
+#ifndef WCA_ACCENT_POLICY
+#define WCA_ACCENT_POLICY 19
+#endif
+enum AccentState {
+    ACCENT_DISABLED = 0,
+    ACCENT_ENABLE_BLURBEHIND = 3,
+    ACCENT_ENABLE_ACRYLICBLURBEHIND = 4,
+};
+struct ACCENT_POLICY { DWORD AccentState; DWORD AccentFlags; DWORD GradientColor; DWORD AnimationId; };
+struct WINDOWCOMPOSITIONATTRIBDATA { DWORD Attrib; PVOID pvData; SIZE_T cbData; };
+
+// 把整窗 alpha 与 DWM 背景模糊一起施加。gradient 用主题底色染一层极淡的色调，
+// alpha 字节给得很低（0x20）——值越低越透、模糊越明显；文字/图标因画在上层仍清晰。
+static void ApplyGlass(HWND h) {
+    if (!h) return;
+    const Theme* t = g.theme;
+    if (g.glassEnabled) {
+        // ① 分层窗口：整窗 alpha 只做极轻微透光（232/255≈91%），文字几乎无损——
+        // 真正的「毛玻璃感」来自 ② 的 DWM 模糊 + 高 tint 色调（手机系统 HyperOS 的做法：
+        // 深色高不透明度 tint 盖在模糊上，而不是把整窗内容一起淡化）。
+        LONG_PTR ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+        if (!(ex & WS_EX_LAYERED))
+            SetWindowLongPtrW(h, GWL_EXSTYLE, ex | WS_EX_LAYERED);
+        const BYTE winAlpha = 232;
+        SetLayeredWindowAttributes(h, 0, winAlpha, LWA_ALPHA);
+
+        // ② DWM 毛玻璃：动态解析未公开 API，给窗口背后的内容加模糊。
+        using PFN_SCA = BOOL(WINAPI*)(HWND, WINDOWCOMPOSITIONATTRIBDATA*);
+        static PFN_SCA pSCA = []() -> PFN_SCA {
+            HMODULE u32 = GetModuleHandleW(L"user32.dll");
+            return u32 ? (PFN_SCA)GetProcAddress(u32, "SetWindowCompositionAttribute") : nullptr;
+        }();
+        if (pSCA) {
+            COLORREF c = t ? t->bg : RGB(12, 16, 48);
+            // GradientColor 是 0xAABBGGRR；0xC8≈78% 不透明 tint 盖住模糊，
+            // 背后只隐约透光——质感来自模糊与色调，而非整窗透明
+            DWORD grad = (DWORD)(0xC8u << 24) | ((DWORD)GetBValue(c) << 16) |
+                         ((DWORD)GetGValue(c) << 8) | (DWORD)GetRValue(c);
+            ACCENT_POLICY ap{ACCENT_ENABLE_ACRYLICBLURBEHIND, 0, grad, 0};
+            WINDOWCOMPOSITIONATTRIBDATA d{WCA_ACCENT_POLICY, &ap, sizeof(ap)};
+            pSCA(h, &d);
+        }
+    } else {
+        // 关闭：摘掉分层标志，恢复完全不透明；关掉 DWM 模糊。
+        LONG_PTR ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+        if (ex & WS_EX_LAYERED)
+            SetWindowLongPtrW(h, GWL_EXSTYLE, ex & ~WS_EX_LAYERED);
+        using PFN_SCA = BOOL(WINAPI*)(HWND, WINDOWCOMPOSITIONATTRIBDATA*);
+        static PFN_SCA pSCA = []() -> PFN_SCA {
+            HMODULE u32 = GetModuleHandleW(L"user32.dll");
+            return u32 ? (PFN_SCA)GetProcAddress(u32, "SetWindowCompositionAttribute") : nullptr;
+        }();
+        if (pSCA) {
+            ACCENT_POLICY ap{ACCENT_DISABLED, 0, 0, 0};
+            WINDOWCOMPOSITIONATTRIBDATA d{WCA_ACCENT_POLICY, &ap, sizeof(ap)};
+            pSCA(h, &d);
+        }
+    }
+}
+
 // 应用图标从内置 .ico 资源（flowtary.ico，多尺寸：16/24/32/48/64/128/256）加载。
 // 取代原先的字体自绘方案：exe 文件、窗口、任务栏/alt-tab、托盘都用同一套图标。
 // 传给目标尺寸（px）让 LoadImageW 从多帧 ico 里取最合适的那一帧。
@@ -3206,6 +3273,12 @@ static void ApplySettingsToRuntime(const ft::Settings& s) {
     g.themeIdx = s.themeIdx;
     g.theme = &kThemes[g.themeIdx];
     g.beautify = s.beautify;
+    // 系统亚克力玻璃开关：注册表 Glass（缺省=1 开启）。旧版本遗留值为 0，
+    // 但本次是新功能，缺省按开启处理，只有显式写 0 才关闭。
+    {
+        DWORD gv = 1;
+        if (ft::RegGetDword(L"Glass", gv)) g.glassEnabled = (gv != 0);
+    }
     g.skipDotFolders = s.skipDotFolders;
     g.dfBackend = s.dfBackend;
     sTune = s.tune;
@@ -4123,20 +4196,32 @@ static void Paint(HDC hdc) {
     {
         RECT inR{0, 0, W, inputH};
         const int ri = S(t.radiusInput);
-        // 玻璃质感输入框：顶部一道柔光高光 → 中段本色 → 底部微暗，模拟玻璃片的反光/厚度。
-        // 这不是纯色块：高光与暗边让输入框读起来像一块有厚度的玻璃，而非填了色的矩形。
-        FillRoundRectAA(mem, inR, ri, [&](float, float v) -> COLORREF {
+        // 手机系统搜索栏质感（HyperOS/iOS 控制中心参考）：
+        // ① 顶部内缘柔光 → 中段本色 → 底部微暗（玻璃厚度）；
+        // ② 中上部一团 accent 环境光（椭圆径向衰减），像控制中心那块「被光照亮的玻璃」。
+        FillRoundRectAA(mem, inR, ri, [&](float u, float v) -> COLORREF {
+            COLORREF base = t.bgInput;
             if (v < 0.18f) {
                 float k = 1.0f - v / 0.18f;
-                return Blend(t.bgInput, t.textTitle, (t.dark ? 0.09f : 0.28f) * k);
-            }
-            if (v > 0.80f) {
+                base = Blend(base, t.textTitle, (t.dark ? 0.09f : 0.28f) * k);
+            } else if (v > 0.80f) {
                 float k = (v - 0.80f) / 0.20f;
-                return Darken(t.bgInput, (int)((t.dark ? 11 : 7) * k + 0.5f));
+                base = Darken(base, (int)((t.dark ? 11 : 7) * k + 0.5f));
             }
-            return t.bgInput;
+            // 环境光：以 (0.5, 0.40) 为中心的椭圆高斯衰减，边缘严格归零
+            float du = (u - 0.5f) / 0.62f, dv = (v - 0.40f) / 0.62f;
+            float d2 = du * du + dv * dv;
+            if (d2 < 1.0f) {
+                float fall = (1.0f - d2) * (1.0f - d2);  // 平滑二次衰减
+                base = Blend(base, t.accent2, (t.dark ? 0.14f : 0.10f) * fall);
+            }
+            return base;
         });
         PaintInsetShadow(mem, inR, ri, t.bgInput);
+        // 边缘发丝：整圈 1px 内描边（上缘偏亮、下缘偏暗做不到逐段，取中性微亮），
+        // 手机玻璃片的「厚度线」——细看有边界、粗看无感
+        StrokeRoundRectAA(mem, inR, ri,
+                          Blend(t.bgInput, t.textTitle, t.dark ? 0.10f : 0.26f), 1);
         int gap = S(6);
         RECT cardR{S(kBasePad), inputH + gap, W - S(kBasePad), H - gap};
         if (cardR.bottom > cardR.top && cardR.right > cardR.left) {
@@ -4144,6 +4229,10 @@ static void Paint(HDC hdc) {
             PaintOutShadow(mem, cardR, rc, S(t.shCardX), S(t.shCardY), S(t.shCardBlur), t.shCardA, t.shCardColor);
             FillRoundRectAA(mem, cardR, rc, [&](float, float) -> COLORREF { return t.bgCard; });
             PaintInsetShadow(mem, cardR, rc, t.bgCard);
+            // 手机卡片细节：整圈 1px 玻璃描边（iOS 列表卡片的 hairline edge），
+            // 让卡片从背景里「立」出来而不只是色块差
+            StrokeRoundRectAA(mem, cardR, rc,
+                              Blend(t.bgCard, t.textTitle, t.dark ? 0.09f : 0.22f), 1);
         }
     }
     // 顶部强调色条：横向三段渐变（两端 accent2 → 中段 accent）+ 半高圆角收口，
@@ -4267,8 +4356,8 @@ static void Paint(HDC hdc) {
             }
             // 玻璃质感选中层：最后叠在卡片内，圆角高光左端 accent 亮、右端渐隐，
             // 顶边一道高光——选中态读起来像光打在玻璃上，而非死板的满宽色带。
-            // 从 y+S(5) 起画，避开测试在 (pad+2, rowY+2) 采样的行底色。
-            RECT selGlass{S(kBasePad), y + S(5), W - S(kBasePad), y + rowH};
+            // 与行矩形完全对齐（上缘=y、下缘=y+rowH），不再向下偏移造成高亮错位。
+            RECT selGlass{S(kBasePad), y, W - S(kBasePad), y + rowH};
             FillRoundRectAA(mem, selGlass, S(t.radiusSmall), [&](float u, float v) -> COLORREF {
                 COLORREF base = Blend(t.selBg, t.accent, 0.30f + 0.18f * (1.0f - u));
                 if (v < 0.28f) base = Blend(base, t.textTitle, (t.dark ? 0.10f : 0.16f) * (1 - v / 0.28f));
@@ -4325,12 +4414,17 @@ static void Paint(HDC hdc) {
         if (hk) {
             int bw = S(20), bh = S(20);
             RECT br{W - pad - bw, y + (rowH - bh) / 2, W - pad, y + (rowH - bh) / 2 + bh};
-            // 玻璃质感快捷键胶囊：圆角 + 选中态强调色 + 顶部高光，取代硬边方块。
+            // 手机键帽质感（iOS 键盘按键参考）：圆角 + 顶部高光 + 底部 lip + 内描边，
+            // 四层叠出「可以按下去」的实体感，取代平面色块。
             FillRoundRectAA(mem, br, bh / 2, [&](float, float v) -> COLORREF {
                 COLORREF base = i == g.sel ? Blend(t.selBg, t.accent, 0.42f)
                                            : Blend(t.bgCard, t.accent2, 0.10f);
-                return v < 0.34f ? Blend(base, t.textTitle, (t.dark ? 0.12f : 0.20f) * (1 - v / 0.34f)) : base;
+                if (v < 0.34f) return Blend(base, t.textTitle, (t.dark ? 0.12f : 0.20f) * (1 - v / 0.34f));
+                if (v > 0.86f) return Darken(base, (int)(t.dark ? 16 : 10));  // 底部 lip：按键厚度
+                return base;
             });
+            StrokeRoundRectAA(mem, br, bh / 2,
+                              Blend(i == g.sel ? t.selBg : t.bgCard, t.textTitle, t.dark ? 0.14f : 0.26f), 1);
             SetBkMode(mem, TRANSPARENT);
             SetTextColor(mem, i == g.sel ? t.textTitle : t.textSec);
             DrawTextW(mem, &hk, 1, &br, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
@@ -4351,14 +4445,13 @@ static void Paint(HDC hdc) {
             RECT br{bx, y + (rowH - bh) / 2, bx + bw, y + (rowH - bh) / 2 + bh};
             COLORREF badgeBg = tier >= 4 ? t.accent
                              : Blend(t.bgCard, t.accent, tier == 3 ? 0.32f : 0.20f);
-            HBRUSH bg = CreateSolidBrush(badgeBg);
-            FillRoundRect(mem, br, bh / 2, bg);  // 胶囊：半径=半高
-            DeleteObject(bg);
-            if (tier == 3) {
-                HPEN fp = CreatePen(PS_SOLID, 1, Blend(t.bgCard, t.accent, 0.55f));
-                StrokeRoundRect(mem, br, bh / 2, fp);
-                DeleteObject(fp);
-            }
+            // 手机状态胶囊质感：垂直渐变（顶部微亮）+ 重度档底部 lip，拒绝平面色块
+            FillRoundRectAA(mem, br, bh / 2, [&](float, float v) -> COLORREF {
+                COLORREF base = badgeBg;
+                if (v < 0.30f) return Blend(base, t.textTitle, (tier >= 4 ? 0.16f : 0.10f) * (1 - v / 0.30f));
+                if (v > 0.85f) return Darken(base, tier >= 4 ? 14 : 8);
+                return base;
+            });
             // 档点：胶囊左端小圆点，重度档与文字同用反白
             HBRUSH db = CreateSolidBrush(tier >= 4 ? t.bgCard : titleBase);
             RECT dr{bx + S(6), y + (rowH - S(5)) / 2, bx + S(6) + S(5), y + (rowH - S(5)) / 2 + S(5)};
@@ -4406,6 +4499,16 @@ static void Paint(HDC hdc) {
         SetTextColor(mem, row.kind == Row::Hint ? t.textDis : hot ? hotTitle : t.textBody);
         DrawTextW(mem, row.title.c_str(), (int)row.title.size(), &tr,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+
+        // 行间发丝分隔线（iOS 设置列表细节）：从文字起点起画、右端给键帽让位，
+        // 选中行上下两段都跳过——让选中态保持完整一块。1px、极低对比，只提供「行有边界」的暗示。
+        if (i + 1 < rows && i != g.sel && i + 1 != g.sel) {
+            int sy = y + rowH - 1;
+            RECT sep{pad + S(24) + S(8), sy, W - pad - S(24), sy + 1};
+            HBRUSH sb = CreateSolidBrush(Blend(t.bgCard, t.textSec, t.dark ? 0.10f : 0.14f));
+            FillRect(mem, &sep, sb);
+            DeleteObject(sb);
+        }
     }
     // 耗时底栏：非秒出才出现。pending 实时跳毫秒 + 还在等哪层；报齐后定格总耗时 + 首屏延迟。
     {
@@ -5879,6 +5982,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
                              nullptr, hInst, nullptr);
     if (!g.hwnd) return 1;
     ApplyRoundCorners(g.hwnd);
+    ApplyGlass(g.hwnd);  // 系统亚克力玻璃：分层窗口 alpha 透出背后 + DWM 模糊
     ApplyTheme();  // 应用主题：透明度、字体、刷子、菜单深色、星点
     fdj_init(g.hwnd);  // 文件对话框“文件夹原地跳转”增强（类 Listary Quick-Switch）
 
