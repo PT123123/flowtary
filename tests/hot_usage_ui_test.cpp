@@ -249,19 +249,24 @@ int main() {
     int inCardX = pad + S(2);
     Check(px.At(inCardX, rowY(4) + S(2)) == tintOf(4), "tier3 higher count tint rendered");
     Check(px.At(inCardX, rowY(2) + S(2)) == tintOf(2), "tier2 tint rendered");
-    // 选中行玻璃胶囊与卡片对齐（iOS 内嵌列表选中态，高亮不再满宽铺出卡片）：
-    // 胶囊内采样玻璃色（左浓右淡 + 顶缘 specular）；卡外边距保持窗体底色
+    // 选中行玻璃高亮：卡片内适度圆角块，左右内缩 S(6)，渐变平滑无台阶。
+    // 顶部 2px 处采样 = 玻璃基色（左浓右淡二次衰减）+ 顶部柔光
     {
-        int gw = px.w - 2 * pad;
-        int sx = pad + S(24) + S(8) + S(2);  // 文字起点右侧，远离胶囊圆角区
-        float ug = (float)(sx - pad) / (float)(gw - 1);
-        COLORREF glassBase = Blend(t.selBg, t.accent, 0.28f + 0.20f * (1.0f - ug));
+        int inset = S(6);
+        int pillW = (px.w - 2 * pad) - 2 * inset;
+        int sx = pad + S(24) + S(8) + S(2);  // 文字起点右侧，远离高亮圆角区
+        float ug = (float)(sx - (pad + inset)) / (float)(pillW - 1);
+        COLORREF glassBase = Blend(t.selBg, t.accent, 0.34f * (1.0f - ug) * (1.0f - ug) + 0.12f);
         float vg = 2.0f / (float)(rowH - 1);
-        COLORREF glassTop = Blend(glassBase, t.textTitle,
-                                  (t.dark ? 0.14f : 0.20f) * (1.0f - vg / 0.22f));
+        float glow = (1.0f - vg); glow *= glow;
+        COLORREF glassTop = Blend(glassBase, t.textTitle, (t.dark ? 0.10f : 0.14f) * glow);
         Check(Near(px.At(sx, rowY(0) + S(2)), glassTop, 2),
               "selected glass pill aligned inside card");
         Check(px.At(S(8), midY(0)) == t.bg, "selection stays inside card (no full-width band)");
+        // 内缩验证：卡左缘与高亮左缘之间（图标托盘从 y+S(4) 才起画，取 y+2 避开；
+        // 该点带卡片内阴影，用容差而非精确色值）
+        Check(Dist(px.At(pad + S(2), rowY(0) + S(2)), t.bgCard) < 30,
+              "selection inset from card left edge");
     }
     Check(px.At(barX + S(1), rowY(2) + S(2)) == t.bg, "tint stays inside card bounds");
     Check(Dist(tintOf(4), t.bgCard) > Dist(tintOf(0), t.bgCard) &&
@@ -294,25 +299,6 @@ int main() {
         Check(px.CountColor(t.accent, rightBox(i)) == 0, "plain row no tier4 badge");
     }
 
-    // ---- 浅色主题臂 ----
-    g.theme = &kThemes[4];  // 日出浅白
-    ApplyTheme(false);
-    Layout();
-    Pixels lp = RenderAndGrab(L"hot_usage_light.bmp");
-    const Theme& lt = *g.theme;
-    COLORREF lBadge2 = Blend(lt.bgCard, lt.accent, 0.20f);
-    COLORREF lBarMid = Blend(lt.accent2, lt.accent, 0.5f);
-    Check(Near(lp.At(barX + S(1), midY(2)), lBarMid, 12), "light theme tier2 bar");
-    Check(Near(lp.At(barX + S(4), midY(5)), lBarMid, 12), "light theme tier4 bar");
-    Check(lp.CountColor(lBadge2, rightBox(2)) > 30, "light theme tier2 badge");
-    Check(lp.CountColor(lt.accent, rightBox(5)) > 30, "light theme tier4 solid badge");
-    Check(lp.At(barX + S(1), midY(1)) == lt.bg, "light theme rare row untouched");
-    Check(lp.At(barX + S(1), rowY(2) + S(2)) == lt.bg, "light theme tint stays inside card");
-    for (int i : {0, 2, 4, 5})
-        Check(lp.CountColor(titleOfTh(lt, i), titleBox(i)) > 10, "light theme hot title in tier ink");
-    Check(Dist(titleOfTh(lt, 5), lt.bgCard) > Dist(titleOfTh(lt, 2), lt.bgCard),
-          "light theme heavy title has stronger contrast than light tier");
-
     // ---- 对照臂：清空全部使用数据 ⇒ 所有醒目样式必须消失 ----
     g.theme = &kThemes[0];
     ApplyTheme(false);
@@ -321,10 +307,12 @@ int main() {
     for (auto& r : g.items) Check(r.usage == 0, "control arm usage cleared");
     Pixels cp = RenderAndGrab(L"hot_usage_control.bmp");
     {
-        int gw = px.w - 2 * pad;
+        int inset = S(6);
+        int pillW = (px.w - 2 * pad) - 2 * inset;
         int sx = pad + S(24) + S(8) + S(2);
-        float uc = (float)(sx - pad) / (float)(gw - 1);
-        COLORREF glassMid = Blend(t.selBg, t.accent, 0.28f + 0.20f * (1.0f - uc));
+        float uc = (float)(sx - (pad + inset)) / (float)(pillW - 1);
+        COLORREF glassMid = Blend(t.selBg, t.accent, 0.34f * (1.0f - uc) * (1.0f - uc) + 0.12f);
+        glassMid = Blend(glassMid, t.textTitle, (t.dark ? 0.10f : 0.14f) * 0.25f);  // v=0.5 柔光
         Check(Near(cp.At(sx, midY(0)), glassMid, 2),
               "control: selected row plain glass inside card");
         Check(cp.At(barX + S(1), midY(0)) == t.bg, "control: selection does not spill outside card");

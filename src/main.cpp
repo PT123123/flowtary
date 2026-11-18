@@ -4346,7 +4346,11 @@ static void Paint(HDC hdc) {
     // 结果列表
     SelectObject(mem, g.fList);
     int rows = (std::min)((int)g.items.size(), (int)kMaxVisibleResults);
-    const int kSelPillR = S(12);  // 选中胶囊：接近半高的 iOS 列表选中高亮
+    const int kSelPillR = S(8);   // 选中高亮圆角：适度圆角，不做半高胶囊
+    const int kSelInset = S(6);   // 高亮相对卡片左右各内缩，不与卡片圆角/描边打架
+    auto selRect = [&](const RECT& cardRow, int y) {
+        return RECT{cardRow.left + kSelInset, y, cardRow.right - kSelInset, y + rowH};
+    };
     for (int i = 0; i < rows; ++i) {
         Row& row = g.items[i];
         int y = inputH + i * rowH;
@@ -4372,26 +4376,29 @@ static void Paint(HDC hdc) {
             RestoreDC(mem, -1);
         }
         if (i == g.sel) {
-            // iOS 内嵌列表选中态：液态玻璃胶囊只落在卡片内，不再满宽铺出卡片外。
-            // 左端 accent 浓、右端渐隐；顶缘 specular 高光、底缘玻璃厚度；悬停轻微提亮。
-            FillRoundRectAA(mem, cardRow, kSelPillR, [&](float u, float v) -> COLORREF {
-                COLORREF base = Blend(t.selBg, t.accent, 0.28f + 0.20f * (1.0f - u));
+            // iOS 内嵌列表选中态：卡片内适度圆角高亮，左右内缩留出呼吸感。
+            // 渐变全程平滑（二次衰减），无任何阈值台阶——上一版的顶缘高光带/底缘
+            // 硬 lip 就是横向色带断层感的来源，全部去掉。
+            RECT pill = selRect(cardRow, y);
+            FillRoundRectAA(mem, pill, kSelPillR, [&](float u, float v) -> COLORREF {
+                // 横向：左端 accent 浓、向右二次衰减（平滑，无渐隐硬边）
+                COLORREF base = Blend(t.selBg, t.accent, 0.34f * (1.0f - u) * (1.0f - u) + 0.12f);
                 if (i == g.hoverRow && g.hoverT > 0.001)
                     base = Blend(base, t.accent2, (float)(0.14 * g.hoverT));
-                if (v < 0.22f)
-                    base = Blend(base, t.textTitle, (t.dark ? 0.14f : 0.20f) * (1 - v / 0.22f));
-                else if (v > 0.86f)
-                    base = Darken(base, t.dark ? 6 : 4);
+                // 纵向：顶部极轻的柔光随高度平方衰减，读起来有体积感但不成「带」
+                float glow = (1.0f - v); glow *= glow;
+                base = Blend(base, t.textTitle, (t.dark ? 0.10f : 0.14f) * glow);
                 return base;
             });
         } else if (i == g.hoverRow) {
-            RECT hp = cardRow;
-            FillRoundRectAA(mem, hp, kSelPillR, [&](float, float) -> COLORREF {
+            RECT pill = selRect(cardRow, y);
+            FillRoundRectAA(mem, pill, kSelPillR, [&](float, float) -> COLORREF {
                 return Blend(rowBase, t.accent2, (float)(0.10 + 0.12 * g.hoverT));
             });
         }
         if (i == g.pressRow && i != g.sel) {
-            PaintInsetShadow(mem, cardRow, kSelPillR, rowBase);
+            RECT pill = selRect(cardRow, y);
+            PaintInsetShadow(mem, pill, kSelPillR, rowBase);
         }
         if (hot) {
             // 左侧强调色条：圆角胶囊 + 垂直渐变，重度档外再罩一层软辉光。
@@ -4422,7 +4429,7 @@ static void Paint(HDC hdc) {
             FillRoundRectAA(mem, well, S(8), [&](float, float v) -> COLORREF {
                 COLORREF base = Blend(t.bgCard, t.accent2, t.dark ? 0.22f : 0.14f);
                 if (v < 0.22f) return Blend(base, t.textTitle, (t.dark ? 0.16f : 0.22f) * (1 - v / 0.22f));
-                if (v > 0.84f) return Darken(base, 10);
+                if (v > 0.84f) return Darken(base, (int)(10 * (v - 0.84f) / 0.16f + 0.5f));  // 底部渐暗，连续无台阶
                 return base;
             });
             DrawIconEx(mem, x, iconTop, rowIcon, S(24), S(24), 0, nullptr, DI_NORMAL);
@@ -4442,7 +4449,7 @@ static void Paint(HDC hdc) {
                 COLORREF base = i == g.sel ? Blend(t.selBg, t.accent, 0.42f)
                                            : Blend(t.bgCard, t.accent2, 0.10f);
                 if (v < 0.34f) return Blend(base, t.textTitle, (t.dark ? 0.12f : 0.20f) * (1 - v / 0.34f));
-                if (v > 0.86f) return Darken(base, (int)(t.dark ? 16 : 10));  // 底部 lip：按键厚度
+                if (v > 0.86f) return Darken(base, (int)((t.dark ? 16 : 10) * (v - 0.86f) / 0.14f + 0.5f));  // 底部 lip：连续加深
                 return base;
             });
             StrokeRoundRectAA(mem, br, bh / 2,
@@ -4471,7 +4478,7 @@ static void Paint(HDC hdc) {
             FillRoundRectAA(mem, br, bh / 2, [&](float, float v) -> COLORREF {
                 COLORREF base = badgeBg;
                 if (v < 0.30f) return Blend(base, t.textTitle, (tier >= 4 ? 0.16f : 0.10f) * (1 - v / 0.30f));
-                if (v > 0.85f) return Darken(base, tier >= 4 ? 14 : 8);
+                if (v > 0.85f) return Darken(base, (int)((tier >= 4 ? 14 : 8) * (v - 0.85f) / 0.15f + 0.5f));  // 底部 lip 连续加深
                 return base;
             });
             // 档点：胶囊左端小圆点，重度档与文字同用反白
