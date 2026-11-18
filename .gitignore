@@ -43,3 +43,7 @@ tools/rustc-wrapper/
 
 # Local indexer metrics output
 resource-samples.jsonl
+
+# UI 测试落盘的取证图（tests/ 运行时写在仓库根）
+hot_usage_dark.bmp
+hot_usage_control.bmp

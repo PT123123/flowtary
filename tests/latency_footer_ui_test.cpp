@@ -122,8 +122,12 @@ int main() {
     const Theme& t = *g.theme;
     int inputH = S(kBaseInputH), rowH = S(kBaseRowH), pad = S(kBasePad);
     int rows = (int)g.items.size();
-    int baseH = S(kBaseInputH + rows * kBaseRowH);
-    int footH = S(kBaseInputH + rows * kBaseRowH + kBaseFooterH);
+    // 窗口高度公式（与 Layout 一致）：输入栏 + 卡片（间距 + 行 + 底部内边距）
+    //                              + 卡片到窗口底的留白 + 可选耗时底栏
+    int baseH = S(kBaseInputH + kBaseCardGapTop + rows * kBaseRowH +
+                  kBaseCardPadBottom + kBaseWinPadBottom);
+    int footH = S(kBaseInputH + kBaseCardGapTop + rows * kBaseRowH +
+                  kBaseCardPadBottom + kBaseWinPadBottom + kBaseFooterH);
 
     // ---- 数据臂：pending 实时累计、报齐定格 ----
     g.mode = Mode::Files; g.dfWsDone = false;

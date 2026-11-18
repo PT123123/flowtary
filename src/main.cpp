@@ -330,6 +330,16 @@ struct App {
 constexpr int kBaseW = 680, kBaseInputH = 62, kBaseRowH = 34, kBasePad = 12;
 constexpr int kBaseEmptyH = 200;  // 空态引导面板逻辑高度（输入区之外的品牌/引导区）
 constexpr int kBaseFooterH = 22;  // 耗时底栏逻辑高度（仅非秒出时出现）
+// 列表卡片的版式留白（逻辑像素）：
+//   kBaseCardGapTop    输入栏底边 → 卡片顶边。两片玻璃之间必须留呼吸位——紧贴时
+//                      输入栏的底圆角和卡片的顶圆角叠在一起，左上角会糊成一块方角暗斑。
+//   kBaseCardPadBottom 卡片底边 → 最后一行底边。最后一行不贴卡片边，图标托盘和高亮
+//                      才不会顶到卡片圆角上。
+//   kBaseWinPadBottom  卡片底边 → 窗口底边。窗口底缘的圆角在这里收口，最后一行
+//                      不会被窗口底边水平切断（之前正是这里把末行切掉半截）。
+constexpr int kBaseCardGapTop = 10;
+constexpr int kBaseCardPadBottom = 8;
+constexpr int kBaseWinPadBottom = 10;
 constexpr int kSlowMs = 120;      // 超过这个毫秒数才报耗时；秒出的查询保持干净
 constexpr int kFontMin = 11, kFontMax = 24;  // 字体池逻辑字号范围
 constexpr UINT_PTR kTimerDebounce = 1;
@@ -401,6 +411,7 @@ static void SaveClickWeightsNow();
 static long long NowUnix();  // 定义在自学习小节；评分函数用它算「距今多久」
 // f/d 自学习（定义在「自学习」小节）
 static void RecordLearned(const Row& r);
+static void RerankByTier();  // 热度档统一重排（定义在自学习段，Refresh 先用到）
 static void PrependLearnedRows(const std::wstring& term);
 static void SaveLearnedNow();
 static void LoadLearned();
@@ -833,20 +844,6 @@ static void StrokeRoundRect(HDC h, const RECT& r, int rad, HPEN p) {
     HPEN op = (HPEN)SelectObject(h, p);
     StrokePath(h);
     SelectObject(h, op);
-}
-
-// 垂直渐变圆角矩形（path  clip + GradientFill）：色条胶囊用
-static void FillRoundRectVGradient(HDC h, const RECT& r, int rad, COLORREF c0, COLORREF c1) {
-    if (r.right <= r.left || r.bottom <= r.top) return;
-    SaveDC(h);
-    BeginPath(h);
-    // GDI 圆角/矩形 path 不含右/下边缘，+1 补回，保证 clip 宽度=请求宽度
-    if (rad > 0) RoundRect(h, r.left, r.top, r.right + 1, r.bottom + 1, 2 * rad, 2 * rad);
-    else Rectangle(h, r.left, r.top, r.right + 1, r.bottom + 1);
-    EndPath(h);
-    SelectClipPath(h, RGN_COPY);
-    FillVGradient(h, r.left, r.top, r.right - r.left, r.bottom - r.top, c0, c1);
-    RestoreDC(h, -1);
 }
 
 // 软外阴影：在 r 外侧偏移 (ox,oy) 画一张带 alpha 的圆角矩形（无模糊，靠低 alpha 模拟海拔）
@@ -1387,11 +1384,72 @@ static bool HasExcludeTerm(const std::wstring& textLower) {
     return false;
 }
 
+// ---------------- 使用分档与热度 ----------------
+// 常用阈值：历史总使用次数达到该行数才进入醒目样式；
+// 没用过/偶尔用的行保持原样（哪怕同在开始菜单这类规定目录下）。
+constexpr int kHotUsageMin = 3;
+
+// 使用分档：0=原样(0-2 次)，2=常用(3-9)，3=高频(10-29)，4=重度(>=30)。
+// 档决定字体/徽章形态；档内再由 UsageHeat 连续驱动颜色强度，
+// 同档里 15 次和 25 次看起来也不一样，避免一刀切的粗粒度。
+static int UsageTier(int usage) {
+    if (usage < kHotUsageMin) return 0;
+    if (usage < 10) return 2;
+    if (usage < 30) return 3;
+    return 4;
+}
+// 热度 0..1：log 曲线，次数边际递减（1→0.17，3→0.33，15→0.66，29→0.82，64+→1）
+static float UsageHeat(int usage) {
+    if (usage <= 0) return 0.f;
+    float h = logf(1.f + (float)usage) / logf(65.f);
+    return h > 1.f ? 1.f : h;
+}
+
+// ---------------- 全局使用档案（徽章与排序共用同一口径） ----------------
+// 徽章上的「×N」是「跨全部搜索词 + 自学习」的累计次数；如果排序仍按「当前词桶」
+// 的使用分排，就会出现「徽章标着重度 ×81、却被零使用的行压在下面」的矛盾。
+// 这里把全局累计（次数 + 最近使用时间）单独聚一份，排序与徽章都从它取数。
+struct AppUsage { int count = 0; long long last = 0; };
+
+static std::unordered_map<std::wstring, AppUsage> g_globalUsage;
+static bool g_globalUsageDirty = true;
+
+// 权重/自学习发生任何增删改都要打脏标，否则排序会读到旧档案。
+static void MarkUsageDirty() { g_globalUsageDirty = true; }
+
+static const std::unordered_map<std::wstring, AppUsage>& GlobalUsage() {
+    if (g_globalUsageDirty) {
+        g_globalUsage.clear();
+        // 按应用身份聚合：taskinformer 升级到新版本目录后，历史各版本的使用次数合并计数，
+        // 常用档加粗不会因为升级而丢失。文件/文件夹不在版本目录里，身份=路径，行为不变。
+        for (auto& kv : g.weights)
+            for (auto& pv : kv.second) {
+                AppUsage& a = g_globalUsage[ft::search::AppIdentityKey(pv.first)];
+                a.count += pv.second.count;
+                if (pv.second.last > a.last) a.last = pv.second.last;
+            }
+        for (auto& kv : g.learned)
+            for (auto& pv : kv.second) {
+                AppUsage& a = g_globalUsage[ft::search::AppIdentityKey(pv.first)];
+                a.count += pv.second.count;
+                if (pv.second.last > a.last) a.last = pv.second.last;
+            }
+        g_globalUsageDirty = false;
+    }
+    return g_globalUsage;
+}
+
+// 某条目标的全局累计次数（徽章口径）与分档。
+static int GlobalUsageCount(const std::wstring& path) {
+    const auto& m = GlobalUsage();
+    auto it = m.find(ft::search::AppIdentityKey(path));
+    return it == m.end() ? 0 : it->second.count;
+}
+
 // 当前查询下的「使用档案」：把精确词命中 + 前缀词推荐的历史权重，统一按应用身份聚合。
 // 一次遍历算好，排序时每个候选只需一次查表。跨版本合并让升级不丢历史使用。
 //   - 精确词 term==ql：用户敲完整/当前词时点过的
 //   - 前缀词 term 以 ql 开头且更长：以前敲完整词点过、现在只敲前缀的自适应推荐
-struct AppUsage { int count = 0; long long last = 0; };
 static void CollectUsageByApp(const std::wstring& ql,
                               std::unordered_map<std::wstring, AppUsage>& out) {
     out.clear();
@@ -1445,7 +1503,8 @@ static void SearchPrograms(const std::wstring& query) {
     CollectUsageByApp(ql, usage);
     const long long now = NowUnix();
     const bool hasEx = !g.excludes.empty();
-    struct Cand { Program* p; int score; int w; };
+    const auto& globalUse = GlobalUsage();
+    struct Cand { Program* p; int score; int w; int tier; };
     std::vector<Cand> cands;
     // 单字符查询只保留精确(4)/前缀(3)：带上「包含/子序列」时命中面过宽
     // （实测 d 命中全部程序的 32%），刚敲第一个字母就撑满 10 行噪音结果。
@@ -1459,10 +1518,15 @@ static void SearchPrograms(const std::wstring& query) {
             std::wstring hay = ToLowerW(p.name) + L' ' + ToLowerW(p.path);
             if (HasExcludeTerm(hay)) continue;
         }
-        cands.push_back({&p, s, w});
+        // 全局热度档：与行上徽章同一口径（跨全部搜索词累计），重度档必须排在最前
+        int tier = 0;
+        auto git = globalUse.find(ft::search::AppIdentityKey(p.path));
+        if (git != globalUse.end()) tier = UsageTier(git->second.count);
+        cands.push_back({&p, s, w, tier});
     }
     std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {
-        if (a.w != b.w) return a.w > b.w;  // 综合使用分（跨版本累计次数+最近使用）最优先
+        if (a.tier != b.tier) return a.tier > b.tier;  // 热度档优先：重度 > 高频 > 常用 > 原样
+        if (a.w != b.w) return a.w > b.w;  // 再比当前词桶的综合使用分（跨版本累计次数+最近使用）
         if (a.score != b.score) return a.score > b.score;  // 同分再比文本匹配度
         if (a.p->startMenu != b.p->startMenu) return a.p->startMenu;
         return _wcsicmp(a.p->name.c_str(), b.p->name.c_str()) < 0;
@@ -1535,25 +1599,6 @@ static HICON GetPathIcon(const std::wstring& path) {
 }
 
 // ---------------- UI 布局 ----------------
-// 常用阈值：历史总使用次数达到该行数才进入醒目样式；
-// 没用过/偶尔用的行保持原样（哪怕同在开始菜单这类规定目录下）。
-constexpr int kHotUsageMin = 3;
-
-// 使用分档：0=原样(0-2 次)，2=常用(3-9)，3=高频(10-29)，4=重度(>=30)。
-// 档决定字体/色条宽度/徽章形态；档内再由 UsageHeat 连续驱动颜色强度，
-// 同档里 15 次和 25 次看起来也不一样，避免一刀切的粗粒度。
-static int UsageTier(int usage) {
-    if (usage < kHotUsageMin) return 0;
-    if (usage < 10) return 2;
-    if (usage < 30) return 3;
-    return 4;
-}
-// 热度 0..1：log 曲线，次数边际递减（1→0.17，3→0.33，15→0.66，29→0.82，64+→1）
-static float UsageHeat(int usage) {
-    if (usage <= 0) return 0.f;
-    float h = logf(1.f + (float)usage) / logf(65.f);
-    return h > 1.f ? 1.f : h;
-}
 
 // 给当前结果行回填历史总使用次数：点击权重按搜索词分桶，这里跨全部词求和，
 // 再叠加自学习的打开次数——衡量的是「这个目标平时用不用」，与当前输入的词无关。
@@ -1565,17 +1610,11 @@ static void AnnotateRowUsage() {
         if (r.kind == Row::Prog || r.kind == Row::File || r.kind == Row::Folder) any = true;
     }
     if (!any) return;
-    std::unordered_map<std::wstring, int> total;
-    // 按应用身份聚合：taskinformer 升级到新版本目录后，历史各版本的使用次数合并计数，
-    // 常用档加粗不会因为升级而丢失。文件/文件夹不在版本目录里，身份=路径，行为不变。
-    for (auto& kv : g.weights)
-        for (auto& pv : kv.second) total[ft::search::AppIdentityKey(pv.first)] += pv.second.count;
-    for (auto& kv : g.learned)
-        for (auto& pv : kv.second) total[ft::search::AppIdentityKey(pv.first)] += pv.second.count;
+    const auto& total = GlobalUsage();
     for (auto& r : g.items) {
         if (r.kind != Row::Prog && r.kind != Row::File && r.kind != Row::Folder) continue;
         auto it = total.find(ft::search::AppIdentityKey(r.action));
-        if (it != total.end()) r.usage = it->second;
+        if (it != total.end()) r.usage = it->second.count;
     }
 }
 
@@ -1656,7 +1695,16 @@ static void Layout() {
     int fm = 0; bool fl = false;
     const bool footer = LatencyFooter(fm, fl);
     int W = S(kBaseW);
-    int H = S(kBaseInputH + rows * kBaseRowH + (footer ? kBaseFooterH : 0));
+    // 窗口高度 = 输入栏 + 卡片（间距 + 结果行 + 底部内边距）+ 卡片到窗口底的留白 + 耗时底栏。
+    // 末行不再被窗口底边切断：卡片底边与窗口底边之间必须留出 kBaseWinPadBottom，
+    // 否则最后一行的高亮胶囊/图标托盘会越过卡片圆角、被窗口底缘水平切掉半截。
+    int H;
+    if (rows <= 0) {
+        H = S(kBaseInputH);  // 空态：紧凑输入框，不长卡片
+    } else {
+        H = S(kBaseInputH + kBaseCardGapTop + rows * kBaseRowH +
+               kBaseCardPadBottom + kBaseWinPadBottom + (footer ? kBaseFooterH : 0));
+    }
     MONITORINFO mi{};
     mi.cbSize = sizeof(mi);
     GetMonitorInfoW(mon, &mi);
@@ -1929,18 +1977,29 @@ static void StartDfSearch() {
 }
 
 // 点击加权重排（与 Handle索引Reply 内同一套规则；含自适应前缀推荐 + 跨版本聚合）
+// 首要键是「全局热度档」——与行上徽章同一口径（跨全部搜索词累计），
+// 否则会出现「徽章标着重度 ×81、却被零使用的行压在下面」。
 static void RerankDfByWeight() {
-    if (!g.weightEnabled || g.evTermKey.empty() || g.items.size() <= 1) return;
+    if (g.evTermKey.empty() || g.items.size() <= 1) return;
     const std::wstring& tk = g.evTermKey;
     std::unordered_map<std::wstring, AppUsage> usage;
-    CollectUsageByApp(tk, usage);
+    if (g.weightEnabled) CollectUsageByApp(tk, usage);
     const long long now = NowUnix();
+    const auto& globalUse = GlobalUsage();
+    auto rowTier = [&](const Row& r) -> int {
+        if (r.kind != Row::File && r.kind != Row::Folder) return 0;
+        auto it = globalUse.find(ft::search::AppIdentityKey(r.action));
+        if (it == globalUse.end()) return 0;
+        return UsageTier(it->second.count);
+    };
     auto rowW = [&](const Row& r) {
         if (r.kind != Row::File && r.kind != Row::Folder) return 0;
         return UsageScoreOf(r.action, tk, usage, now);
     };
     std::stable_sort(g.items.begin(), g.items.end(),
-                     [&rowW](const Row& a, const Row& b) {
+                     [&rowTier, &rowW](const Row& a, const Row& b) {
+                         int ta = rowTier(a), tb = rowTier(b);
+                         if (ta != tb) return ta > tb;   // 热度档优先：重度 > 高频 > 常用 > 原样
                          if (a.workshopHit != b.workshopHit) return a.workshopHit;
                          return rowW(a) > rowW(b);
                      });
@@ -1973,15 +2032,22 @@ static void RenderDfResults() {
         return s;
     };
     if (!words.empty() && g.items.size() > 1) {
-        // 排序键一次算好（文本分 + 版本档）：比较器里现算路径解析会被排序放大几倍。
-        struct DfKey { int workshop; int score; int vrank; unsigned long long ver; int plain; size_t idx; };
+        // 排序键一次算好（文本分 + 热度档 + 版本档）：比较器里现算路径解析会被排序放大几倍。
+        struct DfKey { int tier; int workshop; int score; int vrank; unsigned long long ver; int plain; size_t idx; };
         std::vector<DfKey> keys(g.items.size());
         std::vector<Info> av(g.items.size());
         appver::Table tab;
+        const auto& globalUse = GlobalUsage();
         for (size_t i = 0; i < g.items.size(); ++i) {
             keys[i].score = scoreOf(g.items[i]);
             keys[i].workshop = g.items[i].workshopHit ? 1 : 0;
             keys[i].idx = i;
+            // 热度档与行上徽章同源：重度档必须排在最前，不能被零使用的行压住
+            keys[i].tier = 0;
+            if (g.items[i].kind == Row::File || g.items[i].kind == Row::Folder) {
+                auto it = globalUse.find(ft::search::AppIdentityKey(g.items[i].action));
+                if (it != globalUse.end()) keys[i].tier = UsageTier(it->second.count);
+            }
             av[i] = appver::Parse(g.items[i].action);
             tab.Feed(av[i]);
         }
@@ -1991,6 +2057,7 @@ static void RenderDfResults() {
             keys[i].ver = av[i].ver;
         }
         std::stable_sort(keys.begin(), keys.end(), [](const DfKey& a, const DfKey& b) {
+            if (a.tier != b.tier) return a.tier > b.tier;  // 热度档优先
             if (a.workshop != b.workshop) return a.workshop > b.workshop;
             if (a.score != b.score) return a.score > b.score;
             if (a.vrank != b.vrank) return a.vrank < b.vrank;
@@ -2003,9 +2070,11 @@ static void RenderDfResults() {
         for (const auto& k : keys) sorted.push_back(std::move(g.items[k.idx]));
         g.items = std::move(sorted);
     }
-    RerankDfByWeight();
     // f/d 自学习置顶（与 索引 展示路径同一套：摘出与结果重复的学习行后插到最前）
+    // 先插学习项再重排：学习项也参与热度排序，重度档学习行仍然排在最前，
+    // 而只有一两次使用的学习项不会硬压过热得多的目标。
     PrependLearnedRows(g.evTermKey);
+    RerankDfByWeight();
     NoteHistoryFirstPaint();
     if (g.items.empty()) {
         if (!g.dfWsDone) AddHint(g.searchRoute == ft::search::Route::FlowtaryIndex ? L"正在查询 Flowtary 索引…" : g.searchRoute == ft::search::Route::WorkshopCatalog ? L"正在查询 C:\\workshop 应用…" : L"正在查询 Windows Search…");
@@ -2459,6 +2528,8 @@ static void Refresh() {
             SearchPrograms(pq.positive);
             // 自学习结果同样参与普通搜索（覆盖不在程序索引里的条目）
             PrependLearnedRows(term);
+            // 热度档统一重排：重度/高频/常用必须在最前，学习项也一起参与
+            RerankByTier();
             if(g.items.empty()){
                 if(g.startingUp)AddHint(L"正在加载应用…");
                 else if(s_programCatalogStats.truncated)AddHint(L"应用列表尚未完整，可稍后刷新");
@@ -3484,6 +3555,7 @@ static void PruneOneMinWeight(const std::wstring& keepTerm, const std::wstring& 
     it->second.erase(minPath);
     if (it->second.empty()) g.weights.erase(it);
     if (g.weightCount > 0) --g.weightCount;
+    MarkUsageDirty();
 }
 
 // 记录一次点击权重（仅本地文件 / 文件夹 / 程序条目）
@@ -3508,6 +3580,7 @@ static void RecordClickWeight(const Row& r) {
         it->second.last = now;  // 最近使用时间随每次点击刷新
     }
     g.weightsDirty = true;
+    MarkUsageDirty();
 
     // 按所选写盘策略持久化
     if (g.weightFlush == 0) {
@@ -3560,6 +3633,7 @@ static void LoadClickWeights() {
     g.weights.clear();
     g.weightCount = 0;
     g.weightsDirty = false;
+    MarkUsageDirty();
     HANDLE f = CreateFileW(WeightsFilePath().c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) return;
@@ -3609,6 +3683,7 @@ static void ClearClickWeights() {
     g.weights.clear();
     g.weightCount = 0;
     g.weightsDirty = true;
+    MarkUsageDirty();
     SaveClickWeightsNow();
 }
 
@@ -3861,6 +3936,7 @@ static void PruneOneLearned(const std::wstring& keepTerm, const std::wstring& ke
     it->second.erase(minPath);
     if (it->second.empty()) g.learned.erase(it);
     if (g.learnCount > 0) --g.learnCount;
+    MarkUsageDirty();
 }
 
 static void ScheduleLearnedSave() {
@@ -3925,6 +4001,7 @@ static void RecordLearned(const Row& r) {
     }
     EnsureEntryLnk(term, path, it->second);
     g.learnedDirty = true;
+    MarkUsageDirty();
     ScheduleLearnedSave();
 }
 
@@ -3952,6 +4029,7 @@ static void SaveLearnedNow() {
                 if (t->second.empty()) g.learned.erase(t);
             }
             if (g.learnCount > 0) --g.learnCount;
+            MarkUsageDirty();
         }
         all.resize(cap);
     }
@@ -3980,6 +4058,7 @@ static void LoadLearned() {
     g.learned.clear();
     g.learnCount = 0;
     g.learnedDirty = false;
+    MarkUsageDirty();  // 下面整段都会增删学习项，标记全局使用档案失效
 
     HANDLE f = CreateFileW(LearnedDataFilePath().c_str(), GENERIC_READ, FILE_SHARE_READ,
                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -4127,6 +4206,7 @@ static void ClearLearned() {
     g.learned.clear();
     g.learnCount = 0;
     g.learnedDirty = true;
+    MarkUsageDirty();
     SaveLearnedNow();
 }
 
@@ -4185,6 +4265,37 @@ static void PrependLearnedRows(const std::wstring& term) {
     }
 }
 
+// 热度档统一重排：把「重度/高频/常用」档的行整体提到前面，档内保持原顺序。
+// 只在可打分的行（程序/文件/文件夹）之间换位——组、网页、提示、直达项留在原位，
+// 免得「一键启动」这类显式动作被热度挤下去。
+// 必须排这一步的原因：自学习项（PrependLearnedRows）总是插在最前，
+// 只用过一两次的学习项会硬压过热得多的重度项——这正是「重度没排在最上面」的另一半。
+static void RerankByTier() {
+    // slots：可打分行的原始位置（升序）。写回时必须按这个原始顺序落位，
+    // 否则「排好序的行 → 排序后的 slots」会互相抵消（恒等置换，等于没排）。
+    std::vector<size_t> slots;
+    for (size_t i = 0; i < g.items.size(); ++i) {
+        Row::Kind k = g.items[i].kind;
+        if (k == Row::Prog || k == Row::File || k == Row::Folder) slots.push_back(i);
+    }
+    if (slots.size() <= 1) return;
+    const auto& globalUse = GlobalUsage();
+    auto tierOf = [&](const Row& r) -> int {
+        auto it = globalUse.find(ft::search::AppIdentityKey(r.action));
+        if (it == globalUse.end()) return 0;
+        return UsageTier(it->second.count);
+    };
+    // 排的是「行的先后」，不是「位置」：先按档位把行取出，再依次写回原始坑位。
+    std::vector<size_t> order = slots;
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return tierOf(g.items[a]) > tierOf(g.items[b]);
+    });
+    std::vector<Row> picked;
+    picked.reserve(order.size());
+    for (size_t idx : order) picked.push_back(g.items[idx]);
+    for (size_t i = 0; i < slots.size(); ++i) g.items[slots[i]] = std::move(picked[i]);
+}
+
 // ---------------- 绘制 ----------------
 static void Paint(HDC hdc) {
     RECT rc;
@@ -4231,10 +4342,17 @@ static void Paint(HDC hdc) {
         for (auto& b : starB) DeleteObject(b);
     }
 
-    // 分层面板：输入区 + 结果卡片（圆角 + 轻外影 + 顶部内高光）
-    // iOS 内嵌分组列表逻辑：卡片顶边与输入栏底边相接（无缝隙），
-    // 行背景与卡片边缘完全对齐——高亮不再越过卡片顶缘。
-    RECT cardR{S(kBasePad), inputH, W - S(kBasePad), H - S(6)};
+    // 分层面板：输入区（通宽玻璃片）+ 结果卡片（内缩圆角块）
+    // iOS 内嵌分组列表逻辑：两片玻璃之间留一段呼吸位（kBaseCardGapTop）。
+    // 之前卡片紧贴输入栏底边，输入栏的底圆角与卡片的顶圆角叠在一起，
+    // 左上角糊出一块方角暗斑——现在拉开间距，两道圆弧各自干净。
+    const int rows = (std::min)((int)g.items.size(), (int)kMaxVisibleResults);
+    const int gapTop = S(kBaseCardGapTop);
+    const int rowsTop = inputH + gapTop;           // 第一行顶边
+    const int rowsBottom = rowsTop + rows * rowH;  // 最后一行底边
+    RECT cardR{S(kBasePad), rowsTop, W - S(kBasePad), rowsBottom + S(kBaseCardPadBottom)};
+    // 兜底：卡片底边不得越过窗口底缘（正常由 Layout 按同一公式给足高度）
+    if (cardR.bottom > H - S(2)) cardR.bottom = H - S(2);
     int cardRad = 0;
     HRGN hCardRgn = nullptr;
     {
@@ -4245,7 +4363,7 @@ static void Paint(HDC hdc) {
         // 手机系统搜索栏质感（HyperOS/iOS 控制中心参考）：
         // ① 顶部内缘柔光 → 中段本色 → 底部微暗（玻璃厚度）；
         // ② 中上部一团 accent 环境光（椭圆径向衰减），像控制中心那块「被光照亮的玻璃」。
-        FillRoundRectAA(mem, inR, ri, [&](float u, float v) -> COLORREF {
+        auto inputBase = [&](float u, float v) -> COLORREF {
             COLORREF base = t.bgInput;
             if (v < 0.14f) {
                 float k = 1.0f - v / 0.14f;
@@ -4262,14 +4380,13 @@ static void Paint(HDC hdc) {
                 base = Blend(base, t.accent2, (t.dark ? 0.16f : 0.11f) * fall);
             }
             return base;
-        });
+        };
+        FillRoundRectAA(mem, inR, ri, inputBase);
         PaintInsetShadow(mem, inR, ri, t.bgInput);
         // 边缘发丝：整圈 1px 内描边（上缘偏亮、下缘偏暗做不到逐段，取中性微亮），
         // 手机玻璃片的「厚度线」——细看有边界、粗看无感
         StrokeRoundRectAA(mem, inR, ri,
                           Blend(t.bgInput, t.textTitle, t.dark ? 0.10f : 0.26f), 1);
-        int gap = S(6);
-        (void)gap;
         if (cardR.bottom > cardR.top && cardR.right > cardR.left) {
             cardRad = S(t.radiusCard);
             PaintOutShadow(mem, cardR, cardRad, S(t.shCardX), S(t.shCardY), S(t.shCardBlur), t.shCardA, t.shCardColor);
@@ -4284,17 +4401,39 @@ static void Paint(HDC hdc) {
                                           cardRad * 2, cardRad * 2);
         }
     }
-    // 顶部强调色条：横向三段渐变（两端 accent2 → 中段 accent）+ 半高圆角收口，
-    // 全部走抗锯齿覆盖率，边缘不再有 GDI 硬边锯齿。
+    // 顶部强调色条：横向三段渐变（两端 accent2 → 中段 accent）+ 两端渐隐收口。
+    // 之前两端是垂直切口（4px 高的条上「半高圆角」退化成方角），一眼就是硬边；
+    // 现在两端按 smoothstep 化进输入栏底色，读起来是光线扫过而不是被刀切断。
     if (t.accentStrip) {
         int barH = S(4);
         // 强调条必须内缩出圆角区：条若顶到窗口圆角，会和圆框描边糊成一个
         // 「蓝色钩子」，视觉上就是蓝线溢出圆框。内缩后角上只剩干净的圆框弧线。
         int inset = S(t.radiusWindow) + S(5);
         RECT ar{inset, 0, W - inset, barH};
-        FillRoundRectAA(mem, ar, barH / 2, [&](float u, float) -> COLORREF {
+        const float barV = barH > 1 ? (float)(barH / 2) / (float)(inputH - 1) : 0.f;
+        const float fade = (float)S(46);   // 两端渐隐长度（像素）
+        FillRoundRectAA(mem, ar, barH / 2, [&](float u, float v) -> COLORREF {
             float k = u < 0.5f ? (u * 2) : ((1 - u) * 2);  // 0→1→0
-            return Blend(t.accent2, t.accent, k);
+            COLORREF strip = Blend(t.accent2, t.accent, k);
+            // 渐隐：两端 alpha 归零并 smoothstep 化开，末端不再有垂直切口
+            float span = (float)(ar.right - ar.left);
+            float dL = u * span, dR = span - u * span;
+            float a = 1.f;
+            if (dL < fade) a = dL / fade;
+            if (dR < fade) a = (std::min)(a, dR / fade);
+            a = a * a * (3.f - 2.f * a);
+            if (a <= 0.001f) return t.bgInput;
+            // 背板 = 输入栏在该处的实际颜色（渐隐必须化进它自己的底，不能化进纯色）
+            COLORREF back = t.bgInput;
+            {
+                COLORREF base = t.bgInput;
+                if (v < 0.14f) base = Blend(base, t.textTitle, (t.dark ? 0.12f : 0.30f) * (1.f - v / 0.14f));
+                float du = (u - 0.5f) / 0.66f, dv = (barV - 0.40f) / 0.66f;
+                float d2 = du * du + dv * dv;
+                if (d2 < 1.0f) base = Blend(base, t.accent2, (t.dark ? 0.16f : 0.11f) * (1.f - d2) * (1.f - d2));
+                back = base;
+            }
+            return Blend(back, strip, a);
         });
         // 柔光过渡：色条正下方 2px，accent2 低 alpha 渐隐进背景，消除生硬硬边
         RECT glow{inset, barH, W - inset, barH + S(2)};
@@ -4365,15 +4504,17 @@ static void Paint(HDC hdc) {
 
     // 结果列表
     SelectObject(mem, g.fList);
-    int rows = (std::min)((int)g.items.size(), (int)kMaxVisibleResults);
-    const int kSelPillR = S(8);   // 选中高亮圆角：适度圆角，不做半高胶囊
-    const int kSelInset = S(6);   // 高亮相对卡片左右各内缩，不与卡片圆角/描边打架
+    const int kSelPillR = S(6);   // 选中高亮圆角：适度圆角，不做半高胶囊（圆得太圆会腻）
+    const int kSelInset = S(4);   // 高亮相对卡片左右各内缩，不与卡片圆角/描边打架
+    // 行内容左内边距：图标托盘必须整块落在高亮胶囊的左圆角之内，
+    // 否则白色图标盒会压在高亮左圆角上、把圆角啃出一个缺口（放大看非常明显）。
+    const int kContentPad = S(13);
     auto selRect = [&](const RECT& cardRow, int y) {
         return RECT{cardRow.left + kSelInset, y, cardRow.right - kSelInset, y + rowH};
     };
     for (int i = 0; i < rows; ++i) {
         Row& row = g.items[i];
-        int y = inputH + i * rowH;
+        int y = rowsTop + i * rowH;
         const int tier = (row.kind == Row::Prog || row.kind == Row::File || row.kind == Row::Folder)
                              ? UsageTier(row.usage) : 0;
         const bool hot = tier >= 2;
@@ -4420,17 +4561,10 @@ static void Paint(HDC hdc) {
             RECT pill = selRect(cardRow, y);
             PaintInsetShadow(mem, pill, kSelPillR, rowBase);
         }
-        if (hot) {
-            // 左侧强调色条：圆角胶囊 + 垂直渐变，重度档外再罩一层软辉光。
-            // 画在行最左缘外侧边距（图标从 pad 起，会盖住卡片左缘的同位置色条）
-            RECT barR{S(2), y + S(6), S(2) + S(1) + S(tier), y + rowH - S(6)};
-            if (tier >= 4) {
-                RECT gr{barR.left - S(2), barR.top - S(2), barR.right + S(2), barR.bottom + S(2)};
-                PaintOutShadow(mem, gr, S(3), 0, 0, 0, 46, t.accent2);
-            }
-            FillRoundRectVGradient(mem, barR, (barR.right - barR.left) / 2, t.accent2, t.accent);
-        }
-        int x = pad;
+        // 档位不再画左侧色条：那条色条画在卡片左缘之外（x=S(2) < pad），
+        // 是一枚漂在窗体背景上的孤立小色块，看着就是「溢出」。
+        // 档位信息由行上的徽章（常用/高频/重度 ×N）+ 染色 + 标题字色完整表达。
+        int x = cardRow.left + kContentPad;
         int iconTop = y + (rowH - S(24)) / 2;
         HICON rowIcon = nullptr;
         if (row.kind == Row::Prog && row.prog) {
@@ -4525,7 +4659,7 @@ static void Paint(HDC hdc) {
             GetTextExtentPoint32W(mem, row.title.c_str(), (int)row.title.size(), &tsz);
             // 路径栏宽度按「标题完整显示后剩多少」给，上限 3/4、下限 1/4：
             // 标题短时深路径能整条看完，标题长时也不会把路径压成几个字。
-            const int budget = W - pad - hkReserved - hotReserved - S(12);
+            const int budget = W - x - hkReserved - hotReserved - S(12);
             int room = budget - (std::min)((int)tsz.cx, budget * 3 / 4) - S(12);
             if (room > budget * 3 / 4) room = budget * 3 / 4;
             if (room < budget / 4) room = budget / 4;
@@ -4555,7 +4689,7 @@ static void Paint(HDC hdc) {
         // 选中行上下两段都跳过——让选中态保持完整一块。1px、极低对比，只提供「行有边界」的暗示。
         if (i + 1 < rows && i != g.sel && i + 1 != g.sel) {
             int sy = y + rowH - 1;
-            RECT sep{pad + S(24) + S(8), sy, W - pad - S(30), sy + 1};
+            RECT sep{x, sy, W - pad - S(30), sy + 1};
             HBRUSH sb = CreateSolidBrush(Blend(t.bgCard, t.textSec, t.dark ? 0.06f : 0.09f));
             FillRect(mem, &sep, sb);
             DeleteObject(sb);
@@ -4566,7 +4700,9 @@ static void Paint(HDC hdc) {
     {
         int fm = 0; bool fl = false;
         if (LatencyFooter(fm, fl)) {
-            int fy = inputH + rows * rowH;
+            // 底栏独占窗口最下面一条带：分隔线在带的上边，文字在带内垂直居中。
+            // 带的上边 = 卡片底边 + 窗口底部留白，所以底栏不会和卡片叠在一起。
+            int fy = H - S(kBaseFooterH);
             RECT dl{pad, fy, W - pad, fy + 1};
             PaintDivider(mem, dl, t.divider, 55);
             SelectObject(mem, g.fontPool[FontSlot(kFontMin)]);
@@ -5382,8 +5518,9 @@ case VK_LEFT:
             if (!keyboard) ScreenToClient(hwnd, &p);
             int idx = keyboard ? g.sel : -1;
             int inputH = S(kBaseInputH), rowH = S(kBaseRowH);
-            if (!keyboard && p.y >= inputH && !g.items.empty()) {
-                idx = (p.y - inputH) / rowH;
+            int rowsTop = inputH + S(kBaseCardGapTop);
+            if (!keyboard && p.y >= rowsTop && !g.items.empty()) {
+                idx = (p.y - rowsTop) / rowH;
                 if (idx >= (int)g.items.size()) idx = -1;
             }
             if (idx >= 0 && idx < (int)g.items.size()) {
@@ -5398,6 +5535,7 @@ case VK_LEFT:
             int x = GET_X_LPARAM(lParam);
             int y = GET_Y_LPARAM(lParam);
             int inputH = S(kBaseInputH), rowH = S(kBaseRowH);
+            int rowsTop = inputH + S(kBaseCardGapTop);
             // 拖拽选区中：随鼠标移动扩展 selEnd，光标跟到末尾
             if (g.dragging) {
                 size_t pos = CaretFromX(x);
@@ -5407,8 +5545,8 @@ case VK_LEFT:
                 return 0;
             }
             int idx = -1;
-            if (y >= inputH && !g.items.empty()) {
-                idx = (y - inputH) / rowH;
+            if (y >= rowsTop && !g.items.empty()) {
+                idx = (y - rowsTop) / rowH;
                 if (idx < 0 || idx >= (int)g.items.size()) idx = -1;
             }
             // 悬停行变化：触发 hover 补间动画（进入→提亮，离开→回落）
@@ -5438,8 +5576,9 @@ case VK_LEFT:
             int x = GET_X_LPARAM(lParam);
             int y = GET_Y_LPARAM(lParam);
             int inputH = S(kBaseInputH), rowH = S(kBaseRowH);
-            if (y >= inputH && !g.items.empty()) {
-                int idx = (y - inputH) / rowH;
+            int rowsTop = inputH + S(kBaseCardGapTop);
+            if (y >= rowsTop && !g.items.empty()) {
+                int idx = (y - rowsTop) / rowH;
                 if (idx >= 0 && idx < (int)g.items.size()) {
                     g.sel = idx;
                     g.pressRow = idx;

@@ -1,6 +1,7 @@
 // 使用分档醒目样式取证：种入真实权重/自学习数据，驱动生产 Layout()+Paint() 画进 DIB，
-// 像素级断言四档（原样/常用/高频/重度）各自的色条宽度、徽章形态、染色强度，
-// 以及同档内不同次数的连续渐变；带清空数据的对照臂证明门认的是使用数据而不是常量。
+// 像素级断言各档的染色强度、徽章形态、选中高亮与卡片/图标的关系、同档内不同次数的
+// 连续渐变；带清空数据的对照臂证明门认的是使用数据而不是常量。
+// 另加排序臂：热度档优先（重度/高频/常用必须排在零使用行之前），与行上徽章同口径。
 // BMP 落盘供肉眼复核。
 #include <windows.h>
 #include <atomic>
@@ -67,7 +68,7 @@ static Pixels RenderAndGrab(const wchar_t* bmpPath) {
     px.w = W; px.h = H;
     px.bgra.resize((size_t)W * H * 4);
     BITMAPINFO bi{};
-    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biSize = sizeof(bi);
     bi.bmiHeader.biWidth = W;
     bi.bmiHeader.biHeight = -H;
     bi.bmiHeader.biPlanes = 1;
@@ -154,6 +155,7 @@ static void SeedUsage() {
     // workshop：重度档 40
     LearnVal w; w.count = 40; w.last = NowUnix();
     g.learned[L"work"][L"C:\\workshop"] = w;
+    MarkUsageDirty();
 }
 
 int main() {
@@ -166,6 +168,7 @@ int main() {
                            nullptr, nullptr, cls.hInstance, nullptr);
     Check(g.hwnd != nullptr, "hidden probe window");
     g.historyEnabled = false; g.learnEnabled = false; g.startingUp = false;
+    g.weightEnabled = true;
     g.text = L"trae";
     g.hoverRow = -1; g.pressRow = -1; g.sel = 0;
 
@@ -206,7 +209,14 @@ int main() {
     Pixels px = RenderAndGrab(L"hot_usage_dark.bmp");
     const Theme& t = *g.theme;
     int inputH = S(kBaseInputH), rowH = S(kBaseRowH), pad = S(kBasePad);
-    auto rowY = [&](int i) { return inputH + i * rowH; };
+    int gapTop = S(kBaseCardGapTop);
+    auto rowY = [&](int i) { return inputH + gapTop + i * rowH; };
+    auto midY = [&](int i) { return rowY(i) + rowH / 2; };
+    // 行内容左内边距：图标托盘必须整块落在选中高亮的左圆角之内
+    int contentLeft = pad + S(13);
+    int textX = contentLeft + S(24) + S(8);
+    int pillInset = S(4);
+    int pillW = (px.w - 2 * pad) - 2 * pillInset;
     auto titleOfTh = [&](const Theme& th, int i) {
         int tier = UsageTier(g.items[i].usage);
         float heat = UsageHeat(g.items[i].usage);
@@ -220,59 +230,61 @@ int main() {
     };
     COLORREF badge2 = Blend(t.bgCard, t.accent, 0.20f);
     COLORREF badge3 = Blend(t.bgCard, t.accent, 0.32f);
-    COLORREF barMid = Blend(t.accent2, t.accent, 0.5f);
-    int barX = S(2);
-    auto midY = [&](int i) { return rowY(i) + rowH / 2; };
     auto rightBox = [&](int i) { return RECT{px.w / 2, rowY(i), px.w, rowY(i) + rowH}; };
-    auto titleBox = [&](int i) { return RECT{pad + S(24) + S(8), rowY(i), px.w / 2, rowY(i) + rowH}; };
+    auto titleBox = [&](int i) { return RECT{textX, rowY(i), px.w / 2, rowY(i) + rowH}; };
+    // 选中玻璃高亮的颜色（与 Paint 里的公式一致）
+    auto glassAt = [&](float u, float v) {
+        COLORREF base = Blend(t.selBg, t.accent, 0.34f * (1.0f - u) * (1.0f - u) + 0.12f);
+        float glow = (1.0f - v); glow *= glow;
+        return Blend(base, t.textTitle, (t.dark ? 0.10f : 0.14f) * glow);
+    };
 
-    // 色条宽度随档位：常用 3px / 高频 4px / 重度 5px（逻辑）
-    Check(Near(px.At(barX + S(1), midY(2)), barMid, 12), "tier2 bar present");
-    Check(px.At(barX + S(3) + S(1), midY(2)) == t.bg, "tier2 bar narrower than tier3");
-    Check(Near(px.At(barX + S(3), midY(4)), barMid, 12), "tier3 bar reaches 4px");
-    Check(px.At(barX + S(4), midY(4)) == t.bg, "tier3 bar narrower than tier4");
-    Check(Near(px.At(barX + S(4), midY(5)), barMid, 12), "tier4 bar reaches 5px");
-    Check(Near(px.At(barX + S(1), midY(0)), barMid, 12), "selected hot row keeps bar");
-    // 重度档色条外罩软辉光；高频档没有
-    int bar4R = barX + S(1) + S(4);
-    // 重度档色条外罩软辉光（预乘 alpha 后 = 底色叠 accent2 低 alpha）；高频档没有
-    Check(Near(px.At(bar4R + S(1), midY(5)), Blend(t.bg, t.accent2, 46 / 255.f), 3),
-          "tier4 bar glow halo");
-    Check(px.At(barX + S(1) + S(3) + S(1), midY(4)) == t.bg, "tier3 bar has no glow");
-    // 原样行：无色条、无染色
-    Check(px.At(barX + S(1), midY(1)) == t.bg, "rare row has no accent bar");
-    Check(px.At(barX + S(1), midY(3)) == t.bg, "never-used row has no accent bar");
-    Check(px.At(barX + S(1), rowY(1) + S(2)) == t.bg, "rare row keeps original background");
+    // 档位色条已删除：卡片左缘内侧（图标托盘之前）必须是该行底色，
+    // 不能再出现一枚画在窗体背景上的孤立小色块。
+    {
+        COLORREF want = (g.items[4].usage >= kHotUsageMin) ? tintOf(4) : t.bgCard;
+        Check(Near(px.At(pad + S(1), rowY(4) + S(2)), want, 6),
+              "no stray tier bar inside card left edge");
+        Check(Dist(px.At(1, midY(0)), t.bgCard) > 20,
+              "card does not bleed into the window gutter");
+    }
 
     // 连续热度：同档 15 与 25 染色不同，且强度随次数单调；染色只落在卡片内
     Check(tintOf(0) != tintOf(4), "same tier different counts tint differently");
     int inCardX = pad + S(2);
     Check(px.At(inCardX, rowY(4) + S(2)) == tintOf(4), "tier3 higher count tint rendered");
     Check(px.At(inCardX, rowY(2) + S(2)) == tintOf(2), "tier2 tint rendered");
-    // 选中行玻璃高亮：卡片内适度圆角块，左右内缩 S(6)，渐变平滑无台阶。
+    // 选中行玻璃高亮：卡片内圆角块，左右内缩 S(4)，渐变平滑无台阶。
     // 顶部 2px 处采样 = 玻璃基色（左浓右淡二次衰减）+ 顶部柔光
     {
-        int inset = S(6);
-        int pillW = (px.w - 2 * pad) - 2 * inset;
-        int sx = pad + S(24) + S(8) + S(2);  // 文字起点右侧，远离高亮圆角区
-        float ug = (float)(sx - (pad + inset)) / (float)(pillW - 1);
-        COLORREF glassBase = Blend(t.selBg, t.accent, 0.34f * (1.0f - ug) * (1.0f - ug) + 0.12f);
+        int sx = textX + S(2);  // 文字起点右侧，远离高亮圆角区
+        float ug = (float)(sx - (pad + pillInset)) / (float)(pillW - 1);
         float vg = 2.0f / (float)(rowH - 1);
-        float glow = (1.0f - vg); glow *= glow;
-        COLORREF glassTop = Blend(glassBase, t.textTitle, (t.dark ? 0.10f : 0.14f) * glow);
+        COLORREF glassTop = glassAt(ug, vg);
         Check(Near(px.At(sx, rowY(0) + S(2)), glassTop, 2),
               "selected glass pill aligned inside card");
-        Check(px.At(S(8), midY(0)) == t.bg, "selection stays inside card (no full-width band)");
-        // 内缩验证：卡左缘与高亮左缘之间（图标托盘从 y+S(4) 才起画，取 y+2 避开；
-        // 该点带卡片内阴影，用容差而非精确色值）
+        // 图标托盘不许压在高亮左圆角上：圆角内侧第一列必须是玻璃色
+        float uc = 1.0f / (float)(pillW - 1);
+        Check(Near(px.At(pad + pillInset + S(1), midY(0)), glassAt(uc, 0.5f), 3),
+              "icon tray does not break selection pill corner");
+        // 内缩验证：卡左缘与高亮左缘之间是卡片底色（带内阴影，用容差而非精确色值）
         Check(Dist(px.At(pad + S(2), rowY(0) + S(2)), t.bgCard) < 30,
               "selection inset from card left edge");
     }
-    Check(px.At(barX + S(1), rowY(2) + S(2)) == t.bg, "tint stays inside card bounds");
     Check(Dist(tintOf(4), t.bgCard) > Dist(tintOf(0), t.bgCard) &&
           Dist(tintOf(0), t.bgCard) > Dist(tintOf(2), t.bgCard),
           "tint strength monotonic 3 < 15 < 25");
     Check(Dist(tintOf(5), t.bgCard) > Dist(tintOf(4), t.bgCard), "tier4 tint strongest");
+
+    // 末行完整：最后一行底边不得越过卡片底边，卡片底边不得贴死窗口底边
+    {
+        int rowsBottom = rowY((int)g.items.size() - 1) + rowH;
+        int cardBottom = rowsBottom + S(kBaseCardPadBottom);
+        Check(cardBottom <= px.h - S(kBaseWinPadBottom) + 1, "card bottom leaves window padding");
+        // 窗口最底一排是背景（不是卡片被切断的残片）
+        Check(Dist(px.At(px.w / 2, px.h - 1), t.bgCard) > 20,
+              "window bottom edge is not a cut-off card");
+    }
 
     // 标题：每档字芯色存在且互不相同；原样行只有正文色
     for (int i : {0, 2, 4, 5})
@@ -291,7 +303,7 @@ int main() {
     Check(px.CountColor(t.accent, rightBox(2)) > 3, "tier2 badge tier dot");
     Check(px.CountColor(t.accent, rightBox(4)) > 3, "tier3 badge tier dot");
     // 重度档标题后软辉光（字上方采样 = 染色底叠 accent2 低 alpha）
-    Check(Near(px.At(inCardX + S(24) + S(8) + S(2), rowY(5) + S(2)),
+    Check(Near(px.At(textX + S(2), rowY(5) + S(2)),
                Blend(tintOf(5), t.accent2, 26 / 255.f), 2), "tier4 title halo");
     for (int i : {1, 3}) {
         Check(px.CountColor(badge2, rightBox(i)) == 0, "plain row no tier2 badge");
@@ -303,30 +315,94 @@ int main() {
     g.theme = &kThemes[0];
     ApplyTheme(false);
     g.weights.clear(); g.learned.clear();
+    MarkUsageDirty();
     Layout();
     for (auto& r : g.items) Check(r.usage == 0, "control arm usage cleared");
     Pixels cp = RenderAndGrab(L"hot_usage_control.bmp");
     {
-        int inset = S(6);
-        int pillW = (px.w - 2 * pad) - 2 * inset;
-        int sx = pad + S(24) + S(8) + S(2);
-        float uc = (float)(sx - (pad + inset)) / (float)(pillW - 1);
-        COLORREF glassMid = Blend(t.selBg, t.accent, 0.34f * (1.0f - uc) * (1.0f - uc) + 0.12f);
-        glassMid = Blend(glassMid, t.textTitle, (t.dark ? 0.10f : 0.14f) * 0.25f);  // v=0.5 柔光
+        int sx = textX + S(2);
+        float uc = (float)(sx - (pad + pillInset)) / (float)(pillW - 1);
+        COLORREF glassMid = glassAt(uc, 0.5f);
         Check(Near(cp.At(sx, midY(0)), glassMid, 2),
               "control: selected row plain glass inside card");
-        Check(cp.At(barX + S(1), midY(0)) == t.bg, "control: selection does not spill outside card");
+        Check(Dist(cp.At(1, midY(0)), t.bgCard) > 20,
+              "control: selection does not spill outside card");
     }
-    Check(cp.At(barX + S(1), midY(5)) == t.bg, "control: no bar without usage data");
-    Check(cp.At(pad + S(2), rowY(4) + S(2)) == t.bgCard, "control: no tint without usage data");
-    Check(cp.At(pad + S(2) + S(24) + S(8) + S(2), rowY(5) + S(2)) == t.bgCard, "control: no halo without data");
+    Check(Dist(cp.At(pad + S(2), rowY(5) + S(2)), t.bgCard) < 30,
+          "control: no bar or tint without usage data");
+    Check(cp.At(pad + S(2) + S(13) + S(24) + S(8) + S(2), rowY(5) + S(2)) == t.bgCard,
+          "control: no halo without data");
     Check(cp.CountColor(titleOf(0), titleBox(0)) == 0, "control: no accent title without data");
     Check(cp.CountColor(badge2, rightBox(2)) == 0, "control: no tier2 badge without data");
     Check(cp.CountColor(badge3, rightBox(0)) == 0, "control: no tier3 badge without data");
     Check(cp.CountColor(t.accent, rightBox(5)) == 0, "control: no tier4 badge without data");
     Check(cp.CountColor(t.textBody, titleBox(0)) > 10, "control: title back to body color");
 
-    { std::lock_guard<std::mutex> lock(s_wsMu); s_wsQuit = true; } s_wsCv.notify_one();
+    // ---- 排序臂：热度档优先，重度必须排最前（与徽章同口径）----
+    // 放在最后：本臂会重建 g.items（只剩 3 行），前面按 6 行索引的断言必须先跑完。
+    {
+        g.programs.clear();
+        g.programs.resize(3);  // Program 含 unique_ptr，只能默认构造
+        g.programs[0].name = L"Trae";      g.programs[0].path = L"C:\\Apps\\Trae\\Trae.exe";
+        g.programs[0].startMenu = true;    g.programs[0].iconTried = true;
+        g.programs[1].name = L"Trae CN";   g.programs[1].path = L"C:\\Apps\\Trae\\TraeCN.exe";
+        g.programs[1].startMenu = true;    g.programs[1].iconTried = true;
+        g.programs[2].name = L"Trae IDE";  g.programs[2].path = L"C:\\Apps\\Trae\\TraeIDE.exe";
+        g.programs[2].startMenu = true;    g.programs[2].iconTried = true;
+        // Trae IDE：只在别的词下被点过 40 次（重度档），当前词「trae」下 0 次
+        g.weights[L"ide"][L"C:\\Apps\\Trae\\TraeIDE.exe"] = WeightVal(40, NowUnix());
+        MarkUsageDirty();
+        g.items.clear();
+        SearchPrograms(L"trae");
+        Check(g.items.size() == 3, "all three candidates listed");
+        Check(g.items[0].title == L"Trae IDE", "heavy-usage item sorts to the top");
+        Check(g.items[1].title == L"Trae", "hot item follows heavy one");
+        Check(g.items[2].title == L"Trae CN", "never-hot item sinks to the bottom");
+        Check(UsageTier(GlobalUsageCount(L"C:\\Apps\\Trae\\TraeIDE.exe")) == 4,
+              "heavy item is tier 4 in the global ledger");
+    }
+
+    // ---- 重排臂：热度档统一重排（自学习行压住重度行的线上真实场景）----
+    // 回归点：旧实现把「排序后的 slots」当写回目标，等于恒等置换 → 重排从未生效，
+    // 结果是「重度 ×81」被只用 1 次的自学习行压在下面。
+    {
+        g.weights.clear(); g.learned.clear();
+        g.weightCount = 0; g.learnCount = 0;
+        // 自学习行：只用 1 次（tier 0），但 PrependLearnedRows 总是把它插在最前
+        g.weights[L"trae"][L"C:\\Users\\demo\\Apps\\Trae CN\\Trae CN.exe"] = WeightVal(1, NowUnix());
+        // 重度行：81 次（tier 4），线上真实数据显示为「重度 ×81」
+        g.weights[L"tcode"][L"C:\\Users\\demo\\Roaming\\TraeCode CN.lnk"] = WeightVal(81, NowUnix());
+        // 常用行：4 次（tier 2）
+        g.weights[L"trae"][L"C:\\Users\\demo\\Roaming\\TRAE CN.lnk"] = WeightVal(4, NowUnix());
+        MarkUsageDirty();
+
+        g.items.clear();
+        Row grp; grp.kind = Row::Group; grp.title = L"一键启动：trae"; grp.action = L"trae";
+        g.items.push_back(grp);
+        Row learned; learned.kind = Row::File; learned.title = L"Trae CN.exe";
+        learned.sub = learned.action = L"C:\\Users\\demo\\Apps\\Trae CN\\Trae CN.exe";
+        g.items.push_back(learned);
+        Row heavy; heavy.kind = Row::Prog; heavy.title = L"TraeCode CN";
+        heavy.sub = heavy.action = L"C:\\Users\\demo\\Roaming\\TraeCode CN.lnk";
+        g.items.push_back(heavy);
+        Row mid; mid.kind = Row::Prog; mid.title = L"TRAE CN";
+        mid.sub = mid.action = L"C:\\Users\\demo\\Roaming\\TRAE CN.lnk";
+        g.items.push_back(mid);
+        Row zero; zero.kind = Row::Prog; zero.title = L"Control Panel";
+        zero.sub = zero.action = L"C:\\Users\\demo\\Roaming\\Control Panel.lnk";
+        g.items.push_back(zero);
+
+        RerankByTier();
+        Check(g.items.size() == 5, "rerank keeps every row");
+        Check(g.items[0].kind == Row::Group && g.items[0].title == L"一键启动：trae",
+              "group row keeps its position");
+        Check(g.items[1].title == L"TraeCode CN", "heavy-usage row moves above the learned row");
+        Check(g.items[2].title == L"TRAE CN", "common-usage row follows the heavy one");
+        Check(g.items[3].title == L"Trae CN.exe", "learned row sinks below hot rows");
+        Check(g.items[4].title == L"Control Panel", "zero-usage row stays last");
+    }
+
+    { std::lock_guard<std::mutex> lock(s_wsMu); s_wsQuit = true; s_wsCv.notify_one(); }
     DestroyWindow(g.hwnd);
-    std::cout << "PASS: usage tiers (data, bar widths, continuous heat, badge forms, dark/light, control)\n";
+    std::cout << "PASS: usage tiers (data, tint, badge forms, hot-sorted, control)\n";
 }
