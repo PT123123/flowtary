@@ -1622,6 +1622,28 @@ static std::wstring PendingLayerText() {
     }
 }
 
+// ---------------- 退出/唤出追踪日志（诊断「无声消失」与热键不响应） ----------------
+// 追加写 %APPDATA%\Flowtary\trace.log，单行 = 时间 + pid + 事件。只记低频关键事件。
+// 事件标签保持 ASCII，避免 CRT 宽字符→MBCS 转换的编码歧义。
+static void AppendTrace(const char* tag) {
+    char path[MAX_PATH];
+    if (!GetEnvironmentVariableA("APPDATA", path, MAX_PATH)) return;
+    lstrcatA(path, "\\Flowtary\\trace.log");
+    HANDLE f = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char line[256];
+    int n = _snprintf_s(line, sizeof(line), _TRUNCATE,
+                        "%04u-%02u-%02u %02u:%02u:%02u.%03u pid=%lu %s\r\n",
+                        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+                        st.wMilliseconds, GetCurrentProcessId(), tag);
+    DWORD written = 0;
+    if (n > 0) WriteFile(f, line, (DWORD)n, &written, nullptr);
+    CloseHandle(f);
+}
+
 static void Layout() {
     AnnotateRowUsage();
     RECT rc;
@@ -1665,6 +1687,7 @@ static void LayoutAndRepaint() {
 }
 
 static void Show() {
+    AppendTrace("SHOW(wake)");
     g.text.clear();
     g.compText.clear();
     g.caret = 0;
@@ -1700,6 +1723,7 @@ static void Show() {
 }
 
 static void Hide() {
+    AppendTrace("HIDE");
     if (!IsWindowVisible(g.hwnd)) return;
     KillTimer(g.hwnd, kTimerDebounce);
     KillTimer(g.hwnd, kTimerLatency);
@@ -4848,6 +4872,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
         }
         case WM_DESTROY:
+            AppendTrace("WM_DESTROY (main window)");
             StopProgramsRefresh(hwnd);
             KillTimer(hwnd, kTimerBlink);
             FlushHistoryQuery();    // 退出前把攒着的最后一轮查询落盘（含没报齐就退出的那类现场）
@@ -4886,7 +4911,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (wParam == 1) {
                 // 输入框聚焦时屏蔽已注册的 Alt 热键（Alt+Space / Alt+Q / Ctrl+Alt+Space），
                 // 使其不再隐藏/切换窗口，仅 Alt+数字 生效（见 WM_SYSKEYDOWN）。
-                if (GetFocus() == g.hwnd) return 0;
+                if (GetFocus() == g.hwnd) {
+                    AppendTrace("HOTKEY swallowed: focus is self while hotkey fired");
+                    return 0;
+                }
+                AppendTrace(IsWindowVisible(hwnd) ? "HOTKEY toggle -> hide" : "HOTKEY toggle -> show");
                 if (IsWindowVisible(hwnd)) Hide();
                 else Show();
             } else if (wParam == 2) {
@@ -5035,6 +5064,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     OpenSettings();
                     return 0;
                 case IDM_EXIT:
+                    AppendTrace("tray menu EXIT clicked");
                     DestroyWindow(hwnd);
                     return 0;
             }
@@ -5081,6 +5111,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
 
         case WM_APP_QUIT:
+            AppendTrace("WM_APP_QUIT: takeover by another instance");
             // 新版本接管：干净退出（WM_DESTROY 会移除托盘、注销热键）
             DestroyWindow(hwnd);
             return 0;
@@ -5938,11 +5969,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     HANDLE mtx = CreateMutexW(nullptr, TRUE, L"Local\\Flowtary.Singleton");
     if (mtx && GetLastError() == ERROR_ALREADY_EXISTS) {
         if (IsSameRunningBuild()) {
+            AppendTrace("duplicate start (same build): notice + exit");
             ShowNotice(L"Flowtary 已在运行",
                        L"程序已经在后台运行了。\r\n在任务栏托盘找到 Flowtary，左键单击即可唤出。",
                        L"知道了");
             return 0;
         }
+        AppendTrace("version-mismatch start: taking over old instance");
         // 新版本：提示后结束旧实例，由本进程接管继续启动
         ShowNotice(L"检测到新版本", L"正在关闭旧版本并启动新版本…", L"好", 1500);
         if (HWND oldWnd = FindWindowW(L"FlowtaryLauncher", L"Flowtary"))
@@ -5990,9 +6023,17 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     // （避免与其他启动器冲突导致完全不可用）；关闭状态下只保留托盘左键唤出
     if (g.hotkeyWake) {
         if (!RegisterWakeHotkey()) {
+            AppendTrace("wake hotkey: all 3 RegisterHotKey failed, LL hook fallback active");
             MessageBoxW(nullptr, L"Alt+Space / Alt+Q / Ctrl+Alt+Space 热键均注册失败，可能被其他程序占用。",
                         L"Flowtary", MB_ICONWARNING);
+        } else {
+            char tb[64];
+            _snprintf_s(tb, sizeof(tb), _TRUNCATE, "startup: wake hotkey registered (%ls)",
+                        g.hotkeyName.c_str());
+            AppendTrace(tb);
         }
+    } else {
+        AppendTrace("startup: wake hotkey disabled by settings");
     }
     // 辅助热键：Ctrl+Alt+G —— 文件对话框激活时，把前台资源管理器当前目录同步到对话框
     RegisterHotKey(g.hwnd, 2, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'G');
@@ -6003,11 +6044,19 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     StartProgramsRefresh();
 
 
+    AppendTrace("startup complete: enter message loop");
     MSG msg;
-    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+    int gr = 0;
+    while ((gr = GetMessageW(&msg, nullptr, 0, 0)) > 0) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+
+    char eb[96];
+    _snprintf_s(eb, sizeof(eb), _TRUNCATE,
+                "message loop exit: GetMessage returned %d%s", gr,
+                gr == 0 ? " (WM_QUIT, expected)" : " (ERROR -> loop ended WITHOUT WM_QUIT!)");
+    AppendTrace(eb);
 
     fdj_uninit();  // 卸载文件对话框增强的钩子与 32 位助手
     RemoveWakeHook();
