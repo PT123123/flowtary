@@ -4201,6 +4201,21 @@ static void Paint(HDC hdc) {
     oldBmp = SelectObject(mem, bmp);
     if (t.bg2 != t.bg) FillVGradient(mem, 0, 0, W, H, t.bg, t.bg2);
     else { HBRUSH bgBr = CreateSolidBrush(t.bg); FillRect(mem, &rc, bgBr); DeleteObject(bgBr); }
+
+    // 窗口圆角裁剪：强调条/辉光/星点等一切内容都不得画出圆角边界——
+    // 之前蓝色强调条以方角画满全宽，在圆角处溢出弧线之外，非常刺眼。
+    int savedClip = 0;
+    {
+        int rWin = S(t.radiusWindow);
+        if (rWin > 1) {
+            HRGN hWinRgn = CreateRoundRectRgn(0, 0, W + 1, H + 1, rWin, rWin);
+            if (hWinRgn) {
+                savedClip = SaveDC(mem);
+                ExtSelectClipRgn(mem, hWinRgn, RGN_COPY);
+                DeleteObject(hWinRgn);
+            }
+        }
+    }
     if (t.stars) {
         HBRUSH starB[3];
         starB[0] = CreateSolidBrush(RGB(255, 255, 255));
@@ -4224,7 +4239,9 @@ static void Paint(HDC hdc) {
     HRGN hCardRgn = nullptr;
     {
         RECT inR{0, 0, W, inputH};
-        const int ri = S(t.radiusInput);
+        // 输入栏占据窗口整个顶部，其顶边轮廓 = 窗口顶边轮廓：
+        // 圆角必须与窗口圆角同半径，否则角上留出方角缝隙、强调条看起来溢出。
+        const int ri = S(t.radiusWindow);
         // 手机系统搜索栏质感（HyperOS/iOS 控制中心参考）：
         // ① 顶部内缘柔光 → 中段本色 → 底部微暗（玻璃厚度）；
         // ② 中上部一团 accent 环境光（椭圆径向衰减），像控制中心那块「被光照亮的玻璃」。
@@ -4440,19 +4457,21 @@ static void Paint(HDC hdc) {
         SelectObject(mem, g.fList);  // 徽章固定常规字重（上一行可能是常用加粗行）
         int hkReserved = 0;
         WCHAR hk = HotkeyChar(i);
+        // 快捷键徽章右缘离卡片边缘 S(4)：贴死边缘会显得憋屈
+        const int kBadgeRight = W - pad - S(4);
         if (hk) {
             int bw = S(20), bh = S(20);
-            RECT br{W - pad - bw, y + (rowH - bh) / 2, W - pad, y + (rowH - bh) / 2 + bh};
-            // 手机键帽质感（iOS 键盘按键参考）：圆角 + 顶部高光 + 底部 lip + 内描边，
-            // 四层叠出「可以按下去」的实体感，取代平面色块。
-            FillRoundRectAA(mem, br, bh / 2, [&](float, float v) -> COLORREF {
+            RECT br{kBadgeRight - bw, y + (rowH - bh) / 2, kBadgeRight, y + (rowH - bh) / 2 + bh};
+            // 手机键帽质感（iOS 键盘按键参考）：圆角方形（非正圆——正圆会把数字
+            // 两角和上下的留白吃掉，字形贴边）+ 顶部高光 + 底部 lip + 内描边。
+            FillRoundRectAA(mem, br, S(6), [&](float, float v) -> COLORREF {
                 COLORREF base = i == g.sel ? Blend(t.selBg, t.accent, 0.42f)
                                            : Blend(t.bgCard, t.accent2, 0.10f);
                 if (v < 0.34f) return Blend(base, t.textTitle, (t.dark ? 0.12f : 0.20f) * (1 - v / 0.34f));
                 if (v > 0.86f) return Darken(base, (int)((t.dark ? 16 : 10) * (v - 0.86f) / 0.14f + 0.5f));  // 底部 lip：连续加深
                 return base;
             });
-            StrokeRoundRectAA(mem, br, bh / 2,
+            StrokeRoundRectAA(mem, br, S(6),
                               Blend(i == g.sel ? t.selBg : t.bgCard, t.textTitle, t.dark ? 0.10f : 0.20f), 1);
             SetBkMode(mem, TRANSPARENT);
             SetTextColor(mem, i == g.sel ? t.textTitle : t.textSec);
@@ -4470,7 +4489,7 @@ static void Paint(HDC hdc) {
             SIZE ts{};
             GetTextExtentPoint32W(mem, tag.c_str(), (int)tag.size(), &ts);
             int bw = S(6) + S(5) + S(4) + ts.cx + S(8), bh = S(18);
-            int bx = W - pad - hkReserved - bw;
+            int bx = kBadgeRight - hkReserved - bw;
             RECT br{bx, y + (rowH - bh) / 2, bx + bw, y + (rowH - bh) / 2 + bh};
             COLORREF badgeBg = tier >= 4 ? t.accent
                              : Blend(t.bgCard, t.accent, tier == 3 ? 0.32f : 0.20f);
@@ -4572,6 +4591,7 @@ static void Paint(HDC hdc) {
     }
 
     BitBlt(hdc, 0, 0, W, H, mem, 0, 0, SRCCOPY);
+    if (savedClip) RestoreDC(mem, savedClip);
     SelectObject(mem, oldBmp);
     DeleteObject(bmp);
     DeleteDC(mem);
