@@ -381,6 +381,7 @@ constexpr int IDM_COPYTITLE = 2025;   // 复制窗口标题
 constexpr int IDM_COPYPROC = 2026;    // 复制进程名
 constexpr int IDM_OPENCMD = 2027;     // 结果右键菜单：用此路径（所在目录）打开命令行
 constexpr int IDM_OPENFILE = 2028;    // 路径直达行：打开文件本身
+constexpr int IDM_ADDALIAS = 2029;    // 结果右键菜单：添加别名（在自学习目录建同名快捷方式）
 
 // 结果项快捷键方案：
 //   方案0 Alt+数字：按结果优先级自上而下分配 1..9,0（列表最多 10 行，1=最高优先级）
@@ -413,6 +414,7 @@ static long long NowUnix();  // 定义在自学习小节；评分函数用它算
 static void RecordLearned(const Row& r);
 static void RerankByTier();  // 热度档统一重排（定义在自学习段，Refresh 先用到）
 static void PrependLearnedRows(const std::wstring& term);
+static void AddAliasForRow(const std::wstring& target, const std::wstring& defaultName);
 static void SaveLearnedNow();
 static void LoadLearned();
 static void ClearLearned();
@@ -2893,6 +2895,10 @@ static void ShowRowMenu(HWND hwnd) {
             AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_OPENLOC, (LPCWSTR)L"打开所在文件夹");
         if (r.kind == Row::Reveal)
             AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_OPENFILE, (LPCWSTR)L"打开文件");
+        // 别名：在自学习目录里建一个「别名.lnk」，之后搜别名即可直达（与自学习结果同一套数据）
+        if ((r.kind == Row::File || r.kind == Row::Folder || r.kind == Row::Prog) &&
+            GetFileAttributesW(r.action.c_str()) != INVALID_FILE_ATTRIBUTES)
+            AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_ADDALIAS, (LPCWSTR)L"添加别名…");
         if (r.kind == Row::File || r.kind == Row::Prog)
             AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_RUNAS, (LPCWSTR)L"以管理员模式打开");
         if (r.kind == Row::Shell)
@@ -2944,6 +2950,13 @@ static void ShowRowMenu(HWND hwnd) {
             // 路径直达行：真的把该文件交系统打开（与默认的「定位并选中」区分开）
             ShellExecuteW(nullptr, L"open", r.action.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
             break;
+        case IDM_ADDALIAS: {
+            // 先拷出目标再弹输入框：弹窗有嵌套消息循环，期间 g.items 可能被刷新改动
+            std::wstring target = r.action, name = r.title;
+            done = false;  // 加完别名留在启动器里，不自动隐藏
+            AddAliasForRow(target, name);
+            break;
+        }
         case IDM_OPENCMD: {
             // 文件夹项用自身路径；文件/程序项用其所在目录
             std::wstring dir = (r.kind == Row::Folder) ? r.action : DirOf(r.action);
@@ -3158,6 +3171,222 @@ static void ApplyRoundCorners(HWND h) {
     COLORREF border = (g.theme ? g.theme->border : RGB(80, 80, 80));
     if (SUCCEEDED(DwmSetWindowAttribute(h, DWMWA_BORDER_COLOR, &border, sizeof(border))))
         g.dwmBorderOk = true;
+}
+
+// ---------------- 单行输入弹窗（添加别名） ----------------
+// 与提示弹窗同款主题化外观：顶部强调条 + 标题 + 说明 + 单行编辑框 + 取消/确定。
+// 用嵌套消息循环做模态；弹窗打开期间主窗的「失焦即隐藏」被 s_promptActive 抑制。
+struct PromptData {
+    std::wstring title;
+    std::wstring label;
+    std::wstring text;    // 用户输入（确定时回填）
+    bool ok = false;
+    HWND edit = nullptr;
+    HBRUSH editBg = nullptr;
+};
+constexpr int IDC_PROMPT_OK = 5002;
+constexpr int IDC_PROMPT_CANCEL = 5003;
+constexpr int kPromptW = 420, kPromptH = 176;
+static PromptData* s_promptActive = nullptr;  // 非空=输入弹窗打开中（主窗不因失焦隐藏）
+static WNDPROC s_promptEditProc = nullptr;
+
+// 单行 EDIT 不会把回车交给父窗：这里接管回车=确定、Esc=取消
+static LRESULT CALLBACK PromptEditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_KEYDOWN) {
+        if (wp == VK_RETURN) {
+            PostMessageW(GetParent(h), WM_COMMAND, MAKEWPARAM(IDC_PROMPT_OK, 0), 0);
+            return 0;
+        }
+        if (wp == VK_ESCAPE) {
+            PostMessageW(GetParent(h), WM_COMMAND, MAKEWPARAM(IDC_PROMPT_CANCEL, 0), 0);
+            return 0;
+        }
+    }
+    return CallWindowProcW(s_promptEditProc, h, msg, wp, lp);
+}
+
+static LRESULT CALLBACK PromptProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_CREATE: {
+            PromptData* pd = (PromptData*)((CREATESTRUCTW*)lp)->lpCreateParams;
+            SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)pd);
+            if (!pd || !g.theme) return 0;
+            ApplyRoundCorners(h);
+            RECT rc;
+            GetClientRect(h, &rc);
+            pd->edit = CreateWindowExW(0, L"EDIT", pd->text.c_str(),
+                                       WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                                       S(22), S(74), rc.right - S(44), S(32), h,
+                                       (HMENU)(INT_PTR)1001, g.inst, nullptr);
+            SendMessageW(pd->edit, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+            SendMessageW(pd->edit, EM_SETSEL, 0, -1);  // 默认名整段选中，直接输入即替换
+            s_promptEditProc = (WNDPROC)SetWindowLongPtrW(pd->edit, GWLP_WNDPROC,
+                                                          (LONG_PTR)PromptEditProc);
+            pd->editBg = CreateSolidBrush(g.theme->editBg);
+            int bw = S(96), bh = S(32), by = rc.bottom - S(18) - bh;
+            HWND cancel = CreateWindowExW(
+                0, L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                rc.right - S(22) - bw, by, bw, bh, h,
+                (HMENU)(INT_PTR)IDC_PROMPT_CANCEL, g.inst, nullptr);
+            HWND ok = CreateWindowExW(
+                0, L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                rc.right - S(22) - bw * 2 - S(10), by, bw, bh, h,
+                (HMENU)(INT_PTR)IDC_PROMPT_OK, g.inst, nullptr);
+            SendMessageW(cancel, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+            SendMessageW(ok, WM_SETFONT, (WPARAM)g.fInput, TRUE);
+            return 0;
+        }
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC hdc = BeginPaint(h, &ps);
+            RECT rc;
+            GetClientRect(h, &rc);
+            const Theme& t = *g.theme;
+            HBRUSH bg = CreateSolidBrush(t.bg);
+            FillRect(hdc, &rc, bg);
+            DeleteObject(bg);
+            RECT accent{0, 0, rc.right, S(3)};
+            HBRUSH ab = CreateSolidBrush(t.menuHi);
+            FillRect(hdc, &accent, ab);
+            DeleteObject(ab);
+            PromptData* pd = (PromptData*)GetWindowLongPtrW(h, GWLP_USERDATA);
+            if (pd) {
+                SetBkMode(hdc, TRANSPARENT);
+                SelectObject(hdc, g.fontPool[FontSlot(t.fontInput + 2)]);
+                SetTextColor(hdc, t.text);
+                RECT tr{S(22), S(12), rc.right - S(22), S(44)};
+                DrawTextW(hdc, pd->title.c_str(), -1, &tr,
+                          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                SelectObject(hdc, g.fList);
+                SetTextColor(hdc, t.sub);
+                RECT lr{S(22), S(46), rc.right - S(22), S(70)};
+                DrawTextW(hdc, pd->label.c_str(), -1, &lr,
+                          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            }
+            EndPaint(h, &ps);
+            return 0;
+        }
+        case WM_CTLCOLOREDIT: {
+            PromptData* pd = (PromptData*)GetWindowLongPtrW(h, GWLP_USERDATA);
+            const Theme& t = *g.theme;
+            SetTextColor((HDC)wp, t.text);
+            SetBkColor((HDC)wp, t.editBg);
+            HBRUSH bg = (pd && pd->editBg) ? pd->editBg : (HBRUSH)GetStockObject(BLACK_BRUSH);
+            return (LRESULT)bg;
+        }
+        case WM_DRAWITEM: {
+            DRAWITEMSTRUCT* dis = (DRAWITEMSTRUCT*)lp;
+            if (!dis || dis->CtlType != ODT_BUTTON) break;
+            const Theme& t = *g.theme;
+            bool primary = (dis->CtlID == IDC_PROMPT_OK);
+            bool pressed = (dis->itemState & ODS_SELECTED) != 0;
+            HBRUSH bg = CreateSolidBrush(pressed ? t.selBg : (primary ? t.accent : t.menuHi));
+            FillRect(dis->hDC, &dis->rcItem, bg);
+            DeleteObject(bg);
+            if (!primary) {
+                HBRUSH bf = CreateSolidBrush(t.divider);
+                FrameRect(dis->hDC, &dis->rcItem, bf);
+                DeleteObject(bf);
+            }
+            SetBkMode(dis->hDC, TRANSPARENT);
+            SetTextColor(dis->hDC, primary ? t.textTitle : t.text);
+            SelectObject(dis->hDC, g.fInput);
+            WCHAR text[32]{};
+            GetWindowTextW(dis->hwndItem, text, 32);
+            DrawTextW(dis->hDC, text, -1, &dis->rcItem,
+                      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            return TRUE;
+        }
+        case WM_COMMAND: {
+            PromptData* pd = (PromptData*)GetWindowLongPtrW(h, GWLP_USERDATA);
+            int id = LOWORD(wp);
+            if (id == IDC_PROMPT_OK && pd && pd->edit) {
+                int n = GetWindowTextLengthW(pd->edit);
+                std::vector<WCHAR> buf((size_t)n + 1, 0);
+                GetWindowTextW(pd->edit, buf.data(), n + 1);
+                pd->text.assign(buf.data(), (size_t)n);
+                pd->ok = true;
+                DestroyWindow(h);
+            } else if (id == IDC_PROMPT_CANCEL) {
+                DestroyWindow(h);
+            }
+            return 0;
+        }
+        case WM_CLOSE:
+            DestroyWindow(h);
+            return 0;
+        case WM_DESTROY: {
+            PromptData* pd = (PromptData*)GetWindowLongPtrW(h, GWLP_USERDATA);
+            if (pd && pd->editBg) {
+                DeleteObject(pd->editBg);
+                pd->editBg = nullptr;
+            }
+            s_promptActive = nullptr;
+            return 0;
+        }
+        default:
+            break;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+// 弹一个单行输入框并等待关闭；确定返回去空白后的文字，取消/关闭返回空串
+static std::wstring PromptLine(const std::wstring& title, const std::wstring& label,
+                               const std::wstring& defaultText) {
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW nc{};
+        nc.cbSize = sizeof(nc);
+        nc.lpfnWndProc = PromptProc;
+        nc.hInstance = g.inst;
+        nc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        nc.lpszClassName = L"FlowtaryPrompt";
+        if (RegisterClassExW(&nc)) registered = true;
+    }
+    if (!registered || !g.theme) return L"";
+    int W = S(kPromptW), H = S(kPromptH);
+    RECT owner{};
+    GetWindowRect(g.hwnd, &owner);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    GetMonitorInfoW(MonitorFromWindow(g.hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+    int x = owner.left + ((owner.right - owner.left) - W) / 2;
+    int y = owner.top + ((owner.bottom - owner.top) - H) / 2;
+    if (x < mi.rcWork.left) x = mi.rcWork.left;
+    if (y < mi.rcWork.top) y = mi.rcWork.top;
+    if (x + W > mi.rcWork.right) x = mi.rcWork.right - W;
+    if (y + H > mi.rcWork.bottom) y = mi.rcWork.bottom - H;
+
+    PromptData pd;
+    pd.title = title;
+    pd.label = label;
+    pd.text = defaultText;
+    s_promptActive = &pd;
+    EnableWindow(g.hwnd, FALSE);  // 模态：弹窗期间启动器不响应输入
+    HWND h = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, L"FlowtaryPrompt",
+                             title.c_str(), WS_POPUP, x, y, W, H, g.hwnd, nullptr, g.inst,
+                             &pd);
+    if (!h) {
+        EnableWindow(g.hwnd, TRUE);
+        s_promptActive = nullptr;
+        return L"";
+    }
+    ShowWindow(h, SW_SHOW);
+    SetForegroundWindow(h);
+    SetFocus(pd.edit);
+    MSG msg;
+    while (IsWindow(h) && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (msg.message == WM_QUIT) {
+            PostQuitMessage(0);
+            break;
+        }
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    EnableWindow(g.hwnd, TRUE);
+    SetForegroundWindow(g.hwnd);
+    s_promptActive = nullptr;
+    return pd.ok ? TrimW(pd.text) : L"";
 }
 
 // ---------------- 系统亚克力玻璃 ----------------
@@ -4037,6 +4266,73 @@ static void RecordLearned(const Row& r) {
     g.learnedDirty = true;
     MarkUsageDirty();
     ScheduleLearnedSave();
+}
+
+// 给条目加一个别名：在自学习目录里建「别名.lnk」，并登记为学习项（与自学习结果同一套数据）。
+// 之后搜别名（或其前缀）即可直接置顶打开；启动时的 .lnk 双向同步也会把它当普通学习项吸收。
+static void AddAliasForRow(const std::wstring& target, const std::wstring& defaultName) {
+    if (target.empty()) return;
+    std::wstring name = PromptLine(L"添加别名", L"输入一个更好记的名字，回车确认（Esc 取消）",
+                                   defaultName);
+    if (name.empty()) return;
+    std::wstring term = NormalizeSearchTerm(name);
+    // 别名会被当成搜索词：路径/百分号形式学了没意义，直接拒绝
+    if (term.empty() || term.find(L'\\') != std::wstring::npos ||
+        term.find(L'/') != std::wstring::npos || term.find(L'%') != std::wstring::npos)
+        return;
+
+    auto& m = g.learned[term];
+    auto it = m.find(target);
+    long long now = NowUnix();
+    if (it == m.end()) {
+        if (g.learnCount >= (size_t)(std::max)(10, g.learnMaxEntries))
+            PruneOneLearned(term, target);
+        LearnVal v;
+        v.count = 1;
+        v.last = now;
+        it = m.emplace(target, v).first;
+        ++g.learnCount;
+    } else {
+        it->second.last = now;
+    }
+
+    // 快捷方式用别名本身命名；同名已被其他条目占用时追加 " (2)" 序号
+    std::wstring base = SanitizeTermForFile(name);
+    auto usedByOther = [&](const std::wstring& n) {
+        if (n.empty()) return false;
+        for (auto& kv : g.learned)
+            for (auto& pv : kv.second) {
+                if (&pv.second == &it->second) continue;
+                if (!_wcsicmp(pv.second.lnk.c_str(), n.c_str())) return true;
+            }
+        return false;
+    };
+    std::wstring lnk = base + L".lnk";
+    for (int i = 2; usedByOther(lnk) && i < 10000; ++i)
+        lnk = base + L" (" + std::to_wstring(i) + L").lnk";
+
+    std::wstring dir = LearnedDirPath();
+    CreateDirectoryW(dir.c_str(), nullptr);
+    std::wstring full = dir + L"\\" + lnk;
+    if (GetFileAttributesW(full.c_str()) == INVALID_FILE_ATTRIBUTES ||
+        _wcsicmp(ResolveLnkTarget(full).c_str(), target.c_str()) != 0) {
+        if (!CreateShortcutFile(full, target, L"Flowtary 别名：" + name)) {
+            // 快捷方式没建出来就不留半条新数据
+            if (it->second.lnk.empty()) {
+                m.erase(it);
+                if (g.learnCount > 0) --g.learnCount;
+                if (m.empty()) g.learned.erase(term);
+            }
+            return;
+        }
+    }
+    if (!it->second.lnk.empty() && _wcsicmp(it->second.lnk.c_str(), lnk.c_str()) != 0)
+        DeleteFileW((dir + L"\\" + it->second.lnk).c_str());  // 旧镜像让位给新别名
+    it->second.lnk = lnk;
+    g.learnedDirty = true;
+    MarkUsageDirty();
+    SaveLearnedNow();  // 立即落盘：别名马上可用，也和目录里的 .lnk 保持一致
+    ShowTopToast(g.hwnd, L"已添加别名：" + name);
 }
 
 // 立即写盘：按排序键裁剪到上限（连带删除被挤出条目的 .lnk）后整体写出
@@ -5107,7 +5403,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
 
         case WM_ACTIVATE:
-            if (LOWORD(wParam) == WA_INACTIVE && IsWindowVisible(hwnd)) Hide();
+            // 输入弹窗（添加别名）打开时不算失焦：否则启动器会被自动隐藏
+            if (LOWORD(wParam) == WA_INACTIVE && IsWindowVisible(hwnd) && !s_promptActive)
+                Hide();
             return 0;
 
         case WM_ERASEBKGND:
