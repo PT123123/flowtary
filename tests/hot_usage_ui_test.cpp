@@ -213,9 +213,9 @@ int main() {
     auto rowY = [&](int i) { return inputH + gapTop + i * rowH; };
     auto midY = [&](int i) { return rowY(i) + rowH / 2; };
     // 行内容左内边距：图标托盘必须整块落在选中高亮的左圆角之内
-    int contentLeft = pad + S(13);
+    int contentLeft = pad + S(9);
     int textX = contentLeft + S(24) + S(8);
-    int pillInset = S(4);
+    int pillInset = S(2);
     int pillW = (px.w - 2 * pad) - 2 * pillInset;
     auto titleOfTh = [&](const Theme& th, int i) {
         int tier = UsageTier(g.items[i].usage);
@@ -254,7 +254,7 @@ int main() {
     int inCardX = pad + S(2);
     Check(px.At(inCardX, rowY(4) + S(2)) == tintOf(4), "tier3 higher count tint rendered");
     Check(px.At(inCardX, rowY(2) + S(2)) == tintOf(2), "tier2 tint rendered");
-    // 选中行玻璃高亮：卡片内圆角块，左右内缩 S(4)，渐变平滑无台阶。
+    // 选中行玻璃高亮：卡片内圆角块，左右内缩 S(2)，渐变平滑无台阶。
     // 顶部 2px 处采样 = 玻璃基色（左浓右淡二次衰减）+ 顶部柔光
     {
         int sx = textX + S(2);  // 文字起点右侧，远离高亮圆角区
@@ -331,7 +331,7 @@ int main() {
     }
     Check(Dist(cp.At(pad + S(2), rowY(5) + S(2)), t.bgCard) < 30,
           "control: no bar or tint without usage data");
-    Check(cp.At(pad + S(2) + S(13) + S(24) + S(8) + S(2), rowY(5) + S(2)) == t.bgCard,
+    Check(cp.At(pad + S(2) + S(9) + S(24) + S(8) + S(2), rowY(5) + S(2)) == t.bgCard,
           "control: no halo without data");
     Check(cp.CountColor(titleOf(0), titleBox(0)) == 0, "control: no accent title without data");
     Check(cp.CountColor(badge2, rightBox(2)) == 0, "control: no tier2 badge without data");

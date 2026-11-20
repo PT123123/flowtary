@@ -327,19 +327,18 @@ struct App {
     std::wstring captureArgs;          // 本次启动的命令行参数
 } g;
 
-constexpr int kBaseW = 680, kBaseInputH = 62, kBaseRowH = 34, kBasePad = 12;
+constexpr int kBaseW = 680, kBaseInputH = 62, kBaseRowH = 34, kBasePad = 8;
 constexpr int kBaseEmptyH = 200;  // 空态引导面板逻辑高度（输入区之外的品牌/引导区）
 constexpr int kBaseFooterH = 22;  // 耗时底栏逻辑高度（仅非秒出时出现）
-// 列表卡片的版式留白（逻辑像素）：
-//   kBaseCardGapTop    输入栏底边 → 卡片顶边。两片玻璃之间必须留呼吸位——紧贴时
-//                      输入栏的底圆角和卡片的顶圆角叠在一起，左上角会糊成一块方角暗斑。
-//   kBaseCardPadBottom 卡片底边 → 最后一行底边。最后一行不贴卡片边，图标托盘和高亮
-//                      才不会顶到卡片圆角上。
-//   kBaseWinPadBottom  卡片底边 → 窗口底边。窗口底缘的圆角在这里收口，最后一行
-//                      不会被窗口底边水平切断（之前正是这里把末行切掉半截）。
-constexpr int kBaseCardGapTop = 10;
-constexpr int kBaseCardPadBottom = 8;
-constexpr int kBaseWinPadBottom = 10;
+// 列表卡片的版式留白（逻辑像素）——整体收紧，避免「卡片离窗口、选中块离卡片、
+// 内容离卡片」三层留白叠加出一大圈空地（图标曾离窗口左缘达 25px）。
+//   kBaseCardGapTop    输入栏底边 → 卡片顶边。留一点缝让两道圆弧各自干净，
+//                      但不再留 10px 那么宽——否则输入栏和卡片像两座孤岛。
+//   kBaseCardPadBottom 卡片底边 → 最后一行底边。够图标托盘/高亮落进卡片圆角即可。
+//   kBaseWinPadBottom  卡片底边 → 窗口底边。窗口底缘圆角在这里收口，末行不被切断。
+constexpr int kBaseCardGapTop = 6;
+constexpr int kBaseCardPadBottom = 5;
+constexpr int kBaseWinPadBottom = 6;
 constexpr int kSlowMs = 120;      // 超过这个毫秒数才报耗时；秒出的查询保持干净
 constexpr int kFontMin = 11, kFontMax = 24;  // 字体池逻辑字号范围
 constexpr UINT_PTR kTimerDebounce = 1;
@@ -4856,11 +4855,12 @@ static void Paint(HDC hdc) {
 
     // 结果列表
     SelectObject(mem, g.fList);
-    const int kSelPillR = S(6);   // 选中高亮圆角：适度圆角，不做半高胶囊（圆得太圆会腻）
-    const int kSelInset = S(4);   // 高亮相对卡片左右各内缩，不与卡片圆角/描边打架
+    const int kSelPillR = S(5);   // 选中高亮圆角：收一档，贴近卡片圆角、不显臃肿
+    const int kSelInset = S(2);   // 高亮几乎贴卡片左右缘，只留 2px 避开卡片描边
     // 行内容左内边距：图标托盘必须整块落在高亮胶囊的左圆角之内，
     // 否则白色图标盒会压在高亮左圆角上、把圆角啃出一个缺口（放大看非常明显）。
-    const int kContentPad = S(13);
+    // 从 13 收到 9：图标不再远远缩在卡片里，紧跟高亮左缘。
+    const int kContentPad = S(9);
     auto selRect = [&](const RECT& cardRow, int y) {
         return RECT{cardRow.left + kSelInset, y, cardRow.right - kSelInset, y + rowH};
     };
