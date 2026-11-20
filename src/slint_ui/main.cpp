@@ -141,6 +141,7 @@ struct UiCtx {
     std::unordered_map<std::wstring, slint::Image> iconCache;   // 小写路径 -> 图标
     std::unordered_map<std::wstring, bool> iconRequested;        // 小写路径 -> 已排队
     bool centerWake = true;   // 屏幕居中唤醒（跟随鼠标为 false）
+    int windowHeight = 300;   // 逻辑像素；按结果行数动态伸缩
     UiCtx() : ui(MainWindow::create()) {}
 };
 static std::shared_ptr<UiCtx> g_ctx;
@@ -238,6 +239,33 @@ static void rebuild_model(UiCtx& ctx)
     ctx.ui->set_empty(ctx.rows.empty());
 }
 
+// 动态高度下 winit 会重新带上原生标题栏，这里强制回无边框弹出窗
+static void remove_native_frame(HWND hwnd)
+{
+    if (!hwnd) return;
+    LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    LONG_PTR want = (style & ~(WS_CAPTION | WS_THICKFRAME | WS_BORDER | WS_DLGFRAME |
+                               WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX)) | WS_POPUP;
+    if (want != style) {
+        SetWindowLongPtrW(hwnd, GWL_STYLE, want);
+        SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    }
+}
+
+static void position_ui(HWND hwnd, bool center);
+
+// 窗口高度：与 main.slint 的排版常量对应（70 行区起点 + 行高 + 12 底栏间距 + 34 底栏）
+static int compute_window_height(const UiCtx& ctx, bool hasQuery)
+{
+    if (ctx.rows.empty()) return hasQuery ? 230 : 300;
+    int content = 0;
+    for (auto& r : ctx.rows)
+        content += (r.kind == slintbridge::kRowHint ? 34 : 54);
+    content += ((int)ctx.rows.size() - 1) * 2;
+    return 70 + content + 12 + 34;
+}
+
 static void apply_state(UiCtx& ctx)
 {
     if (!g_bridge) return;
@@ -272,6 +300,20 @@ static void apply_state(UiCtx& ctx)
     }
     ctx.rows = std::move(rows);
     ctx.centerWake = slot.centerWake != 0;
+    int h = compute_window_height(ctx, tl > 0);
+    if (h != ctx.windowHeight) {
+        ctx.windowHeight = h;
+        ctx.ui->set_window_height((float)h);
+        if (g_uiActive) {
+            slint::Timer::single_shot(std::chrono::milliseconds(30), []() {
+                if (!g_ctx || !g_uiActive) return;
+                HWND hwnd = g_ctx->ui->window().win32_hwnd();
+                remove_native_frame(hwnd);
+                apply_rounded_region(hwnd);
+                position_ui(hwnd, g_ctx->centerWake);
+            });
+        }
+    }
     int sel = slot.selected;
     if (sel < 0 || sel >= (int)ctx.rows.size()) sel = 0;
     ctx.ui->set_selected(sel);
@@ -325,6 +367,8 @@ static void show_ui()
     ctx.ui->set_query(slint::SharedString(""));  // 主进程每次唤起都清空输入
     ctx.ui->set_selected(0);
     HWND hwnd = ctx.ui->window().win32_hwnd();
+    remove_native_frame(hwnd);
+    apply_rounded_region(hwnd);
     position_ui(hwnd, ctx.centerWake);  // 先摆好位置再显示，避免旧位置闪一下
     ctx.ui->window().show();
     if (hwnd) {
@@ -337,8 +381,13 @@ static void show_ui()
         if (attached) AttachThreadInput(myTid, fgTid, FALSE);
     }
     g_uiActive = true;
-    slint::Timer::single_shot(std::chrono::milliseconds(40), [ctx]() {
-        ctx.ui->invoke_focus_input();
+    slint::Timer::single_shot(std::chrono::milliseconds(40), []() {
+        if (!g_ctx) return;
+        g_ctx->ui->invoke_focus_input();
+        HWND h = g_ctx->ui->window().win32_hwnd();
+        remove_native_frame(h);
+        apply_rounded_region(h);
+        position_ui(h, g_ctx->centerWake);
     });
 }
 
@@ -519,10 +568,12 @@ int main()
     slint::Timer::single_shot(std::chrono::milliseconds(80), [ctx]() {
         HWND hwnd = ctx->ui->window().win32_hwnd();
         if (!hwnd) return;
+        remove_native_frame(hwnd);
         enable_acrylic(hwnd);
         apply_rounded_region(hwnd);
         // 接管窗口过程：Alt+数字 / 关闭 / 失焦
-        g_origUiWndProc = (WNDPROC)SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)UiWndProc);
+        if (!g_origUiWndProc)
+            g_origUiWndProc = (WNDPROC)SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)UiWndProc);
     });
 
     // 图标异步填充：定时把 AsyncIcons 的结果塞进缓存并刷新行
@@ -548,7 +599,13 @@ int main()
     });
 
     ctx->ui->window().show();
-    position_ui(ctx->ui->window().win32_hwnd(), ctx->centerWake);
+    HWND h0 = ctx->ui->window().win32_hwnd();
+    remove_native_frame(h0);
+    enable_acrylic(h0);
+    apply_rounded_region(h0);
+    if (!g_origUiWndProc)
+        g_origUiWndProc = (WNDPROC)SetWindowLongPtrW(h0, GWLP_WNDPROC, (LONG_PTR)UiWndProc);
+    position_ui(h0, ctx->centerWake);
     g_uiActive = true;
     send_req(slintbridge::kReqReady);
     // 渲染器是常驻「皮」：隐藏窗口后事件循环不能退出，否则下次唤起又要重开进程

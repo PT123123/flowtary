@@ -1,7 +1,7 @@
-// Flowtary Slint UI — 与 GDI 版视觉对齐的 Raycast 风格主界面
-// 本文件只负责「画」：所有搜索逻辑、结果内容都在主进程（flowtary.exe）里，
-// 渲染器通过共享内存桥拿到「文本 + 行列表」，把用户输入回传给主进程。
-// 交互：TextInput 搜索（走平台 IME，支持中文）/↑↓ 选中/回车启动/Esc 隐藏/点击行启动。
+// Flowtary Slint UI — Raycast 风格启动器
+// 只负责「画」：搜索逻辑、结果内容都在主进程（flowtary.exe）里；
+// 渲染器通过共享内存桥拿到「文本 + 行列表」，把用户意图回传给主进程。
+// 交互：TextInput 搜索（走平台 IME，支持中文）/ ↑↓ 选中 / 回车启动 / Esc 隐藏 / 点击行启动。
 import { VerticalBox, HorizontalBox } from "std-widgets.slint";
 
 struct ResultItem {
@@ -16,7 +16,7 @@ struct ResultItem {
 
 export component MainWindow inherits Window {
     width: 680px;
-    height: 480px;
+    height: root.window-height;
     title: "flowtary-slint";   // 主进程靠这个标题找到渲染器界面窗口（判断「启动器开着没」）
     no-frame: true;
     background: transparent;
@@ -25,7 +25,8 @@ export component MainWindow inherits Window {
     in-out property <[ResultItem]> items: [];
     in-out property <int> selected: 0;
     in-out property <string> query: "";
-    in-out property <bool> empty: false;   // 无结果时显示 welcome 面板
+    in-out property <bool> empty: false;          // 无结果时显示 welcome 面板
+    in-out property <length> window-height: 300px; // C++ 按结果行数动态设置
 
     // → C++ 回调
     callback query-changed(string);
@@ -34,145 +35,323 @@ export component MainWindow inherits Window {
     callback move-selection(int);       // -1 / +1
     callback focus-input();              // 请求把焦点给搜索框
 
-    // 极淡色偏层；真机毛玻璃由 DWM Acrylic 透出桌面（见 main.cpp）
+    // —— 面板底板：DWM Acrylic 之上再叠一层冷色渐变 + 顶部高光 ——
     Rectangle {
         x: 0; y: 0; width: 100%; height: 100%;
-        background: #0e111826;
         border-radius: 16px;
+        background: @linear-gradient(180deg, #12172226 0%, #080b111f 100%);
+        border-width: 1px;
+        border-color: #ffffff12;
+    }
+    // 顶部极淡青色氛围光，避免整块玻璃发灰
+    Rectangle {
+        x: 1px; y: 1px; width: parent.width - 2px; height: 150px;
+        border-radius: 15px;
+        background: @linear-gradient(180deg, #4fd0c610 0%, transparent 100%);
     }
 
-    VerticalLayout {
-        x: 14px; y: 14px; width: parent.width - 28px; height: parent.height - 28px;
-        spacing: 14px;
-
-        // —— 搜索区 ——
-        Rectangle {
-            height: 52px;
-            Path {
-                x: 4px; y: (parent.height - 18px) / 2;
-                width: 18px; height: 18px;
-                fill: #96a3bc;
-                commands: "M 7 0 A 7 7 0 1 0 7 14 A 7 7 0 1 0 7 0 M 12 12 L 17 17";
-                stroke: #96a3bc; stroke-width: 1.5px;
-            }
-            Text {
-                x: 40px; y: 0; width: parent.width - 40px; height: parent.height;
-                vertical-alignment: center;
-                text: "搜索程序 · 文件 · 网页";
-                color: #76809a;
-                font-size: 16px;
-                visible: root.query == "";
-            }
-            input := TextInput {
-                x: 40px; y: 0; width: parent.width - 40px; height: parent.height;
-                vertical-alignment: center;
-                text <=> root.query;
-                color: #ffffff;
-                font-size: 16px;
-                edited => { root.query-changed(root.query); }
-                accepted => {
-                    if (!root.empty && root.selected >= 0 && root.selected < root.items.length) {
-                        root.item-activated(root.selected);
-                    }
-                }
-                key-pressed(e) => {
-                    if (e.text == Key.UpArrow) {
-                        root.move-selection(-1); return accept;
-                    } else if (e.text == Key.DownArrow) {
-                        root.move-selection(1); return accept;
-                    } else if (e.text == Key.Escape) {
-                        root.escape-pressed(); return accept;
-                    }
-                    return reject;
-                }
-            }
-            Rectangle {
-                y: parent.height - 1px; width: 100%; height: 1px;
-                background: #ffffff14;
+    // —— 搜索区 ——
+    // 放大镜：圆环 + 手柄（描边路径，不填充）
+    Path {
+        x: 22px; y: 23px; width: 18px; height: 18px;
+        fill: transparent;
+        stroke: root.query != "" ? #63d8cd : #8d99b3;
+        stroke-width: 2px;
+        commands: "M 7 0 A 7 7 0 1 0 7 14 A 7 7 0 1 0 7 0 M 12.5 12.5 L 17.5 17.5";
+    }
+    Text {
+        x: 52px; y: 0; width: parent.width - 52px - 86px; height: 64px;
+        vertical-alignment: center;
+        text: "搜索程序、文件或网页…";
+        color: #6f7a93;
+        font-size: 16px;
+        visible: root.query == "";
+    }
+    input := TextInput {
+        x: 52px; y: 0; width: parent.width - 52px - 86px; height: 64px;
+        vertical-alignment: center;
+        text <=> root.query;
+        color: #ffffff;
+        font-size: 16px;
+        selection-foreground-color: #0b1017;
+        selection-background-color: #63d8cd;
+        edited => { root.query-changed(root.query); }
+        accepted => {
+            if (!root.empty && root.selected >= 0 && root.selected < root.items.length) {
+                root.item-activated(root.selected);
             }
         }
-
-        // —— 结果列表 ——
-        VerticalLayout {
-            spacing: 2px;
-            for item[idx] in items: Rectangle {
-                height: 54px;
-                border-radius: 11px;
-                background: idx == selected ? #2e7c7c : transparent;
-
-                ta := TouchArea {
-                    x: 0; y: 0; width: 100%; height: 100%;
-                    moved => { root.selected = idx; }
-                    clicked => { root.item-activated(idx); }
-                }
-
-                // 图标：有真实 image 用之，否则回退文字徽标；提示行（kind=4）不画图标块
-                Rectangle {
-                    x: 13px; y: (parent.height - 38px) / 2;
-                    width: 38px; height: 38px;
-                    border-radius: 11px;
-                    background: item.icon-bg;
-                    visible: item.kind != 4;
-                    Text {
-                        width: 100%; height: 100%;
-                        text: item.glyph;
-                        color: #ffffff;
-                        font-size: 12px; font-weight: 700;
-                        horizontal-alignment: center; vertical-alignment: center;
-                    }
-                    Image {
-                        x: 3px; y: 3px; width: 32px; height: 32px;
-                        source: item.icon;
-                        image-fit: contain;
-                    }
-                }
-                Text {
-                    x: 64px; y: 8px; width: parent.width - 150px; height: 20px;
-                    text: item.title;
-                    color: item.kind == 4 ? #8e99b3 : #ffffff;
-                    font-size: 15px;
-                    vertical-alignment: center;
-                    overflow: elide;
-                }
-                Text {
-                    x: 64px; y: 27px; width: parent.width - 150px; height: 16px;
-                    text: item.sub;
-                    color: #96a3bc; font-size: 11px;
-                    vertical-alignment: center;
-                    overflow: elide;
-                }
-                Rectangle {
-                    x: parent.width - 45px; y: (parent.height - 19px) / 2;
-                    width: 30px; height: 19px;
-                    border-radius: 5px;
-                    background: idx == selected ? #3a8f8f : #282f3c;
-                    border-width: 1px; border-color: #5a667a;
-                    visible: item.hotkey != "";
-                    Text {
-                        width: 100%; height: 100%;
-                        text: item.hotkey;
-                        color: idx == selected ? #ffffff : #96a3bc;
-                        font-size: 12px;
-                        horizontal-alignment: center; vertical-alignment: center;
-                    }
-                }
+        key-pressed(e) => {
+            if (e.text == Key.UpArrow) {
+                root.move-selection(-1); return accept;
+            } else if (e.text == Key.DownArrow) {
+                root.move-selection(1); return accept;
+            } else if (e.text == Key.Escape) {
+                root.escape-pressed(); return accept;
             }
+            return reject;
         }
     }
-
-    // 空态欢迎面板（无查询且无结果）
-    if (empty): Rectangle {
-        x: 14px; y: 66px; width: parent.width - 28px; height: parent.height - 80px;
+    // 右侧 Esc 提示
+    Rectangle {
+        x: parent.width - 60px; y: 21px; width: 42px; height: 22px;
+        border-radius: 7px;
+        background: #ffffff08;
+        border-width: 1px;
+        border-color: #ffffff12;
         Text {
-            x: 0; y: 24px; width: 100%; height: 30px;
+            width: 100%; height: 100%;
+            text: "Esc";
+            color: #77829a;
+            font-size: 10px; font-weight: 600;
+            horizontal-alignment: center; vertical-alignment: center;
+        }
+    }
+    // 搜索区 / 结果区的发丝分隔线（两端淡出）
+    Rectangle {
+        x: 16px; y: 64px; width: parent.width - 32px; height: 1px;
+        background: @linear-gradient(90deg, transparent 0%, #ffffff18 18%, #ffffff18 82%, transparent 100%);
+    }
+
+    // —— 结果列表 ——
+    VerticalLayout {
+        x: 8px; y: 70px; width: parent.width - 16px;
+        spacing: 2px;
+
+        for item[idx] in items: Rectangle {
+            height: item.kind == 4 ? 34px : 54px;
+            border-radius: 12px;
+            background: transparent;
+
+            ta := TouchArea {
+                x: 0; y: 0; width: 100%; height: 100%;
+                mouse-cursor: pointer;
+                moved => { root.selected = idx; }
+                clicked => { root.item-activated(idx); }
+            }
+
+            // 悬停底色（选中行不叠）
+            Rectangle {
+                x: 0; y: 0; width: 100%; height: 100%;
+                border-radius: 12px;
+                background: #ffffff0d;
+                opacity: ta.has-hover && idx != root.selected ? 1 : 0;
+                animate opacity { duration: 100ms; easing: ease-out; }
+            }
+            // 选中底色：青色渐变 + 细描边，淡入淡出
+            Rectangle {
+                x: 0; y: 0; width: 100%; height: 100%;
+                border-radius: 12px;
+                background: @linear-gradient(90deg, #2f8f8a40 0%, #1f5f5e22 100%);
+                border-width: 1px;
+                border-color: #6fd7cd33;
+                opacity: idx == root.selected ? 1 : 0;
+                animate opacity { duration: 120ms; easing: ease-out; }
+            }
+            // 选中行左侧强调条
+            Rectangle {
+                x: 0; y: 12px; width: 3px; height: parent.height - 24px;
+                border-radius: 2px;
+                background: #63d8cd;
+                opacity: idx == root.selected ? 1 : 0;
+                animate opacity { duration: 120ms; easing: ease-out; }
+            }
+
+            // 图标：有真实 image 用之，否则回退文字徽标；提示行（kind=4）不画图标
+            if item.kind != 4: Rectangle {
+                x: 12px; y: (parent.height - 36px) / 2;
+                width: 36px; height: 36px;
+                border-radius: 11px;
+                background: item.icon-bg;
+                border-width: 1px;
+                border-color: idx == root.selected ? #ffffff30 : #ffffff1a;
+                Text {
+                    width: 100%; height: 100%;
+                    text: item.glyph;
+                    color: #ffffff;
+                    font-size: 10px; font-weight: 700;
+                    horizontal-alignment: center; vertical-alignment: center;
+                }
+                Image {
+                    x: 3px; y: 3px; width: 30px; height: 30px;
+                    source: item.icon;
+                    image-fit: contain;
+                }
+            }
+
+            // 普通结果：标题 + 副标题
+            if item.kind != 4: Text {
+                x: 60px; y: 8px; width: parent.width - 60px - 56px; height: 20px;
+                text: item.title;
+                color: #ffffff;
+                font-size: 14.5px; font-weight: idx == root.selected ? 600 : 500;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+            if item.kind != 4: Text {
+                x: 60px; y: 27px; width: parent.width - 60px - 56px; height: 16px;
+                text: item.sub;
+                color: idx == root.selected ? #cfe9e6 : #8b96ae;
+                font-size: 11px;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+            // 提示行：单行说明，左边距对齐图标之外
+            if item.kind == 4: Text {
+                x: 14px; width: parent.width - 48px; height: 100%;
+                text: item.title;
+                color: #8d98b0;
+                font-size: 12px;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+
+            // 快捷键徽章
+            if item.hotkey != "" && item.kind != 4: Rectangle {
+                x: parent.width - 42px; y: (parent.height - 20px) / 2;
+                width: 26px; height: 20px;
+                border-radius: 7px;
+                background: idx == root.selected ? #ffffff1f : #ffffff0a;
+                border-width: 1px;
+                border-color: idx == root.selected ? #ffffff30 : #ffffff12;
+                Text {
+                    width: 100%; height: 100%;
+                    text: item.hotkey;
+                    color: idx == root.selected ? #eafffd : #96a1b8;
+                    font-size: 11px; font-weight: 600;
+                    horizontal-alignment: center; vertical-alignment: center;
+                }
+            }
+        }
+    }
+
+    // —— 底部快捷键提示（有结果时显示）——
+    if !root.empty: Rectangle {
+        x: 16px; y: root.window-height - 34px; width: parent.width - 32px; height: 34px;
+        Rectangle {
+            x: 0; y: 0; width: 100%; height: 1px;
+            background: @linear-gradient(90deg, transparent 0%, #ffffff12 18%, #ffffff12 82%, transparent 100%);
+        }
+        Text {
+            x: 2px; y: 10px; width: 60%;
+            text: "↑↓ 选择      ↵ 打开      Esc 隐藏";
+            color: #78839b; font-size: 11px;
+        }
+        Text {
+            x: parent.width - 140px; y: 10px; width: 138px;
+            text: "Alt + 数字 快速打开";
+            color: #78839b; font-size: 11px;
+            horizontal-alignment: right;
+        }
+    }
+
+    // —— 空态欢迎面板 ——
+    if empty && root.query == "": Rectangle {
+        x: 0; y: 0; width: 100%; height: 100%;
+        Rectangle {
+            x: (root.width - 58px) / 2; y: 60px;
+            width: 58px; height: 58px;
+            border-radius: 18px;
+            background: @linear-gradient(135deg, #46c4b4 0%, #1f6f7a 100%);
+            border-width: 1px;
+            border-color: #ffffff30;
+            Text {
+                width: 100%; height: 100%;
+                text: "F";
+                color: #ffffff;
+                font-size: 29px; font-weight: 800;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
+        }
+        Text {
+            x: 0; y: 132px; width: 100%; height: 32px;
             text: "Flowtary";
-            color: #e8edf7; font-size: 22px; font-weight: 600;
+            color: #f2f5fb;
+            font-size: 24px; font-weight: 600;
             horizontal-alignment: center;
         }
         Text {
-            x: 0; y: 62px; width: 100%; height: 24px;
-            text: "输入程序名、文件路径或网页关键词开始搜索";
-            color: #76809a; font-size: 13px;
+            x: 0; y: 168px; width: 100%; height: 22px;
+            text: "搜索程序、文件与网页";
+            color: #8b96ae;
+            font-size: 13px;
+            horizontal-alignment: center;
+        }
+        HorizontalLayout {
+            x: 0; y: 208px; width: 100%; height: 26px;
+            alignment: center;
+            spacing: 8px;
+            Rectangle {
+                width: 108px; height: 26px;
+                border-radius: 8px;
+                background: #ffffff08;
+                border-width: 1px; border-color: #ffffff12;
+                Text {
+                    width: 100%; height: 100%;
+                    text: "输入即搜索";
+                    color: #8d98b0; font-size: 10.5px;
+                    horizontal-alignment: center; vertical-alignment: center;
+                }
+            }
+            Rectangle {
+                width: 108px; height: 26px;
+                border-radius: 8px;
+                background: #ffffff08;
+                border-width: 1px; border-color: #ffffff12;
+                Text {
+                    width: 100%; height: 100%;
+                    text: "Alt+Space 唤起";
+                    color: #8d98b0; font-size: 10.5px;
+                    horizontal-alignment: center; vertical-alignment: center;
+                }
+            }
+            Rectangle {
+                width: 88px; height: 26px;
+                border-radius: 8px;
+                background: #ffffff08;
+                border-width: 1px; border-color: #ffffff12;
+                Text {
+                    width: 100%; height: 100%;
+                    text: "Esc 隐藏";
+                    color: #8d98b0; font-size: 10.5px;
+                    horizontal-alignment: center; vertical-alignment: center;
+                }
+            }
+        }
+    }
+
+    // —— 无结果 ——
+    if empty && root.query != "": Rectangle {
+        x: 0; y: 0; width: 100%; height: 100%;
+        Rectangle {
+            x: (root.width - 52px) / 2; y: 60px;
+            width: 52px; height: 52px;
+            border-radius: 16px;
+            background: #ffffff08;
+            border-width: 1px;
+            border-color: #ffffff14;
+            Path {
+                x: (parent.width - 20px) / 2; y: (parent.height - 20px) / 2;
+                width: 20px; height: 20px;
+                fill: transparent;
+                stroke: #7f8ba6;
+                stroke-width: 2px;
+                commands: "M 8 0 A 8 8 0 1 0 8 16 A 8 8 0 1 0 8 0 M 14 14 L 19 19";
+            }
+        }
+        Text {
+            x: 60px; y: 128px; width: root.width - 120px; height: 26px;
+            text: "没有找到 “" + root.query + "”";
+            color: #e8edf7;
+            font-size: 16px; font-weight: 500;
+            horizontal-alignment: center;
+            overflow: elide;
+        }
+        Text {
+            x: 0; y: 160px; width: 100%; height: 20px;
+            text: "换个关键词，或等索引扫描完成再试";
+            color: #8b96ae;
+            font-size: 12px;
             horizontal-alignment: center;
         }
     }
