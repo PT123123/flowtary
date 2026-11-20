@@ -121,6 +121,7 @@ bool DeleteRunValue(const wchar_t* valueName);
 // ---------------- 设置快照（所有可持久化字段） ----------------
 struct Settings {
     // 常规
+    int uiEngine = 0;    // 界面引擎：0=GDI 稳定版（默认）1=Slint 新版（需重启生效）
     int centerWake = 1;  // 1=屏幕居中 0=跟随鼠标（下拉候选表用 int 绑定）
     int hotkeyMode = 0;
     // 唤起热键总开关：只读。托盘菜单可实时改它，sidecar 保存时不回写，
@@ -203,6 +204,9 @@ inline std::vector<Option> LearnExpireOptions() {
 inline std::vector<Option> DfBackendOptions() {
     return {{L"自动（Flowtary 索引优先，Windows Search 备用）", 0},
             {L"仅 Flowtary 索引", 1}, {L"仅 Windows Search（系统索引范围）", 2}};
+}
+inline std::vector<Option> UiEngineOptions() {
+    return {{L"GDI 稳定版（功能完整）", 0}, {L"Slint 新版（重启生效，实验性）", 1}};
 }
 inline std::vector<Option> ShellTypeOptions() {
     return {{L"命令提示符 (cmd)", 0}, {L"PowerShell", 1}, {L"Git Bash", 2}, {L"自定义…", 3}};

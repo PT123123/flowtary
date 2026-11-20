@@ -1,0 +1,172 @@
+// Flowtary Slint UI — 与 GDI 版视觉对齐的 Raycast 风格主界面
+// 交互：TextInput 搜索（走平台 IME，支持中文）/↑↓ 选中/回车启动/Esc 隐藏/点击行启动。
+// Qt/GDI 无关的纯声明式 UI；系统层（搜索/热键/图标/启动）在 main.cpp。
+import { VerticalBox, HorizontalBox } from "std-widgets.slint";
+
+struct ResultItem {
+    title: string,
+    sub: string,
+    hotkey: string,
+    icon: image,   // 由 C++ 侧 HICON -> RGBA 注入；空 image 时回退到文字徽标
+    glyph: string, // 图标未就绪时的文字回退（VS/CH/...）
+    icon-bg: color,
+}
+
+export component MainWindow inherits Window {
+    width: 680px;
+    height: 480px;
+    no-frame: true;
+    background: transparent;
+    default-font-family: "Segoe UI";
+
+    in-out property <[ResultItem]> items: [];
+    in-out property <int> selected: 0;
+    in-out property <string> query: "";
+    in-out property <bool> empty: false;   // 无结果时显示 welcome 面板
+
+    // → C++ 回调
+    callback query-changed(string);
+    callback item-activated(int);
+    callback escape-pressed();
+    callback move-selection(int);       // -1 / +1
+
+    // 极淡色偏层；真机毛玻璃由 DWM Acrylic 透出桌面（见 main.cpp）
+    Rectangle {
+        x: 0; y: 0; width: 100%; height: 100%;
+        background: #0e111826;
+        border-radius: 16px;
+    }
+
+    VerticalLayout {
+        x: 14px; y: 14px; width: parent.width - 28px; height: parent.height - 28px;
+        spacing: 14px;
+
+        // —— 搜索区 ——
+        Rectangle {
+            height: 52px;
+            Path {
+                x: 4px; y: (parent.height - 18px) / 2;
+                width: 18px; height: 18px;
+                fill: #96a3bc;
+                commands: "M 7 0 A 7 7 0 1 0 7 14 A 7 7 0 1 0 7 0 M 12 12 L 17 17";
+                stroke: #96a3bc; stroke-width: 1.5px;
+            }
+            Text {
+                x: 40px; y: 0; width: parent.width - 40px; height: parent.height;
+                vertical-alignment: center;
+                text: "搜索程序 · 文件 · 网页";
+                color: #76809a;
+                font-size: 16px;
+                visible: root.query == "";
+            }
+            input := TextInput {
+                x: 40px; y: 0; width: parent.width - 40px; height: parent.height;
+                vertical-alignment: center;
+                text <=> root.query;
+                color: #ffffff;
+                font-size: 16px;
+                edited => { root.query-changed(root.query); }
+                accepted => {
+                    if (!root.empty && root.selected >= 0 && root.selected < root.items.length) {
+                        root.item-activated(root.selected);
+                    }
+                }
+                key-pressed(e) => {
+                    if (e.text == Key.UpArrow) {
+                        root.move-selection(-1); return accept;
+                    } else if (e.text == Key.DownArrow) {
+                        root.move-selection(1); return accept;
+                    } else if (e.text == Key.Escape) {
+                        root.escape-pressed(); return accept;
+                    }
+                    return reject;
+                }
+            }
+            Rectangle {
+                y: parent.height - 1px; width: 100%; height: 1px;
+                background: #ffffff14;
+            }
+        }
+
+        // —— 结果列表 ——
+        VerticalLayout {
+            spacing: 2px;
+            for item[idx] in items: Rectangle {
+                height: 54px;
+                border-radius: 11px;
+                background: idx == selected ? #2e7c7c : transparent;
+
+                ta := TouchArea {
+                    x: 0; y: 0; width: 100%; height: 100%;
+                    moved => { root.selected = idx; }
+                    clicked => { root.item-activated(idx); }
+                }
+
+                // 图标：有真实 image 用之，否则回退文字徽标
+                Rectangle {
+                    x: 13px; y: (parent.height - 38px) / 2;
+                    width: 38px; height: 38px;
+                    border-radius: 11px;
+                    background: item.icon-bg;
+                    Text {
+                        width: 100%; height: 100%;
+                        text: item.glyph;
+                        color: #ffffff;
+                        font-size: 12px; font-weight: 700;
+                        horizontal-alignment: center; vertical-alignment: center;
+                    }
+                    Image {
+                        x: 3px; y: 3px; width: 32px; height: 32px;
+                        source: item.icon;
+                        image-fit: contain;
+                    }
+                }
+                Text {
+                    x: 64px; y: 8px; width: parent.width - 150px; height: 20px;
+                    text: item.title;
+                    color: #ffffff; font-size: 15px;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+                Text {
+                    x: 64px; y: 27px; width: parent.width - 150px; height: 16px;
+                    text: item.sub;
+                    color: #96a3bc; font-size: 11px;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+                Rectangle {
+                    x: parent.width - 45px; y: (parent.height - 19px) / 2;
+                    width: 30px; height: 19px;
+                    border-radius: 5px;
+                    background: idx == selected ? #3a8f8f : #282f3c;
+                    border-width: 1px; border-color: #5a667a;
+                    Text {
+                        width: 100%; height: 100%;
+                        text: item.hotkey;
+                        color: idx == selected ? #ffffff : #96a3bc;
+                        font-size: 12px;
+                        horizontal-alignment: center; vertical-alignment: center;
+                    }
+                }
+            }
+        }
+    }
+
+    // 空态欢迎面板（无查询且无结果）
+    if (empty): Rectangle {
+        x: 14px; y: 66px; width: parent.width - 28px; height: parent.height - 80px;
+        Text {
+            x: 0; y: 24px; width: 100%; height: 30px;
+            text: "Flowtary";
+            color: #e8edf7; font-size: 22px; font-weight: 600;
+            horizontal-alignment: center;
+        }
+        Text {
+            x: 0; y: 62px; width: 100%; height: 24px;
+            text: "输入程序名、文件路径或网页关键词开始搜索";
+            color: #76809a; font-size: 13px;
+            horizontal-alignment: center;
+        }
+    }
+}

@@ -1,0 +1,132 @@
+// Flowtary POC — Raycast 风格主界面（Slint 1.19）
+// 对照 tools/render_preview.py 的定稿参数，用 Slint 声明式重建：
+// 独立搜索框 / squircle 图标 / 标题副标题双行 / teal 通栏选中 / 键帽 / backdrop-blur 毛玻璃。
+import { VerticalBox, HorizontalBox } from "std-widgets.slint";
+
+struct ResultItem {
+    title: string,
+    sub: string,
+    hotkey: string,
+    icon-bg: color,
+    glyph: string,
+}
+
+export component MainWindow inherits Window {
+    width: 680px;
+    height: 480px;
+    // 无边框 + 透明背景：毛玻璃透出壁纸，圆角由内容层自己画
+    no-frame: true;
+    background: transparent;
+    default-font-family: "Segoe UI";
+
+    in-out property <[ResultItem]> items: [
+        { title: "Visual Studio Code", sub: "C:\\Program Files\\Microsoft VS Code\\Code.exe", hotkey: "1", icon-bg: #2b8cbe, glyph: "VS" },
+        { title: "Google Chrome", sub: "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe", hotkey: "2", icon-bg: #d85a30, glyph: "CH" },
+        { title: "Windows Terminal", sub: "C:\\Users\\ted\\AppData\\Local\\Microsoft\\WindowsApps\\wt.exe", hotkey: "3", icon-bg: #534ab7, glyph: "WT" },
+        { title: "Spotify", sub: "C:\\Users\\ted\\AppData\\Roaming\\Spotify\\Spotify.exe", hotkey: "4", icon-bg: #1d9e75, glyph: "SP" },
+        { title: "File Explorer", sub: "C:\\Windows\\explorer.exe", hotkey: "5", icon-bg: #ba7517, glyph: "EX" },
+        { title: "Slack", sub: "C:\\Users\\ted\\AppData\\Local\\Slack\\slack.exe", hotkey: "6", icon-bg: #993556, glyph: "SL" },
+    ];
+    in-out property <int> selected: 0;
+    in-out property <string> query: "";
+
+    // 离屏预览专用：假壁纸 + Skia backdrop-blur 模拟真机 DWM Acrylic 效果
+    Image {
+        source: @image-url("wallpaper.png");
+        width: 100%; height: 100%;
+        image-fit: cover;
+    }
+    Rectangle {
+        x: 0; y: 0; width: 100%; height: 100%;
+        background: #0e111866;
+        border-radius: 16px;
+        backdrop-blur: 24px;
+    }
+
+    // 搜索框：无独立实色块，融入玻璃，仅底部一条极淡 hairline
+    VerticalLayout {
+        x: 14px; y: 14px; width: parent.width - 28px; height: parent.height - 28px;
+        spacing: 14px;
+
+        // —— 搜索区（高 52px）——
+        Rectangle {
+            height: 52px;
+            // 放大镜
+            Path {
+                x: 4px; y: (parent.height - 18px) / 2;
+                width: 18px; height: 18px;
+                fill: #96a3bc;
+                commands: "M 7 0 A 7 7 0 1 0 7 14 A 7 7 0 1 0 7 0 M 12 12 L 17 17";
+                stroke: #96a3bc; stroke-width: 1.5px;
+            }
+            Text {
+                x: 40px; y: 0; width: parent.width - 40px; height: parent.height;
+                vertical-alignment: center;
+                text: query == "" ? "搜索程序 · 文件 · 网页" : query;
+                color: query == "" ? #76809a : #ffffff;
+                font-size: 16px;
+            }
+            // 底部极淡 hairline
+            Rectangle {
+                y: parent.height - 1px; width: 100%; height: 1px;
+                background: #ffffff14;
+            }
+        }
+
+        // —— 结果列表 ——
+        VerticalLayout {
+            spacing: 2px;
+            for item[idx] in items: Rectangle {
+                height: 54px;
+                border-radius: 11px;
+                background: idx == selected ? #2e7c7c : transparent;
+
+                // 图标托盘（squircle 38px）
+                Rectangle {
+                    x: 13px; y: (parent.height - 38px) / 2;
+                    width: 38px; height: 38px;
+                    border-radius: 11px;
+                    background: item.icon-bg;
+                    Text {
+                        width: 100%; height: 100%;
+                        text: item.glyph;
+                        color: #ffffff;
+                        font-size: 12px; font-weight: 700;
+                        horizontal-alignment: center; vertical-alignment: center;
+                    }
+                }
+                // 标题（上行）
+                Text {
+                    x: 64px; y: 8px; width: parent.width - 150px; height: 20px;
+                    text: item.title;
+                    color: #ffffff; font-size: 15px;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+                // 副标题（下行）
+                Text {
+                    x: 64px; y: 27px; width: parent.width - 150px; height: 16px;
+                    text: item.sub;
+                    color: #96a3bc; font-size: 11px;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+                // 键帽：几何 ⌘ + 数字
+                Rectangle {
+                    x: parent.width - 45px; y: (parent.height - 19px) / 2;
+                    width: 30px; height: 19px;
+                    border-radius: 5px;
+                    background: idx == selected ? #3a8f8f : #282f3c;
+                    border-width: 1px; border-color: #5a667a;
+                    Text {
+                        width: 100%; height: 100%;
+                        text: item.hotkey;
+                        color: idx == selected ? #ffffff : #96a3bc;
+                        font-size: 12px;
+                        horizontal-alignment: center; vertical-alignment: center;
+                    }
+                }
+            }
+        }
+    }
+}

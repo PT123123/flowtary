@@ -78,6 +78,11 @@ if (Test-Path (Join-Path $src 'flowtary-search.exe')) {
 if (Test-Path (Join-Path $src 'flowtary-indexer.exe')) {
     Copy-Item (Join-Path $src 'flowtary-indexer.exe') (Join-Path $dest 'flowtary-indexer.exe') -Force
 }
+# Slint engine (optional UI switch): launcher + runtime DLL
+if (Test-Path (Join-Path $src 'flowtary-slint.exe')) {
+    Copy-Item (Join-Path $src 'flowtary-slint.exe') (Join-Path $dest 'flowtary-slint.exe') -Force
+    Copy-Item (Join-Path $src 'slint_cpp.dll')      (Join-Path $dest 'slint_cpp.dll') -Force
+}
 
 Write-Host ("[ok] deployed to {0}" -f $dest)
 exit 0

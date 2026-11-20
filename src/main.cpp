@@ -180,6 +180,7 @@ struct WinInfo {
 };
 
 struct App {
+    int uiEngine = 0;          // 界面引擎：0=GDI 稳定版（默认）1=Slint 新版
     HWND hwnd = nullptr;
     HFONT fInput = nullptr;
     HFONT fList = nullptr;
@@ -404,6 +405,7 @@ static const struct { UINT mod, vk; const WCHAR* name; } kWakeHotkeys[] = {
 };
 
 // 前置声明（后文定义，ApplyTheme 需要）
+static std::wstring GetExePath();
 static void EnableDarkMenus();
 static const CmdGroup* FindGroup(const std::vector<CmdGroup>& gs, const std::wstring& key);
 static int KillProcessesByName(const std::wstring& name);
@@ -1776,7 +1778,28 @@ static void LayoutAndRepaint() {
     RepaintNow();
 }
 
+// Slint 引擎：唤起时拉起同目录的 flowtary-slint.exe。
+// 系统层（全局热键 Alt+Space / Alt+数字）继续留在 GDI 主程序，Slint 只做搜索 UI。
+static void LaunchSlintEngine() {
+    // 已在运行则直接前置，避免多开
+    if (HWND slintWnd = FindWindowW(L"Window Class", L"flowtary-slint")) {
+        ShowWindow(slintWnd, SW_SHOW);
+        SetForegroundWindow(slintWnd);
+        return;
+    }
+    std::wstring exe = GetExePath();
+    size_t slash = exe.find_last_of(L"\\/");
+    std::wstring path = (slash == std::wstring::npos) ? L"flowtary-slint.exe"
+                                                      : exe.substr(0, slash + 1) + L"flowtary-slint.exe";
+    ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
 static void Show() {
+    if (g.uiEngine == 1) {
+        AppendTrace("SHOW(wake) -> Slint engine");
+        LaunchSlintEngine();
+        return;
+    }
     AppendTrace("SHOW(wake)");
     g.text.clear();
     g.compText.clear();
@@ -3646,6 +3669,7 @@ static std::wstring GetExePath() {
 // 重放、sidecar 取消时回退快照 —— 保证运行态只有一种被写法。
 static ft::Settings sSnap;
 static void ApplySettingsToRuntime(const ft::Settings& s) {
+    g.uiEngine = s.uiEngine;
     g.centerWake = s.centerWake != 0;
     g.hotkeyMode = s.hotkeyMode;
     g.hotkeyWake = s.hotkeyWake;

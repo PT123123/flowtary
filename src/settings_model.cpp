@@ -538,6 +538,9 @@ void SyncStartupPath(const std::wstring& mainExePath) {
 void Settings::Load() {
     DWORD v = 0;
 
+    uiEngine = 0;
+    if (RegGetDword(L"UiEngine", v)) uiEngine = (v <= 1) ? (int)v : 0;
+
     centerWake = 1;
     if (RegGetDword(L"CenterWake", v)) centerWake = v ? 1 : 0;
 
@@ -675,6 +678,7 @@ void Settings::Load() {
 void Settings::Save() {
     Settings& self = *this;
 
+    RegSetDword(L"UiEngine", (DWORD)uiEngine);
     RegSetDword(L"CenterWake", centerWake ? 1 : 0);
     RegSetDword(L"HotkeyMode", (DWORD)hotkeyMode);
     RegSetDword(L"FileDlgJump", fdjEnabled ? 1 : 0);

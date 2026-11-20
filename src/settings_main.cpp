@@ -798,17 +798,18 @@ static void BuildSidebar() {
 
 static void BuildTabGeneral() {
     Fl_Group* p = NewPanel(0);
-    AddCheck(p, 0, 8, kPW, L"开机自动启动", &g_s.startupWanted);
-    AddChoiceRow(p, 44, L"结果项快捷键：", ft::HotkeyModeOptions(), &g_s.hotkeyMode);
-    AddChoiceRow(p, 78, L"唤醒位置：", ft::CenterWakeOptions(), &g_s.centerWake);
-    AddCheck(p, 0, 116, kPW, L"文件对话框跳转（在文件对话框中直接定位文件夹）", &g_s.fdjEnabled);
-    AddChoiceRow(p, 150, L"d/f 搜索后端：", ft::DfBackendOptions(), &g_s.dfBackend, 2);
-    AddLabel(p, 0, 184, kPW, kRowH, L"Flowtary 快照查询已接入；当前仍需独立完成索引生成与验证。");
-    AddHint(p, 0, 218, kPW, 60,
+    AddChoiceRow(p, 8,  L"界面引擎：", ft::UiEngineOptions(), &g_s.uiEngine);
+    AddCheck(p, 0, 42, kPW, L"开机自动启动", &g_s.startupWanted);
+    AddChoiceRow(p, 78, L"结果项快捷键：", ft::HotkeyModeOptions(), &g_s.hotkeyMode);
+    AddChoiceRow(p, 112, L"唤醒位置：", ft::CenterWakeOptions(), &g_s.centerWake);
+    AddCheck(p, 0, 150, kPW, L"文件对话框跳转（在文件对话框中直接定位文件夹）", &g_s.fdjEnabled);
+    AddChoiceRow(p, 184, L"d/f 搜索后端：", ft::DfBackendOptions(), &g_s.dfBackend, 2);
+    AddLabel(p, 0, 218, kPW, kRowH, L"Flowtary 快照查询已接入；当前仍需独立完成索引生成与验证。");
+    AddHint(p, 0, 252, kPW, 60,
             L"自动模式优先查询已发布的 Flowtary 快照；快照尚未就绪时查询 Windows Search。\n"
             L"Flowtary 快照缺失或损坏时不会启动文件扫描；Windows Search 范围由系统设置决定。");
-    AddHint(p, 0, 282, kPW, 46,
-            L"Flowtary 不启动文件扫描，不自动启动索引服务，也不修改系统索引范围。\n"
+    AddHint(p, 0, 316, kPW, 46,
+            L"界面引擎切换（GDI/Slint）在保存后、下次唤起时生效。\n"
             L"唤起快捷键（Alt+Space）在托盘菜单里开关；结果项快捷键改动立即生效。");
     p->end();
 }

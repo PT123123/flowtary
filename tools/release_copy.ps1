@@ -36,4 +36,8 @@ if (Test-Path (Join-Path $src 'flowtary-search.exe')) {
 if (Test-Path (Join-Path $src 'flowtary-indexer.exe')) {
     Copy-Item (Join-Path $src 'flowtary-indexer.exe') (Join-Path $Dist 'flowtary-indexer.exe') -Force
 }
+if (Test-Path (Join-Path $src 'flowtary-slint.exe')) {
+    Copy-Item (Join-Path $src 'flowtary-slint.exe') (Join-Path $Dist 'flowtary-slint.exe') -Force
+    Copy-Item (Join-Path $src 'slint_cpp.dll')      (Join-Path $Dist 'slint_cpp.dll') -Force
+}
 Write-Host ("[ok] {0}\flowtary-{1}.exe" -f $Dist, $ver)

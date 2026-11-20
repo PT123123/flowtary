@@ -47,3 +47,11 @@ resource-samples.jsonl
 # UI 测试落盘的取证图（tests/ 运行时写在仓库根）
 hot_usage_dark.bmp
 hot_usage_control.bmp
+
+# Slint SDK / viewer / prebuilt binaries (fetch on demand, do not commit)
+tools/slint_poc/sdk/
+tools/slint_poc/viewer/
+tools/slint_poc/*.exe
+tools/slint_poc/*.zip
+tools/slint_poc/*.dll
+src/slint_ui/*.dll
