@@ -55,7 +55,11 @@ class AsyncIcons {
         if(SUCCEEDED(initialized))CoUninitialize();
     }
 public:
-    static constexpr size_t kPendingLimit=64;
+    static constexpr size_t kPendingLimit=128;
+    // 并发抽取：SHGetFileInfo 每个 exe 要读图标资源/解析 PE，单线程串行时首屏
+    // 十几个图标逐个蹦出来（肉眼可见 1-2 秒）。多个 worker 抢同一队列并发抽取，
+    // 首屏图标几乎同时到位。每个 worker 各自 CoInitializeEx（STA 抽取 shell 图标）。
+    static constexpr int kWorkerCount=4;
     explicit AsyncIcons(std::function<HICON(const std::wstring&)> extract={}){state->extract=std::move(extract);}
     ~AsyncIcons(){Stop();}
     void Reset(unsigned long long generation) {
@@ -68,7 +72,10 @@ public:
         if(state->pending.count(path))return true;
         if(state->pending.size()>=kPendingLimit)return false;
         if(!state->started){
-            try{std::thread(Work,state).detach();state->started=true;}
+            try{
+                for(int i=0;i<kWorkerCount;++i) std::thread(Work,state).detach();
+                state->started=true;
+            }
             catch(const std::system_error&){return false;}
         }
         state->pending.insert(path);state->requests.push_back(path);state->changed.notify_one();return true;

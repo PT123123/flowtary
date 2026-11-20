@@ -327,18 +327,25 @@ struct App {
     std::wstring captureArgs;          // 本次启动的命令行参数
 } g;
 
-constexpr int kBaseW = 680, kBaseInputH = 62, kBaseRowH = 34, kBasePad = 8;
-constexpr int kBaseEmptyH = 200;  // 空态引导面板逻辑高度（输入区之外的品牌/引导区）
-constexpr int kBaseFooterH = 22;  // 耗时底栏逻辑高度（仅非秒出时出现）
-// 列表卡片的版式留白（逻辑像素）——整体收紧，避免「卡片离窗口、选中块离卡片、
-// 内容离卡片」三层留白叠加出一大圈空地（图标曾离窗口左缘达 25px）。
-//   kBaseCardGapTop    输入栏底边 → 卡片顶边。留一点缝让两道圆弧各自干净，
-//                      但不再留 10px 那么宽——否则输入栏和卡片像两座孤岛。
-//   kBaseCardPadBottom 卡片底边 → 最后一行底边。够图标托盘/高亮落进卡片圆角即可。
-//   kBaseWinPadBottom  卡片底边 → 窗口底边。窗口底缘圆角在这里收口，末行不被切断。
-constexpr int kBaseCardGapTop = 6;
-constexpr int kBaseCardPadBottom = 5;
-constexpr int kBaseWinPadBottom = 6;
+// —— 主窗版式（Raycast 风格，逻辑像素）——
+// 视觉结构：窗口内一枚独立圆角搜索框 + 下方结果列表直接铺在玻璃上（无独立卡片），
+// 每行大 squircle 图标 + 标题/副标题上下双行，选中行为通栏纯色胶囊。
+// 关键等式：kBaseInputH(=pad+searchH) + kBaseCardGapTop = 列表顶边 rowsTop，
+// 命中测试/Layout/动画都复用这个等式，所以改这里即可整体适配，无需逐个改调用点。
+constexpr int kBaseW = 680;
+constexpr int kBasePad = 14;        // 窗口四周留白：搜索框与列表的左右边界
+constexpr int kSearchH = 52;        // 搜索框高度
+constexpr int kBaseInputH = 66;     // = kBasePad + kSearchH，搜索框底边 y
+constexpr int kBaseRowH = 54;       // 行高（容纳双行文字 + 大图标）
+constexpr int kBaseCardGapTop = 14; // 搜索框底 → 列表顶
+constexpr int kBaseCardPadBottom = 0;   // 新布局无结果卡片，列表底即内容底
+constexpr int kBaseWinPadBottom = 14;   // 列表底 → 窗口底
+constexpr int kBaseEmptyH = 200;
+constexpr int kBaseFooterH = 22;
+// 造型半径 / 尺寸
+constexpr int kWinRadius = 16, kSearchRadius = 12, kSelRadius = 11;
+constexpr int kIconSize = 38, kIconRadius = 11, kIconGapL = 13, kIconTextGap = 13;
+constexpr int kBadgeW = 30, kBadgeH = 19, kBadgeR = 5, kBadgeGapR = 15;
 constexpr int kSlowMs = 120;      // 超过这个毫秒数才报耗时；秒出的查询保持干净
 constexpr int kFontMin = 11, kFontMax = 24;  // 字体池逻辑字号范围
 constexpr UINT_PTR kTimerDebounce = 1;
@@ -3027,13 +3034,20 @@ static int SelectionEndWidth(HDC hdc) {
     return sz.cx;
 }
 
+// 输入文字的统一左起点：搜索框左缘 + 放大镜左边距 + 放大镜 + 间距。
+// Paint / 光标定位 / IME 锚点 / 可见性都用它，避免改版式后光标错位。
+static inline int InputTextStartX() {
+    return S(kBasePad) + S(14) + S(16) + S(10);
+}
+
 static void EnsureCaretVisible() {
     HDC hdc = GetDC(g.hwnd);
     int cw = CaretTextWidth(hdc) + CompTextWidth(hdc);  // 含输入法组合串，保持整段可见
     ReleaseDC(g.hwnd, hdc);
     RECT rc;
     GetClientRect(g.hwnd, &rc);
-    int avail = rc.right - 2 * S(kBasePad);
+    // 可用宽度 = 搜索框右缘 - 文字起点；留一点右侧余量
+    int avail = (rc.right - S(kBasePad)) - InputTextStartX() - S(8);
     if (cw - g.scrollX > avail) g.scrollX = cw - avail;
     if (cw < g.scrollX) g.scrollX = cw;
     if (g.scrollX < 0) g.scrollX = 0;
@@ -3044,7 +3058,7 @@ static void EnsureCaretVisible() {
 static size_t CaretFromX(int clientX) {
     HDC hdc = GetDC(g.hwnd);
     SelectObject(hdc, g.fInput);
-    int targetX = clientX - S(kBasePad) + g.scrollX;
+    int targetX = clientX - InputTextStartX() + g.scrollX;
     if (targetX <= 0) {
         ReleaseDC(g.hwnd, hdc);
         return 0;
@@ -3088,7 +3102,9 @@ static void SetImePos() {
     HDC hdc = GetDC(g.hwnd);
     int cw = CaretTextWidth(hdc);
     ReleaseDC(g.hwnd, hdc);
-    POINT pt{S(kBasePad) - g.scrollX + cw, S(kBaseInputH) - S(10)};
+    // 搜索框垂直中心 + 一点下移（候选窗出现在光标右下，符合输入直觉）
+    int searchMidY = S(kBasePad) + (S(kBaseInputH) - S(kBasePad)) / 2;
+    POINT pt{InputTextStartX() - g.scrollX + cw, searchMidY + S(10)};
     if (pt.x < 0) pt.x = 0;
     COMPOSITIONFORM cf{};
     cf.dwStyle = CFS_FORCE_POSITION;
@@ -4641,16 +4657,17 @@ static void Paint(HDC hdc) {
     oldBmp = SelectObject(mem, bmp);
     if (t.bg2 != t.bg) FillVGradient(mem, 0, 0, W, H, t.bg, t.bg2);
     else { HBRUSH bgBr = CreateSolidBrush(t.bg); FillRect(mem, &rc, bgBr); DeleteObject(bgBr); }
+    // 注：壁纸毛玻璃透出由 ApplyGlass 的 WS_EX_LAYERED + DWM AcrylicBlur 在系统层实现，
+    // 绘制层保持实色底即可，不再用假的渐变光晕冒充（那会在不透明合成时显得脏）。
 
     // 窗口圆角裁剪：强调条/辉光/星点等一切内容都不得画出圆角边界——
     // 之前蓝色强调条以方角画满全宽，在圆角处溢出弧线之外，非常刺眼。
     int savedClip = 0;
     {
-        int rWin = S(t.radiusWindow);
+        int rWin = S(kWinRadius);
         if (rWin > 1) {
-            // CreateRoundRectRgn 第 5/6 参数是圆角椭圆的【直径】，不是半径。
-            // 之前直接传 rWin，实际裁剪半径只有一半（5px vs 自绘 10px），
-            // 输入栏顶角的描边弧被拦腰切断，角上露出背景方角 —— 左上/右上角发脏。
+            // CreateRoundRectRgn 第 5/6 参数是圆角椭圆的【直径】，不是半径，
+            // 所以这里传 rWin*2 才得到 rWin 的实际裁剪半径。
             HRGN hWinRgn = CreateRoundRectRgn(0, 0, W + 1, H + 1, rWin * 2, rWin * 2);
             if (hWinRgn) {
                 savedClip = SaveDC(mem);
@@ -4674,380 +4691,190 @@ static void Paint(HDC hdc) {
         for (auto& b : starB) DeleteObject(b);
     }
 
-    // 分层面板：输入区（通宽玻璃片）+ 结果卡片（内缩圆角块）
-    // iOS 内嵌分组列表逻辑：两片玻璃之间留一段呼吸位（kBaseCardGapTop）。
-    // 之前卡片紧贴输入栏底边，输入栏的底圆角与卡片的顶圆角叠在一起，
-    // 左上角糊出一块方角暗斑——现在拉开间距，两道圆弧各自干净。
+    // ================= Raycast 风格主窗 =================
+    // 结构：窗口内一枚【独立圆角搜索框】+ 下方【结果列表直接铺在玻璃上】（无独立卡片）。
+    // 每行：大 squircle 图标 + 标题/副标题上下双行；选中项 = 通栏纯色胶囊。
+    // 搜索框底边 = inputH，列表顶边 rowsTop = inputH + gapTop（命中测试/Layout 共用此等式）。
     const int rows = (std::min)((int)g.items.size(), (int)kMaxVisibleResults);
     const int gapTop = S(kBaseCardGapTop);
-    const int rowsTop = inputH + gapTop;           // 第一行顶边
-    const int rowsBottom = rowsTop + rows * rowH;  // 最后一行底边
-    RECT cardR{S(kBasePad), rowsTop, W - S(kBasePad), rowsBottom + S(kBaseCardPadBottom)};
-    // 兜底：卡片底边不得越过窗口底缘（正常由 Layout 按同一公式给足高度）
-    if (cardR.bottom > H - S(2)) cardR.bottom = H - S(2);
-    int cardRad = 0;
-    HRGN hCardRgn = nullptr;
-    // 输入栏底色采样（绝对像素坐标）：输入栏填充与顶部强调条共用同一函数。
-    // 之前强调条自己猜了一份「输入栏底色」，坐标换算错了——渐隐归零时回到的
-    // 是纯 bgInput，而周围输入栏还叠着顶缘提亮 + 环境光，两端就裂出一道接缝。
-    // 共用后渐隐精确化进输入栏真实底色，接缝消失。
-    auto inputColorPx = [&](float px, float py) -> COLORREF {
-        float u = W > 1 ? px / (float)(W - 1) : 0.f;
-        float v = inputH > 1 ? py / (float)(inputH - 1) : 0.f;
-        COLORREF base = t.bgInput;
-        if (v < 0.14f) {
-            float k = 1.0f - v / 0.14f;
-            base = Blend(base, t.textTitle, (t.dark ? 0.12f : 0.30f) * k);
-        } else if (v > 0.84f) {
-            float k = (v - 0.84f) / 0.16f;
-            base = Darken(base, (int)((t.dark ? 13 : 8) * k + 0.5f));
-        }
-        // 环境光：以 (0.5, 0.40) 为中心的椭圆高斯衰减，边缘严格归零
-        float du = (u - 0.5f) / 0.66f, dv = (v - 0.40f) / 0.66f;
-        float d2 = du * du + dv * dv;
-        if (d2 < 1.0f) {
-            float fall = (1.0f - d2) * (1.0f - d2);  // 平滑二次衰减
-            base = Blend(base, t.accent2, (t.dark ? 0.16f : 0.11f) * fall);
-        }
-        return base;
-    };
+    const int rowsTop = inputH + gapTop;
+
+    // —— 独立搜索框（内嵌圆角矩形，四周留白 pad）——
     {
-        RECT inR{0, 0, W, inputH};
-        // 输入栏占据窗口整个顶部，其顶边轮廓 = 窗口顶边轮廓：
-        // 圆角必须与窗口圆角同半径，否则角上留出方角缝隙、强调条看起来溢出。
-        const int ri = S(t.radiusWindow);
-        // 手机系统搜索栏质感（HyperOS/iOS 控制中心参考）：
-        // ① 顶部内缘柔光 → 中段本色 → 底部微暗（玻璃厚度）；
-        // ② 中上部一团 accent 环境光（椭圆径向衰减），像控制中心那块「被光照亮的玻璃」。
-        FillRoundRectAA(mem, inR, ri, [&](float u, float v) -> COLORREF {
-            return inputColorPx(u * (float)(W - 1), v * (float)(inputH - 1));
-        });
-        PaintInsetShadow(mem, inR, ri, t.bgInput);
-        // 边缘发丝：整圈 1px 内描边（上缘偏亮、下缘偏暗做不到逐段，取中性微亮），
-        // 手机玻璃片的「厚度线」——细看有边界、粗看无感。
-        // 描边整圈内缩 1px：DWM 在 (0,0)-(W,H) 上按系统圆角裁窗口，描边若画在
-        // 矩形最外沿，左上/右上角会被 DWM 的圆角切掉一截，露出断点。往里收 1px
-        // 后整圈描边完整落在 DWM 裁剪区内，角上是一条连到底的干净弧线。
-        RECT strokeR{inR.left + 1, inR.top + 1, inR.right - 1, inR.bottom - 1};
-        StrokeRoundRectAA(mem, strokeR, ri - 1,
-                          Blend(t.bgInput, t.textTitle, t.dark ? 0.10f : 0.26f), 1);
-        if (cardR.bottom > cardR.top && cardR.right > cardR.left) {
-            cardRad = S(t.radiusCard);
-            PaintOutShadow(mem, cardR, cardRad, S(t.shCardX), S(t.shCardY), S(t.shCardBlur), t.shCardA, t.shCardColor);
-            FillRoundRectAA(mem, cardR, cardRad, [&](float, float) -> COLORREF { return t.bgCard; });
-            PaintInsetShadow(mem, cardR, cardRad, t.bgCard);
-            // 手机卡片细节：整圈 1px 玻璃描边（iOS 列表卡片的 hairline edge），
-            // 让卡片从背景里「立」出来而不只是色块差
-            StrokeRoundRectAA(mem, cardR, cardRad,
-                              Blend(t.bgCard, t.textTitle, t.dark ? 0.09f : 0.22f), 1);
-            // 裁剪区：热行染色（方角矩形）不许溢出卡片圆角
-            hCardRgn = CreateRoundRectRgn(cardR.left, cardR.top, cardR.right, cardR.bottom,
-                                          cardRad * 2, cardRad * 2);
-        }
-    }
-    // 顶部强调色条：横向三段渐变（两端 accent2 → 中段 accent）+ 两端渐隐收口。
-    // 两端按 smoothstep 化进【输入栏真实底色】（与输入栏填充同一采样函数），
-    // 渐隐归零处颜色连续，读起来是光线扫过而不是被刀切断。
-    if (t.accentStrip) {
-        int barH = S(4);
-        // 强调条必须内缩出圆角区：条若顶到窗口圆角，会和圆框描边糊成一个
-        // 「蓝色钩子」，视觉上就是蓝线溢出圆框。内缩后角上只剩干净的圆框弧线。
-        int inset = S(t.radiusWindow) + S(5);
-        RECT ar{inset, 0, W - inset, barH};
-        const float fade = (float)S(46);   // 两端渐隐长度（像素）
-        const float span = (float)(ar.right - ar.left);
-        FillRoundRectAA(mem, ar, barH / 2, [&](float u, float v) -> COLORREF {
-            float k = u < 0.5f ? (u * 2) : ((1 - u) * 2);  // 0→1→0
-            COLORREF strip = Blend(t.accent2, t.accent, k);
-            // 渐隐：两端 alpha 归零并 smoothstep 化开，末端不再有垂直切口
-            float dL = u * span, dR = span - u * span;
-            float a = 1.f;
-            if (dL < fade) a = dL / fade;
-            if (dR < fade) a = (std::min)(a, dR / fade);
-            a = a * a * (3.f - 2.f * a);
-            // 背板 = 该像素处输入栏的真实颜色（顶缘提亮 + 环境光都在内）。
-            // 渐隐到 a=0 时返回的就是这个色，于是与紧邻的输入栏严丝合缝。
-            float px = (float)ar.left + u * span;
-            float py = (float)ar.top + v * (float)barH;
-            COLORREF back = inputColorPx(px, py);
-            if (a <= 0.001f) return back;
-            return Blend(back, strip, a);
-        });
-        // 柔光过渡：色条正下方 2px，accent2 低 alpha 渐隐回输入栏真实底色。
-        // 之前底用窗口背景 t.bg，而蓝条实际压在输入栏玻璃上（bgInput + 提亮 + 环境光），
-        // 底色不符 → 柔光带比周围更暗，反而多出一条脏横线。改为逐像素采样输入栏底色。
-        RECT glow{inset, barH, W - inset, barH + S(2)};
-        FillRoundRectAA(mem, glow, (glow.bottom - glow.top) / 2,
-                        [&](float u, float v) -> COLORREF {
-            float gw = (float)(glow.right - glow.left);
-            float dL = u * gw, dR = gw - dL;
-            float ah = 1.f;
-            if (dL < fade) ah = dL / fade;
-            if (dR < fade) ah = (std::min)(ah, dR / fade);
-            ah = ah * ah * (3.f - 2.f * ah);
-            float a = 0.22f * (1.f - v) * ah;
-            float px = (float)glow.left + u * gw;
-            float py = (float)glow.top + v * (float)(glow.bottom - glow.top);
-            return Blend(inputColorPx(px, py), t.accent2, a);
-        });
-    }
-    // 角部辉光（低透明度装饰）：必须以左上角为圆心的径向衰减，边缘严格归零。
-    // 之前用 PaintDivider 画 (0,0,80,80) 的【方角矩形】，虽然外角被窗口圆角裁掉，
-    // 但在 x≈80 处留下一条垂直亮度台阶——左上圆角衔接看起来像糊了一块方斑；
-    // 且只有左上有、右上没有，左右不对称。改成半椭圆高斯辉光后就没有任何边界。
-    if (t.cornerGlow) {
-        // 辉光严格限制在输入栏玻璃片内：矩形高度 = inputH，绝不越界叠到卡片上。
-        const int glowR = S(150);                 // 辉光横向覆盖
-        RECT gr{0, 0, glowR, inputH};
-        FillRoundRectAA(mem, gr, S(t.radiusWindow), [&](float u, float v) -> COLORREF {
-            // 椭圆径向衰减：d = 归一化椭圆距离，边缘 d→1 时 alpha→0
-            float dx = u * (float)glowR / (float)inputH;  // 横向拉长成椭圆
-            float d = std::sqrt(dx * dx + v * v) / 1.4142f;
-            float a = 1.0f - d;
-            // colAt 的 u/v 相对 gr 矩形，换算回绝对像素再采样输入栏底色
-            float px = u * (float)glowR, py = v * (float)inputH;
-            if (a <= 0.f) return inputColorPx(px, py);  // 归零处与周围严丝合缝
-            a = a * a;  // 二次衰减，去掉线性尾巴
-            COLORREF base = inputColorPx(px, py);
-            return Blend(base, t.accent2, a * 0.10f);  // 峰值 10%，克制不抢眼
-        });
+        RECT sr{pad, pad, W - pad, inputH};
+        const int rs = S(kSearchRadius);
+        // 底色：比窗体玻璃略亮一点的实色，边缘一圈发丝描边，读起来是一枚「搜索片」
+        COLORREF searchBg = Blend(t.bgInput, t.textTitle, t.dark ? 0.06f : 0.04f);
+        FillRoundRectAA(mem, sr, rs, [&](float, float) -> COLORREF { return searchBg; });
+        StrokeRoundRectAA(mem, sr, rs,
+                          Blend(t.bgInput, t.textTitle, t.dark ? 0.16f : 0.24f), 1);
     }
 
     SetBkMode(mem, TRANSPARENT);
 
-    // 输入行
+    // —— 搜索框内的图标与输入文字 ——
+    // 文字起点在「放大镜 + 间距」之后，整体位于搜索框垂直中心。
     SelectObject(mem, g.fInput);
+    const int glyphSize = S(16);
+    const int searchMidY = pad + (inputH - pad) / 2;
+    const int textStartX = InputTextStartX();
     {
-        int textX = pad - g.scrollX;
-        RECT r{textX, 0, W + 4096, inputH};
+        RECT clip{pad, pad, W - pad, inputH};
         SaveDC(mem);
-        IntersectClipRect(mem, 0, 0, W, inputH);
-        // 选区矩形：在文本下方作为高亮底色
+        IntersectClipRect(mem, clip.left, clip.top, clip.right, clip.bottom);
+        // 选区底色
         if (g.selStart != g.selEnd) {
-            int x1 = pad - g.scrollX + SelectionStartWidth(mem);
-            int x2 = pad - g.scrollX + SelectionEndWidth(mem);
+            int x1 = textStartX - g.scrollX + SelectionStartWidth(mem);
+            int x2 = textStartX - g.scrollX + SelectionEndWidth(mem);
             if (x2 < x1) std::swap(x1, x2);
-            RECT sr{x1, inputH / 2 - S(13), x2, inputH / 2 + S(13)};
-            HBRUSH selTextBr = CreateSolidBrush(Blend(t.bgCard, t.accent, 0.35f));
-            FillRect(mem, &sr, selTextBr);
-            DeleteObject(selTextBr);
+            RECT sr2{x1, searchMidY - S(13), x2, searchMidY + S(13)};
+            HBRUSH sb = CreateSolidBrush(Blend(t.bgCard, t.accent, 0.35f));
+            FillRect(mem, &sr2, sb); DeleteObject(sb);
         }
         if (g.text.empty() && g.compText.empty()) {
-            // 空态：抗锯齿放大镜 + 一句人话，不再堆 f/d、bd/bili 等技术黑话
-            int gs = S(16);
-            PaintSearchGlyph(mem, pad, (inputH - gs) / 2, gs, Blend(t.textDis, t.accent2, 0.35f));
-            RECT hr{pad + gs + S(9), 0, W + 4096, inputH};
+            PaintSearchGlyph(mem, pad + S(14), searchMidY - glyphSize / 2,
+                             glyphSize, Blend(t.textDis, t.accent2, 0.35f));
+            RECT hr{textStartX, pad, W + 4096, inputH};
             SetTextColor(mem, t.textDis);
             DrawTextW(mem, L"搜索程序 · 文件 · 网页", -1, &hr,
                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         } else {
+            PaintSearchGlyph(mem, pad + S(14), searchMidY - glyphSize / 2,
+                             glyphSize, Blend(t.textDis, t.accent2, 0.35f));
+            RECT r{textStartX - g.scrollX, pad, W + 4096, inputH};
             SetTextColor(mem, t.textBody);
             DrawTextW(mem, g.text.c_str(), (int)g.text.size(), &r,
                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         }
-        // 内联渲染 IME 组合串（未上屏临时文字）：跟在光标后，浅灰字 + 下划线
         if (!g.compText.empty()) {
-            int cx = pad - g.scrollX + CaretTextWidth(mem);
+            int cx = textStartX - g.scrollX + CaretTextWidth(mem);
             SetTextColor(mem, t.textSec);
-            RECT cr{cx, 0, W + 4096, inputH};
+            RECT cr{cx, pad, W + 4096, inputH};
             DrawTextW(mem, g.compText.c_str(), (int)g.compText.size(), &cr,
                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
             SIZE csz{};
             GetTextExtentPoint32W(mem, g.compText.c_str(), (int)g.compText.size(), &csz);
-            RECT ur{cx, inputH / 2 + S(13), cx + csz.cx, inputH / 2 + S(15)};
+            RECT ur{cx, searchMidY + S(13), cx + csz.cx, searchMidY + S(15)};
             FillRect(mem, &ur, g.brDivider);
         }
         RestoreDC(mem, -1);
     }
-    // 光标
     if (g.caretOn && GetFocus() == g.hwnd) {
-        int cx = pad + CaretTextWidth(mem) - g.scrollX;
-        RECT cr{cx, inputH / 2 - S(13), cx + S(2), inputH / 2 + S(13)};
+        int cx = textStartX + CaretTextWidth(mem) - g.scrollX;
+        RECT cr{cx, searchMidY - S(13), cx + S(2), searchMidY + S(13)};
         HBRUSH carBr = CreateSolidBrush(t.textBody);
-        FillRect(mem, &cr, carBr);
-        DeleteObject(carBr);
+        FillRect(mem, &cr, carBr); DeleteObject(carBr);
     }
-    // 输入栏与结果卡之间不再画分隔线：两张玻璃片相接处的 hairline 就是天然边界（iOS 分层逻辑）
 
-    // 结果列表
+    // —— 结果列表：直接铺在玻璃上，无独立卡片 ——
     SelectObject(mem, g.fList);
-    const int kSelPillR = S(5);   // 选中高亮圆角：收一档，贴近卡片圆角、不显臃肿
-    const int kSelInset = S(2);   // 高亮几乎贴卡片左右缘，只留 2px 避开卡片描边
-    // 行内容左内边距：图标托盘必须整块落在高亮胶囊的左圆角之内，
-    // 否则白色图标盒会压在高亮左圆角上、把圆角啃出一个缺口（放大看非常明显）。
-    // 从 13 收到 9：图标不再远远缩在卡片里，紧跟高亮左缘。
-    const int kContentPad = S(9);
-    auto selRect = [&](const RECT& cardRow, int y) {
-        return RECT{cardRow.left + kSelInset, y, cardRow.right - kSelInset, y + rowH};
-    };
+    const COLORREF selFill = RGB(46, 124, 124);  // 通栏选中胶囊：Raycast teal
+    const COLORREF selText = t.dark ? RGB(255, 255, 255) : RGB(255, 255, 255);
+    const COLORREF subOnSel = Blend(selText, selFill, 0.42f);  // 选中行副标题：淡一档
+    const int listL = pad, listR = W - pad;
+    const int iconX = listL + S(kIconGapL);
+    const int textX = iconX + S(kIconSize) + S(kIconTextGap);
+    const int badgeRight = listR - S(kBadgeGapR);
+    const int badgeW = S(kBadgeW), badgeH = S(kBadgeH);
     for (int i = 0; i < rows; ++i) {
         Row& row = g.items[i];
         int y = rowsTop + i * rowH;
         const int tier = (row.kind == Row::Prog || row.kind == Row::File || row.kind == Row::Folder)
                              ? UsageTier(row.usage) : 0;
         const bool hot = tier >= 2;
-        const float heat = UsageHeat(row.usage);
-        // 浅色主题把热度映射成「更深的墨色」保证对比；深色主题映射成「更纯的强调色」
-        const COLORREF titleBase = tier >= 4 ? (t.dark ? t.accent2 : Darken(t.accent, 25)) : t.accent;
-        const float titleMix = t.dark ? (0.42f - 0.34f * heat) : (0.30f + 0.40f * heat);
-        const COLORREF hotTitle = Blend(titleBase, t.textBody, titleMix);
-        const COLORREF rowBase = hot ? Blend(t.bgCard, t.accent, 0.04f + 0.14f * heat) : t.bgCard;
-        // 染色/选中叠色只落在卡片横向范围内：边距留给窗体底与卡片外影，
-        // 整行铺满会把浅色主题右侧/底部的软影切出缺口
-        RECT cardRow{S(kBasePad), y, W - S(kBasePad), y + rowH};
-        if (hot && i != g.sel) {
-            // iOS 染色只落在卡片圆角内：方角 FillRect 经裁剪区约束，不越过卡片圆角
-            SaveDC(mem);
-            if (hCardRgn) ExtSelectClipRgn(mem, hCardRgn, RGN_AND);
-            HBRUSH hb = CreateSolidBrush(rowBase);
-            FillRect(mem, &cardRow, hb);
-            DeleteObject(hb);
-            RestoreDC(mem, -1);
+        const bool isSel = (i == g.sel);
+
+        // 选中态：通栏纯色胶囊（左右到列表边界，圆角 kSelRadius）
+        if (isSel) {
+            RECT pill{listL, y, listR, y + rowH};
+            FillRoundRectAA(mem, pill, S(kSelRadius),
+                            [&](float, float) -> COLORREF { return selFill; });
+        } else if (i == g.hoverRow && g.hoverT > 0.001f) {
+            RECT pill{listL, y, listR, y + rowH};
+            COLORREF hoverBg = Blend(t.bgCard, t.accent2, (float)(0.10 + 0.12 * g.hoverT));
+            FillRoundRectAA(mem, pill, S(kSelRadius),
+                            [&](float, float) -> COLORREF { return hoverBg; });
         }
-        if (i == g.sel) {
-            // iOS 内嵌列表选中态：卡片内适度圆角高亮，左右内缩留出呼吸感。
-            // 渐变全程平滑（二次衰减），无任何阈值台阶——上一版的顶缘高光带/底缘
-            // 硬 lip 就是横向色带断层感的来源，全部去掉。
-            RECT pill = selRect(cardRow, y);
-            FillRoundRectAA(mem, pill, kSelPillR, [&](float u, float v) -> COLORREF {
-                // 横向：左端 accent 浓、向右二次衰减（平滑，无渐隐硬边）
-                COLORREF base = Blend(t.selBg, t.accent, 0.34f * (1.0f - u) * (1.0f - u) + 0.12f);
-                if (i == g.hoverRow && g.hoverT > 0.001)
-                    base = Blend(base, t.accent2, (float)(0.14 * g.hoverT));
-                // 纵向：顶部极轻的柔光随高度平方衰减，读起来有体积感但不成「带」
-                float glow = (1.0f - v); glow *= glow;
-                base = Blend(base, t.textTitle, (t.dark ? 0.10f : 0.14f) * glow);
+
+        // 大 squircle 图标：真实 HICON 直接画，外加一层圆角底托（无图标时也显示占位）
+        {
+            int isz = S(kIconSize);
+            int iconTop = y + (rowH - isz) / 2;
+            RECT well{iconX, iconTop, iconX + isz, iconTop + isz};
+            HICON rowIcon = nullptr;
+            if (row.kind == Row::Prog && row.prog) {
+                rowIcon = GetProgramIcon(row.prog);
+            } else if ((row.kind == Row::File || row.kind == Row::Folder ||
+                        row.kind == Row::Reveal) && !row.action.empty()) {
+                rowIcon = GetPathIcon(row.action);
+            }
+            // 底托：无图标时是有层次的圆角块，有图标时作为 HICON 的衬底
+            COLORREF wellBase = Blend(t.bgCard, t.accent2, t.dark ? 0.20f : 0.12f);
+            FillRoundRectAA(mem, well, S(kIconRadius), [&](float, float v) -> COLORREF {
+                COLORREF base = wellBase;
+                if (v < 0.22f) return Blend(base, t.textTitle,
+                                            (t.dark ? 0.16f : 0.22f) * (1 - v / 0.22f));
+                if (v > 0.84f) return Darken(base, (int)(12 * (v - 0.84f) / 0.16f + 0.5f));
                 return base;
             });
-        } else if (i == g.hoverRow) {
-            RECT pill = selRect(cardRow, y);
-            FillRoundRectAA(mem, pill, kSelPillR, [&](float, float) -> COLORREF {
-                return Blend(rowBase, t.accent2, (float)(0.10 + 0.12 * g.hoverT));
-            });
-        }
-        if (i == g.pressRow && i != g.sel) {
-            RECT pill = selRect(cardRow, y);
-            PaintInsetShadow(mem, pill, kSelPillR, rowBase);
-        }
-        // 档位不再画左侧色条：那条色条画在卡片左缘之外（x=S(2) < pad），
-        // 是一枚漂在窗体背景上的孤立小色块，看着就是「溢出」。
-        // 档位信息由行上的徽章（常用/高频/重度 ×N）+ 染色 + 标题字色完整表达。
-        int x = cardRow.left + kContentPad;
-        int iconTop = y + (rowH - S(24)) / 2;
-        HICON rowIcon = nullptr;
-        if (row.kind == Row::Prog && row.prog) {
-            rowIcon = GetProgramIcon(row.prog);
-        } else if ((row.kind == Row::File || row.kind == Row::Folder ||
-                    row.kind == Row::Reveal) &&
-                   !row.action.empty()) {
-            // 文件/文件夹行（自学习置顶项、索引 结果、粘贴路径直达项均属此类）：
-            // 按路径经 shell 取图标并缓存，与程序行保持同一直视对齐
-            rowIcon = GetPathIcon(row.action);
-        }
-        // 玻璃质感图标托盘：圆角半透明底板 + 顶部高光，让图标不再是「裸贴在灰底上的白方块」。
-        // 垂直从 y+S(4) 起（图标在 y+S(5)），避开测试在 (pad+2, rowY+2) 的行染色采样点。
-        if (rowIcon) {
-            RECT well{x - S(1), y + S(4), x + S(25), y + S(4) + S(26)};
-            FillRoundRectAA(mem, well, S(8), [&](float, float v) -> COLORREF {
-                COLORREF base = Blend(t.bgCard, t.accent2, t.dark ? 0.22f : 0.14f);
-                if (v < 0.22f) return Blend(base, t.textTitle, (t.dark ? 0.16f : 0.22f) * (1 - v / 0.22f));
-                if (v > 0.84f) return Darken(base, (int)(10 * (v - 0.84f) / 0.16f + 0.5f));  // 底部渐暗，连续无台阶
-                return base;
-            });
-            DrawIconEx(mem, x, iconTop, rowIcon, S(24), S(24), 0, nullptr, DI_NORMAL);
-        }
-        x += S(24) + S(8);
-
-        // 快捷键提示：扁平描边键帽。去掉顶部高光 / 底部 lip——那层塑料凸起是
-        // 一整列小按钮的「廉价感」来源。保留 1px 轮廓让键位仍可辨认。
-        SelectObject(mem, g.fList);  // 徽章固定常规字重（上一行可能是常用加粗行）
-        int hkReserved = 0;
-        WCHAR hk = HotkeyChar(i);
-        // 快捷键徽章右缘离卡片边缘 S(4)：贴死边缘会显得憋屈
-        const int kBadgeRight = W - pad - S(4);
-        if (hk) {
-            int bw = S(18), bh = S(18);
-            RECT br{kBadgeRight - bw, y + (rowH - bh) / 2, kBadgeRight, y + (rowH - bh) / 2 + bh};
-            COLORREF keyBg = i == g.sel ? Blend(t.selBg, t.accent, 0.30f)
-                                        : Blend(t.bgCard, t.accent2, 0.07f);
-            FillRoundRectAA(mem, br, S(5), [&](float, float) -> COLORREF { return keyBg; });
-            StrokeRoundRectAA(mem, br, S(5),
-                              Blend(t.bgCard, t.textSec, t.dark ? 0.42f : 0.50f), 1);
-            SetBkMode(mem, TRANSPARENT);
-            SetTextColor(mem, i == g.sel ? t.textTitle : t.textSec);
-            DrawTextW(mem, &hk, 1, &br, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-            hkReserved = bw + S(6);
+            if (rowIcon)
+                DrawIconEx(mem, iconX + S(2), iconTop + S(2), rowIcon,
+                           isz - S(4), isz - S(4), 0, nullptr, DI_NORMAL);
         }
 
-        // 档位徽章：只留档名（重度额外带 ×N；次数是重度唯一有信息增量的数字）。
-        // 去掉左侧小圆点与垂直高光/lip；常用档靠染色 + 加粗表达，不再塞「常用 ×4」。
-        int hotReserved = 0;
-        if (hot) {
-            const WCHAR* lab = tier >= 4 ? L"重度" : tier == 3 ? L"高频" : L"常用";
-            std::wstring tag = tier >= 4 ? std::wstring(lab) + L" ×" + std::to_wstring(row.usage)
-                                         : std::wstring(lab);
-            SelectObject(mem, g.fontPool[FontSlot(kFontMin)]);
-            SIZE ts{};
-            GetTextExtentPoint32W(mem, tag.c_str(), (int)tag.size(), &ts);
-            int bw = S(9) + ts.cx + S(9), bh = S(17);
-            int bx = kBadgeRight - hkReserved - bw;
-            RECT br{bx, y + (rowH - bh) / 2, bx + bw, y + (rowH - bh) / 2 + bh};
-            COLORREF badgeBg = tier >= 4 ? t.accent
-                             : Blend(t.bgCard, t.accent, tier == 3 ? 0.32f : 0.20f);
-            FillRoundRectAA(mem, br, bh / 2, [&](float, float) -> COLORREF { return badgeBg; });
-            SetTextColor(mem, tier >= 4 ? t.bgCard : hotTitle);
-            RECT tr2{br.left + S(9), br.top, br.right - S(9), br.bottom};
-            DrawTextW(mem, tag.c_str(), (int)tag.size(), &tr2,
-                      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-            hotReserved = bw + S(6);
-        }
-
-        // 标题（常用行：加粗 + 强调色向正文色靠拢，热度越高越纯；深/浅主题都保持可读对比）
-        SelectObject(mem, hot && g.fListHot ? g.fListHot : g.fList);
-        SIZE tsz{};
-        GetTextExtentPoint32W(mem, row.title.c_str(), (int)row.title.size(), &tsz);
-        const int trailingRight = W - pad - hkReserved - hotReserved - S(8);
-        int titleRoom = trailingRight - x - S(8);
-        if (titleRoom < S(40)) titleRoom = S(40);
-        RECT tr{x, y, x + (std::min)((int)tsz.cx, titleRoom) + S(2), y + rowH};
-        if (tier >= 4) {
-            // 重度档：字后罩一层低 alpha 圆角辉光，把最高档从普通加粗里托出来
-            RECT hr{tr.left, tr.top, (std::min)(tr.right, tr.left + tsz.cx + S(4)), tr.bottom};
-            PaintOutShadow(mem, hr, S(4), 0, 0, 0, 26, t.accent2);
-        }
-        SetTextColor(mem, row.kind == Row::Hint ? t.textDis : hot ? hotTitle : t.textBody);
+        // 标题（上） + 副标题（下）：Raycast 双行信息层级
+        const int titleRoomMax = badgeRight - badgeW - S(10) - textX;
+        SelectObject(mem, g.fList);
+        int yTitle = y + rowH / 2 - S(9);
+        int ySub = y + rowH / 2 + S(9);
+        // 标题：hot 行加粗并向正文色靠拢；选中行纯白
+        HFONT hTitle = (!isSel && hot && g.fListHot) ? g.fListHot : g.fList;
+        HFONT hOldTitle = (HFONT)SelectObject(mem, hTitle);
+        COLORREF titleCol = isSel ? selText
+                          : (row.kind == Row::Hint ? t.textDis
+                             : hot ? Blend(t.accent2, t.textBody, 0.42f - 0.34f * UsageHeat(row.usage))
+                                   : t.textBody);
+        SetTextColor(mem, titleCol);
+        // 标题绘制在上半区（22px 高的矩形，垂直居中于 yTitle）
+        RECT tr{textX, yTitle - S(11), textX + titleRoomMax, yTitle + S(11)};
         DrawTextW(mem, row.title.c_str(), (int)row.title.size(), &tr,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-
-        // 副标题：小一号浅灰字，紧跟标题尾部——不再甩到行尾占掉半屏。
-        // 标题优先：放不下就整条不画，留白比堆字高级。
+        SelectObject(mem, hOldTitle);
         if (!row.sub.empty()) {
-            int sx = tr.right + S(9);
-            int avail = trailingRight - sx;
-            if (avail > S(28)) {
-                HFONT hOld = (HFONT)SelectObject(
-                    mem, g.fontPool[FontSlot((g.theme ? g.theme->fontList : 15) - 1)]);
-                SIZE sz{};
-                GetTextExtentPoint32W(mem, row.sub.c_str(), (int)row.sub.size(), &sz);
-                RECT sr{sx, y, sx + (std::min)((int)sz.cx, avail), y + rowH};
-                SetTextColor(mem, t.textSec);
-                DrawTextW(mem, row.sub.c_str(), (int)row.sub.size(), &sr,
-                          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-                SelectObject(mem, hOld);
-            }
+            HFONT hOldSub = (HFONT)SelectObject(
+                mem, g.fontPool[FontSlot((g.theme ? g.theme->fontList : 15) - 1)]);
+            SetTextColor(mem, isSel ? subOnSel : t.textSec);
+            RECT sr{textX, ySub - S(9), textX + titleRoomMax, ySub + S(9)};
+            DrawTextW(mem, row.sub.c_str(), (int)row.sub.size(), &sr,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+            SelectObject(mem, hOldSub);
         }
 
-        // 行间发丝分隔线（iOS 设置列表细节）：从文字起点起画、右端给键帽让位，
-        // 选中行上下两段都跳过——让选中态保持完整一块。1px、极低对比，只提供「行有边界」的暗示。
-        if (i + 1 < rows && i != g.sel && i + 1 != g.sel) {
-            int sy = y + rowH - 1;
-            RECT sep{x, sy, W - pad - S(30), sy + 1};
-            HBRUSH sb = CreateSolidBrush(Blend(t.bgCard, t.textSec, t.dark ? 0.06f : 0.09f));
-            FillRect(mem, &sep, sb);
-            DeleteObject(sb);
+        // 快捷键键帽：几何 ⌘（四爪 + 中心）+ 数字。不用 U+2318 字符（Windows 缺字变方框）。
+        WCHAR hk = HotkeyChar(i);
+        if (hk) {
+            RECT br{badgeRight - badgeW, y + (rowH - badgeH) / 2, badgeRight, y + (rowH - badgeH) / 2 + badgeH};
+            COLORREF keyBg = isSel ? Blend(selFill, RGB(0, 0, 0), 0.18f)
+                                   : Blend(t.bgCard, t.accent2, 0.10f);
+            const int kr = S(kBadgeR);
+            FillRoundRectAA(mem, br, kr, [&](float, float) -> COLORREF { return keyBg; });
+            StrokeRoundRectAA(mem, br, kr, isSel ? subOnSel : t.textSec, 1);
+            COLORREF gc = isSel ? selText : t.textSec;
+            int ccx = br.left + S(9), ccy = (br.top + br.bottom) / 2;
+            HBRUSH gb = CreateSolidBrush(gc);
+            RECT gh{ccx - S(4), ccy - S(1), ccx + S(4), ccy + S(1)}; FillRect(mem, &gh, gb);
+            RECT gv{ccx - S(1), ccy - S(4), ccx + S(1), ccy + S(4)}; FillRect(mem, &gv, gb);
+            for (int dx : {-4, 4}) for (int dy : {-4, 4}) {
+                RECT gp{ccx + S(dx) - S(1), ccy + S(dy) - S(1),
+                        ccx + S(dx) + S(1), ccy + S(dy) + S(1)};
+                FillRect(mem, &gp, gb);
+            }
+            DeleteObject(gb);
+            RECT nr{br.right - S(12), br.top, br.right - S(2), br.bottom};
+            SetTextColor(mem, gc);
+            DrawTextW(mem, &hk, 1, &nr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         }
     }
-    if (hCardRgn) DeleteObject(hCardRgn);
     // 耗时底栏：非秒出才出现。pending 实时跳毫秒 + 还在等哪层；报齐后定格总耗时 + 首屏延迟。
     {
         int fm = 0; bool fl = false;
@@ -5078,7 +4905,7 @@ static void Paint(HDC hdc) {
     // 描边（DWM 边框不可用时回退 GDI 抗锯齿圆角描边）
     if (!g.dwmBorderOk) {
         RECT fr{0, 0, W, H};
-        StrokeRoundRectAA(mem, fr, S(t.radiusWindow), t.border, t.borderWidth);
+        StrokeRoundRectAA(mem, fr, S(kWinRadius), t.border, t.borderWidth);
     }
 
     BitBlt(hdc, 0, 0, W, H, mem, 0, 0, SRCCOPY);
