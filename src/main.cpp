@@ -4791,10 +4791,26 @@ static void Paint(HDC hdc) {
             return Blend(inputColorPx(px, py), t.accent2, a);
         });
     }
-    // 角部辉光（低透明度装饰）
+    // 角部辉光（低透明度装饰）：必须以左上角为圆心的径向衰减，边缘严格归零。
+    // 之前用 PaintDivider 画 (0,0,80,80) 的【方角矩形】，虽然外角被窗口圆角裁掉，
+    // 但在 x≈80 处留下一条垂直亮度台阶——左上圆角衔接看起来像糊了一块方斑；
+    // 且只有左上有、右上没有，左右不对称。改成半椭圆高斯辉光后就没有任何边界。
     if (t.cornerGlow) {
-        RECT gr0{0, 0, S(80), S(80)};
-        PaintDivider(mem, gr0, t.accent2, 16);
+        // 辉光严格限制在输入栏玻璃片内：矩形高度 = inputH，绝不越界叠到卡片上。
+        const int glowR = S(150);                 // 辉光横向覆盖
+        RECT gr{0, 0, glowR, inputH};
+        FillRoundRectAA(mem, gr, S(t.radiusWindow), [&](float u, float v) -> COLORREF {
+            // 椭圆径向衰减：d = 归一化椭圆距离，边缘 d→1 时 alpha→0
+            float dx = u * (float)glowR / (float)inputH;  // 横向拉长成椭圆
+            float d = std::sqrt(dx * dx + v * v) / 1.4142f;
+            float a = 1.0f - d;
+            // colAt 的 u/v 相对 gr 矩形，换算回绝对像素再采样输入栏底色
+            float px = u * (float)glowR, py = v * (float)inputH;
+            if (a <= 0.f) return inputColorPx(px, py);  // 归零处与周围严丝合缝
+            a = a * a;  // 二次衰减，去掉线性尾巴
+            COLORREF base = inputColorPx(px, py);
+            return Blend(base, t.accent2, a * 0.10f);  // 峰值 10%，克制不抢眼
+        });
     }
 
     SetBkMode(mem, TRANSPARENT);
