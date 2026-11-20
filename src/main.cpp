@@ -3427,13 +3427,17 @@ static void ApplyGlass(HWND h) {
     if (!h) return;
     const Theme* t = g.theme;
     if (g.glassEnabled) {
-        // ① 分层窗口：整窗 alpha 只做极轻微透光（232/255≈91%），文字几乎无损——
-        // 真正的「毛玻璃感」来自 ② 的 DWM 模糊 + 高 tint 色调（手机系统 HyperOS 的做法：
-        // 深色高不透明度 tint 盖在模糊上，而不是把整窗内容一起淡化）。
+        // ① 分层窗口：整窗 alpha（208/255≈82%）让背后 DWM 模糊层透出——
+        // 壁纸透出量 = (1-整窗alpha) × (1-tint alpha)，与 ② 的模糊底色串联。
+        // 真正干净的「背景透 + 文字清晰分离」需 per-pixel alpha（UpdateLayeredWindow），
+        // 那是绘制链路大改；这里用 LWA_ALPHA + 低 tint 的折中，兼顾稳健与通透。
         LONG_PTR ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
         if (!(ex & WS_EX_LAYERED))
             SetWindowLongPtrW(h, GWL_EXSTYLE, ex | WS_EX_LAYERED);
-        const BYTE winAlpha = 232;
+        // 整窗 alpha 调低：让背后的 DWM 模糊壁纸透出更多。参考 Raycast：
+        // 深色玻璃 tint 盖在模糊壁纸上，壁纸仍明显可见。232→208 让透出从 ~9% 升到 ~18%。
+        // 文字/图标画在最上层，短时淡化可接受，换来的是通透的毛玻璃质感。
+        const BYTE winAlpha = 208;
         SetLayeredWindowAttributes(h, 0, winAlpha, LWA_ALPHA);
 
         // ② DWM 毛玻璃：动态解析未公开 API，给窗口背后的内容加模糊。
@@ -3443,10 +3447,12 @@ static void ApplyGlass(HWND h) {
             return u32 ? (PFN_SCA)GetProcAddress(u32, "SetWindowCompositionAttribute") : nullptr;
         }();
         if (pSCA) {
+            // tint 色取主题的 bg 再提一点蓝紫：毛玻璃染上一层冷色调，比纯黑通透。
             COLORREF c = t ? t->bg : RGB(12, 16, 48);
-            // GradientColor 是 0xAABBGGRR；0xC8≈78% 不透明 tint 盖住模糊，
-            // 背后只隐约透光——质感来自模糊与色调，而非整窗透明
-            DWORD grad = (DWORD)(0xC8u << 24) | ((DWORD)GetBValue(c) << 16) |
+            c = Blend(c, RGB(60, 90, 150), 0.28f);
+            // GradientColor 是 0xAABBGGRR；alpha 从 0xC8(78%) 降到 0x50(31%)，
+            // 让背后模糊壁纸明显透出——这是「真毛玻璃」和「不透明色块」的分水岭。
+            DWORD grad = (DWORD)(0x50u << 24) | ((DWORD)GetBValue(c) << 16) |
                          ((DWORD)GetGValue(c) << 8) | (DWORD)GetRValue(c);
             ACCENT_POLICY ap{ACCENT_ENABLE_ACRYLICBLURBEHIND, 0, grad, 0};
             WINDOWCOMPOSITIONATTRIBDATA d{WCA_ACCENT_POLICY, &ap, sizeof(ap)};
@@ -4699,15 +4705,28 @@ static void Paint(HDC hdc) {
     const int gapTop = S(kBaseCardGapTop);
     const int rowsTop = inputH + gapTop;
 
-    // —— 独立搜索框（内嵌圆角矩形，四周留白 pad）——
+    // —— 搜索区：无独立边框、无独立实心底，就是整窗玻璃的一部分 ——
+    // 参考 Raycast 2.0：搜索框没有描边方框，只在下方用一条极淡 hairline 与结果区分。
+    // 旧版画了「独立圆角实色块 + 亮描边」，空态下那圈边框浮在玻璃上非常突兀——
+    // 用户抱怨的「输入框边界特别难看，尤其没输入时」正是这枚假控件。
+    // 现在改成：一层比玻璃略亮的极淡提亮（焦点态暗示，读起来是一块可交互区而非控件），
+    // 边框完全删掉；分区交给下面那条几乎看不见的 hairline。
     {
         RECT sr{pad, pad, W - pad, inputH};
         const int rs = S(kSearchRadius);
-        // 底色：比窗体玻璃略亮一点的实色，边缘一圈发丝描边，读起来是一枚「搜索片」
-        COLORREF searchBg = Blend(t.bgInput, t.textTitle, t.dark ? 0.06f : 0.04f);
-        FillRoundRectAA(mem, sr, rs, [&](float, float) -> COLORREF { return searchBg; });
-        StrokeRoundRectAA(mem, sr, rs,
-                          Blend(t.bgInput, t.textTitle, t.dark ? 0.16f : 0.24f), 1);
+        // 「提亮」混进窗体底色，而不是混入 bgInput：再没有与周围玻璃割裂的实心色块。
+        COLORREF searchLift = Blend(t.bg, t.textTitle, t.dark ? 0.045f : 0.06f);
+        FillRoundRectAA(mem, sr, rs, [&](float, float) -> COLORREF { return searchLift; });
+    }
+    // 搜索区 / 结果区之间的极淡分隔线：只画在左右 pad 之间，取该处玻璃色微亮，
+    // 位于 gap 的垂直中点。它几乎不可见，只提供「这里分了两区」的暗示。
+    if (rows > 0) {
+        const int hy = inputH + S(kBaseCardGapTop) / 2;
+        COLORREF hair = Blend(t.bg, t.textSec, t.dark ? 0.07f : 0.10f);
+        HBRUSH hb = CreateSolidBrush(hair);
+        RECT hr{pad, hy, W - pad, hy + S(1)};
+        FillRect(mem, &hr, hb);
+        DeleteObject(hb);
     }
 
     SetBkMode(mem, TRANSPARENT);
@@ -4732,10 +4751,14 @@ static void Paint(HDC hdc) {
             FillRect(mem, &sr2, sb); DeleteObject(sb);
         }
         if (g.text.empty() && g.compText.empty()) {
+            // 空态：放大镜与占位文字都压淡、去掉蓝色偏色，安静地融进玻璃，
+            // 不再是一枚「有边框的输入控件里杵着个亮图标」。
+            COLORREF phGlyph = Blend(t.textDis, t.bg, 0.22f);
+            COLORREF phText = Blend(t.textDis, t.bg, 0.18f);
             PaintSearchGlyph(mem, pad + S(14), searchMidY - glyphSize / 2,
-                             glyphSize, Blend(t.textDis, t.accent2, 0.35f));
+                             glyphSize, phGlyph);
             RECT hr{textStartX, pad, W + 4096, inputH};
-            SetTextColor(mem, t.textDis);
+            SetTextColor(mem, phText);
             DrawTextW(mem, L"搜索程序 · 文件 · 网页", -1, &hr,
                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         } else {

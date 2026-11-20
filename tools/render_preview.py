@@ -7,7 +7,7 @@ flowtary 主窗离屏渲染器 —— 复刻 main.cpp Paint() 的几何/颜色/S
 """
 import sys, math
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 # ---------------- 布局参数（逻辑像素，与 main.cpp 同步） ----------------
 LAYOUT = dict(
@@ -17,6 +17,7 @@ LAYOUT = dict(
     winBottomPad=14,      # 列表底部到窗口底
     searchH=52,           # 搜索框高度
     searchRadius=12,      # 搜索框圆角
+    dividerH=1,           # 搜索区/结果区之间的极淡 hairline
     gapSearchList=14,     # 搜索框底 → 列表第一项顶
     rowH=54,              # 行高
     selRadius=11,         # 选中胶囊圆角
@@ -30,24 +31,28 @@ LAYOUT = dict(
 )
 
 THEME_NAME = sys.argv[1] if len(sys.argv) > 1 else 'obsidian'
+EMPTY = '--empty' in sys.argv   # 空态：只有搜索框，无结果列表
 THEMES = {
  'obsidian': dict(
-    dark=True, glass=(13,15,20), glassA=0.72,
-    text=(255,255,255), textSec=(136,150,176),
-    searchBg=(26,30,39), searchBorder=(58,68,85),
+    dark=True, glass=(14,17,24), glassA=0.62,
+    text=(255,255,255), textSec=(150,163,188),
+    searchBg=(30,35,45), searchBorder=(58,68,85),
     selFill=(46,124,124), selText=(255,255,255),
     badgeBg=(40,48,60), badgeBorder=(90,102,122), badgeText=(150,162,182),
     accent=(64,134,196), accent2=(94,162,224),
-    wall_top=(26,22,52), wall_bot=(10,14,30), wall_glow=[(0.15,0.12,(64,150,150)),(0.85,0.78,(96,64,150))],
+    # 壁纸：Windows 11 bloom 风格的蓝紫流动壁纸，毛玻璃透出用
+    wall_top=(18,30,62), wall_bot=(8,14,34),
+    wall_glow=[(0.28,0.30,(48,110,205)),(0.72,0.62,(30,60,150)),(0.55,0.15,(70,80,170))],
     fontList=15),
  'classic': dict(
-    dark=True, glass=(10,10,12), glassA=0.76,
-    text=(255,255,255), textSec=(150,150,150),
-    searchBg=(28,28,30), searchBorder=(70,70,72),
+    dark=True, glass=(12,12,15), glassA=0.66,
+    text=(255,255,255), textSec=(155,155,158),
+    searchBg=(30,30,33), searchBorder=(70,70,72),
     selFill=(46,124,124), selText=(255,255,255),
     badgeBg=(38,38,40), badgeBorder=(90,90,92), badgeText=(150,150,150),
     accent=(64,134,196), accent2=(94,162,224),
-    wall_top=(30,26,34), wall_bot=(8,10,16), wall_glow=[(0.2,0.15,(60,70,130)),(0.8,0.8,(100,50,90))],
+    wall_top=(22,28,48), wall_bot=(8,10,20),
+    wall_glow=[(0.25,0.35,(50,70,150)),(0.78,0.60,(90,45,120))],
     fontList=15),
 }
 T = THEMES[THEME_NAME]
@@ -129,22 +134,32 @@ def text(x, y, s, size, col, bold=False, anchor='lm', room=None):
 
 # ---------------- 壁纸 + 毛玻璃 ----------------
 def make_wallpaper():
-    yy = np.linspace(0, 1, H)[:, None, None]; xx = np.linspace(0, 1, W)[None, :, None]
+    # 一张比窗口大一圈的虚拟桌面壁纸（Windows 11 bloom 风格），之后裁窗口大小。
+    # 放大再模糊，模拟毛玻璃背后那层「被揉开的壁纸」。
+    m = 40
+    hh, ww = H + 2*m, W + 2*m
+    yy = np.linspace(0, 1, hh)[:, None, None]; xx = np.linspace(0, 1, ww)[None, :, None]
     base = np.asarray(T['wall_top'], float)[None, None, :] * (1 - yy) + np.asarray(T['wall_bot'], float)[None, None, :] * yy
-    base = np.broadcast_to(base, (H, W, 3)).copy()
+    base = np.broadcast_to(base, (hh, ww, 3)).copy()
+    # 斜向 bloom 光带
     for cx, cy, col in T['wall_glow']:
-        d2 = ((xx - cx) / 0.55) ** 2 + ((yy - cy) / 0.55) ** 2
-        a = np.clip(1 - d2, 0, None) ** 2 * 0.55
+        d2 = ((xx - cx) / 0.42) ** 2 + ((yy - cy) / 0.5) ** 2
+        a = np.clip(1 - d2, 0, None) ** 1.6 * 0.9
         base = base + (np.asarray(col, float) - base) * a
-    return np.clip(base, 0, 255)
+    im = Image.fromarray(np.clip(base, 0, 255).astype(np.uint8), 'RGB')
+    im = im.filter(ImageFilter.GaussianBlur(18))       # 毛玻璃核心：壁纸被模糊
+    return np.asarray(im.crop((m, m, m+W, m+H)), float)
 
 def apply_glass(wall):
-    # 窗口圆角外的壁纸压暗（失焦桌面），窗口内叠半透明深色玻璃
+    # 窗口圆角外 = 清晰壁纸压暗（失焦桌面）；窗口内 = 模糊壁纸透出 + 深色 tint
     dist, rad = _coverage(W, H, S(L['winRadius']))
     inside = (dist <= rad)[:, :, None]
-    outside = np.clip(wall * 0.42, 0, 255)
-    glass = wall * (1 - T['glassA']) + np.asarray(T['glass'], float) * T['glassA']
-    img[:] = np.where(inside, glass, outside)
+    outside = np.clip(wall * 0.38, 0, 255)
+    tint = np.asarray(T['glass'], float)
+    # 亚克力：壁纸透出占 (1-glassA)，tint 占 glassA，再叠一点壁纸色偏让质感通透
+    glass = wall * (1 - T['glassA']) + tint * T['glassA']
+    glass = glass + (wall - wall.mean()) * 0.10          # 保留一点壁纸的明暗起伏
+    img[:] = np.where(inside, np.clip(glass, 0, 255), outside)
 
 # ================= 绘制主界面 =================
 ROWS = [
@@ -196,43 +211,56 @@ def draw_icon(x, y, size, row):
 def render():
     global img, H
     pad = S(L['winPad']); searchH = S(L['searchH']); rowH = S(L['rowH'])
-    n = len(ROWS)
+    n = 0 if EMPTY else len(ROWS)
     rowsTop = pad + searchH + S(L['gapSearchList'])
-    H = rowsTop + n * rowH + S(L['winBottomPad'])
+    H = (pad + searchH + pad) if EMPTY else (rowsTop + n * rowH + S(L['winBottomPad']))
     img = np.zeros((H, W, 3), float)
     wall = make_wallpaper()
     apply_glass(wall)
 
-    # —— 独立搜索框 ——
+    # —— 搜索区：无独立边框、无独立实心底，就是玻璃的一部分 ——
+    # 参考图 Raycast：搜索框没有描边方框，只在下方用一条极淡 hairline 与结果区分。
+    # 焦点态给搜索区一层非常轻的提亮（比周围玻璃亮 3~4%），读起来是一块可交互区，
+    # 而不是一枚浮起来的实心控件——后者正是「空态边界特别难看」的根源。
     sr = (pad, pad, W - pad, pad + searchH)
+    lift = 0.045 if T['dark'] else 0.06
     fill_round_rect(sr, S(L['searchRadius']),
-                    lambda U, V: np.broadcast_to(np.asarray(T['searchBg'], float), (*U.shape, 3)))
-    stroke_round_rect(sr, S(L['searchRadius']), T['searchBorder'], 1)
-    # 放大镜图标
-    gx, gy, gs = pad + S(16), pad + (searchH - S(18)) // 2, S(18)
+                    lambda U, V: np.broadcast_to(
+                        np.asarray(blend(np.mean(img[max(0,int(sr[1])):int(sr[3]), int(sr[0])], axis=0), T['text'], lift), float),
+                        (*U.shape, 3)))
+    # 放大镜图标（空态更淡）
+    gx, gy, gs = pad + S(14), pad + (searchH - S(18)) // 2, S(18)
     ox, oy = gx + gs / 2, gy + gs / 2
     rr = gs * 0.3
+    gcol = blend(T['textSec'], T['glass'], 0.18) if EMPTY else T['textSec']
     for a in range(0, 360, 20):
         ra = math.radians(a)
         px, py = ox + rr * math.cos(ra), oy + rr * math.sin(ra)
-        fill_rect((px - 1, py - 1, px + 1, py + 1), T['textSec'])
-    fill_rect((ox + rr*0.7, oy + rr*0.7, ox + rr*1.25, oy + rr*1.25), T['textSec'])
-    tx = gx + gs + S(12)
-    text(tx, pad + searchH / 2, 'Safari', L['titleSize'], T['text'], anchor='lm')
-    # 光标
-    tw = font(L['titleSize']).getlength('Safari')
-    fill_rect((tx + tw + 1, pad + searchH/2 - S(11), tx + tw + 1 + S(2), pad + searchH/2 + S(11)), T['text'])
-    # 搜索框右侧小图标
-    rx = W - pad - S(26)
-    fill_round_rect((rx, pad + (searchH - S(22))//2, rx + S(22), pad + (searchH - S(22))//2 + S(22)), S(7),
-                    lambda U, V: np.broadcast_to(np.asarray((235,235,235), float), (*U.shape, 3)))
+        fill_rect((px - 1, py - 1, px + 1, py + 1), gcol)
+    fill_rect((ox + rr*0.7, oy + rr*0.7, ox + rr*1.25, oy + rr*1.25), gcol)
+    tx = gx + gs + S(10)
+    if EMPTY:
+        # 空态：克制的占位文案，和输入文字同字号，颜色更淡
+        text(tx, pad + searchH / 2, '搜索程序 · 文件 · 网页', L['titleSize'],
+             blend(T['textSec'], T['glass'], 0.22), anchor='lm')
+    else:
+        text(tx, pad + searchH / 2, 'Safari', L['titleSize'], T['text'], anchor='lm')
+        # 光标
+        tw = font(L['titleSize']).getlength('Safari')
+        fill_rect((tx + tw + 1, pad + searchH/2 - S(11), tx + tw + 1 + S(2), pad + searchH/2 + S(11)), T['text'])
+    # 搜索区与结果区之间的极淡 hairline（参考图那条几乎看不见的分隔线）。
+    # 只画在左右 pad 之间、垂直居中于 gap，比整幅提亮还淡，仅暗示「分了两区」。
+    if not EMPTY:
+        hy = pad + searchH + S(L['gapSearchList']) // 2
+        hair = blend(np.mean(img[hy-1:hy+1, pad:W-pad], axis=(0,1)), T['text'], 0.06)
+        fill_rect((pad, hy, W - pad, hy + S(L['dividerH'])), hair)
 
     # —— 结果行（直接铺在玻璃上，无卡片）——
     listL = pad + S(L['selPadX']); listR = W - pad - S(L['selPadX'])
     iconX = listL + S(L['iconGapL'])
     textX = iconX + S(L['iconSize']) + S(L['iconTextGap'])
     badgeRight = listR - S(L['badgeGapR'])
-    for i, row in enumerate(ROWS):
+    for i, row in enumerate([] if EMPTY else ROWS):
         y = rowsTop + i * rowH
         if i == SEL:
             pill = (listL, y, listR, y + rowH)
@@ -270,9 +298,7 @@ def render():
 
 if __name__ == '__main__':
     im = render()
-    base = f'C:/Users/ted/Desktop/flowtary/tools/preview_{THEME_NAME}'
+    suffix = '_empty' if EMPTY else ''
+    base = f'C:/Users/ted/Desktop/flowtary/tools/preview_{THEME_NAME}{suffix}'
     im.save(base + '.png')
-    def z(box, s=6):
-        c = im.crop(box); return c.resize((c.width*s, c.height*s), Image.NEAREST)
-    z((0, 0, 46, 46), 6).save(base + '_tl.png')
     print('saved', base + '.png', im.size)
