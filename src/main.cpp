@@ -4649,7 +4649,10 @@ static void Paint(HDC hdc) {
     {
         int rWin = S(t.radiusWindow);
         if (rWin > 1) {
-            HRGN hWinRgn = CreateRoundRectRgn(0, 0, W + 1, H + 1, rWin, rWin);
+            // CreateRoundRectRgn 第 5/6 参数是圆角椭圆的【直径】，不是半径。
+            // 之前直接传 rWin，实际裁剪半径只有一半（5px vs 自绘 10px），
+            // 输入栏顶角的描边弧被拦腰切断，角上露出背景方角 —— 左上/右上角发脏。
+            HRGN hWinRgn = CreateRoundRectRgn(0, 0, W + 1, H + 1, rWin * 2, rWin * 2);
             if (hWinRgn) {
                 savedClip = SaveDC(mem);
                 ExtSelectClipRgn(mem, hWinRgn, RGN_COPY);
@@ -4685,6 +4688,30 @@ static void Paint(HDC hdc) {
     if (cardR.bottom > H - S(2)) cardR.bottom = H - S(2);
     int cardRad = 0;
     HRGN hCardRgn = nullptr;
+    // 输入栏底色采样（绝对像素坐标）：输入栏填充与顶部强调条共用同一函数。
+    // 之前强调条自己猜了一份「输入栏底色」，坐标换算错了——渐隐归零时回到的
+    // 是纯 bgInput，而周围输入栏还叠着顶缘提亮 + 环境光，两端就裂出一道接缝。
+    // 共用后渐隐精确化进输入栏真实底色，接缝消失。
+    auto inputColorPx = [&](float px, float py) -> COLORREF {
+        float u = W > 1 ? px / (float)(W - 1) : 0.f;
+        float v = inputH > 1 ? py / (float)(inputH - 1) : 0.f;
+        COLORREF base = t.bgInput;
+        if (v < 0.14f) {
+            float k = 1.0f - v / 0.14f;
+            base = Blend(base, t.textTitle, (t.dark ? 0.12f : 0.30f) * k);
+        } else if (v > 0.84f) {
+            float k = (v - 0.84f) / 0.16f;
+            base = Darken(base, (int)((t.dark ? 13 : 8) * k + 0.5f));
+        }
+        // 环境光：以 (0.5, 0.40) 为中心的椭圆高斯衰减，边缘严格归零
+        float du = (u - 0.5f) / 0.66f, dv = (v - 0.40f) / 0.66f;
+        float d2 = du * du + dv * dv;
+        if (d2 < 1.0f) {
+            float fall = (1.0f - d2) * (1.0f - d2);  // 平滑二次衰减
+            base = Blend(base, t.accent2, (t.dark ? 0.16f : 0.11f) * fall);
+        }
+        return base;
+    };
     {
         RECT inR{0, 0, W, inputH};
         // 输入栏占据窗口整个顶部，其顶边轮廓 = 窗口顶边轮廓：
@@ -4693,29 +4720,17 @@ static void Paint(HDC hdc) {
         // 手机系统搜索栏质感（HyperOS/iOS 控制中心参考）：
         // ① 顶部内缘柔光 → 中段本色 → 底部微暗（玻璃厚度）；
         // ② 中上部一团 accent 环境光（椭圆径向衰减），像控制中心那块「被光照亮的玻璃」。
-        auto inputBase = [&](float u, float v) -> COLORREF {
-            COLORREF base = t.bgInput;
-            if (v < 0.14f) {
-                float k = 1.0f - v / 0.14f;
-                base = Blend(base, t.textTitle, (t.dark ? 0.12f : 0.30f) * k);
-            } else if (v > 0.84f) {
-                float k = (v - 0.84f) / 0.16f;
-                base = Darken(base, (int)((t.dark ? 13 : 8) * k + 0.5f));
-            }
-            // 环境光：以 (0.5, 0.40) 为中心的椭圆高斯衰减，边缘严格归零
-            float du = (u - 0.5f) / 0.66f, dv = (v - 0.40f) / 0.66f;
-            float d2 = du * du + dv * dv;
-            if (d2 < 1.0f) {
-                float fall = (1.0f - d2) * (1.0f - d2);  // 平滑二次衰减
-                base = Blend(base, t.accent2, (t.dark ? 0.16f : 0.11f) * fall);
-            }
-            return base;
-        };
-        FillRoundRectAA(mem, inR, ri, inputBase);
+        FillRoundRectAA(mem, inR, ri, [&](float u, float v) -> COLORREF {
+            return inputColorPx(u * (float)(W - 1), v * (float)(inputH - 1));
+        });
         PaintInsetShadow(mem, inR, ri, t.bgInput);
         // 边缘发丝：整圈 1px 内描边（上缘偏亮、下缘偏暗做不到逐段，取中性微亮），
-        // 手机玻璃片的「厚度线」——细看有边界、粗看无感
-        StrokeRoundRectAA(mem, inR, ri,
+        // 手机玻璃片的「厚度线」——细看有边界、粗看无感。
+        // 描边整圈内缩 1px：DWM 在 (0,0)-(W,H) 上按系统圆角裁窗口，描边若画在
+        // 矩形最外沿，左上/右上角会被 DWM 的圆角切掉一截，露出断点。往里收 1px
+        // 后整圈描边完整落在 DWM 裁剪区内，角上是一条连到底的干净弧线。
+        RECT strokeR{inR.left + 1, inR.top + 1, inR.right - 1, inR.bottom - 1};
+        StrokeRoundRectAA(mem, strokeR, ri - 1,
                           Blend(t.bgInput, t.textTitle, t.dark ? 0.10f : 0.26f), 1);
         if (cardR.bottom > cardR.top && cardR.right > cardR.left) {
             cardRad = S(t.radiusCard);
@@ -4732,43 +4747,50 @@ static void Paint(HDC hdc) {
         }
     }
     // 顶部强调色条：横向三段渐变（两端 accent2 → 中段 accent）+ 两端渐隐收口。
-    // 之前两端是垂直切口（4px 高的条上「半高圆角」退化成方角），一眼就是硬边；
-    // 现在两端按 smoothstep 化进输入栏底色，读起来是光线扫过而不是被刀切断。
+    // 两端按 smoothstep 化进【输入栏真实底色】（与输入栏填充同一采样函数），
+    // 渐隐归零处颜色连续，读起来是光线扫过而不是被刀切断。
     if (t.accentStrip) {
         int barH = S(4);
         // 强调条必须内缩出圆角区：条若顶到窗口圆角，会和圆框描边糊成一个
         // 「蓝色钩子」，视觉上就是蓝线溢出圆框。内缩后角上只剩干净的圆框弧线。
         int inset = S(t.radiusWindow) + S(5);
         RECT ar{inset, 0, W - inset, barH};
-        const float barV = barH > 1 ? (float)(barH / 2) / (float)(inputH - 1) : 0.f;
         const float fade = (float)S(46);   // 两端渐隐长度（像素）
+        const float span = (float)(ar.right - ar.left);
         FillRoundRectAA(mem, ar, barH / 2, [&](float u, float v) -> COLORREF {
             float k = u < 0.5f ? (u * 2) : ((1 - u) * 2);  // 0→1→0
             COLORREF strip = Blend(t.accent2, t.accent, k);
             // 渐隐：两端 alpha 归零并 smoothstep 化开，末端不再有垂直切口
-            float span = (float)(ar.right - ar.left);
             float dL = u * span, dR = span - u * span;
             float a = 1.f;
             if (dL < fade) a = dL / fade;
             if (dR < fade) a = (std::min)(a, dR / fade);
             a = a * a * (3.f - 2.f * a);
-            if (a <= 0.001f) return t.bgInput;
-            // 背板 = 输入栏在该处的实际颜色（渐隐必须化进它自己的底，不能化进纯色）
-            COLORREF back = t.bgInput;
-            {
-                COLORREF base = t.bgInput;
-                if (v < 0.14f) base = Blend(base, t.textTitle, (t.dark ? 0.12f : 0.30f) * (1.f - v / 0.14f));
-                float du = (u - 0.5f) / 0.66f, dv = (barV - 0.40f) / 0.66f;
-                float d2 = du * du + dv * dv;
-                if (d2 < 1.0f) base = Blend(base, t.accent2, (t.dark ? 0.16f : 0.11f) * (1.f - d2) * (1.f - d2));
-                back = base;
-            }
+            // 背板 = 该像素处输入栏的真实颜色（顶缘提亮 + 环境光都在内）。
+            // 渐隐到 a=0 时返回的就是这个色，于是与紧邻的输入栏严丝合缝。
+            float px = (float)ar.left + u * span;
+            float py = (float)ar.top + v * (float)barH;
+            COLORREF back = inputColorPx(px, py);
+            if (a <= 0.001f) return back;
             return Blend(back, strip, a);
         });
-        // 柔光过渡：色条正下方 2px，accent2 低 alpha 渐隐进背景，消除生硬硬边
+        // 柔光过渡：色条正下方 2px，accent2 低 alpha 渐隐回输入栏真实底色。
+        // 之前底用窗口背景 t.bg，而蓝条实际压在输入栏玻璃上（bgInput + 提亮 + 环境光），
+        // 底色不符 → 柔光带比周围更暗，反而多出一条脏横线。改为逐像素采样输入栏底色。
         RECT glow{inset, barH, W - inset, barH + S(2)};
-        FillVGradient(mem, glow.left, glow.top, glow.right - glow.left,
-                      glow.bottom - glow.top, Blend(t.bg, t.accent2, 0.28f), t.bg);
+        FillRoundRectAA(mem, glow, (glow.bottom - glow.top) / 2,
+                        [&](float u, float v) -> COLORREF {
+            float gw = (float)(glow.right - glow.left);
+            float dL = u * gw, dR = gw - dL;
+            float ah = 1.f;
+            if (dL < fade) ah = dL / fade;
+            if (dR < fade) ah = (std::min)(ah, dR / fade);
+            ah = ah * ah * (3.f - 2.f * ah);
+            float a = 0.22f * (1.f - v) * ah;
+            float px = (float)glow.left + u * gw;
+            float py = (float)glow.top + v * (float)(glow.bottom - glow.top);
+            return Blend(inputColorPx(px, py), t.accent2, a);
+        });
     }
     // 角部辉光（低透明度装饰）
     if (t.cornerGlow) {
