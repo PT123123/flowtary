@@ -538,8 +538,9 @@ void SyncStartupPath(const std::wstring& mainExePath) {
 void Settings::Load() {
     DWORD v = 0;
 
-    uiEngine = 0;
-    if (RegGetDword(L"UiEngine", v)) uiEngine = (v <= 1) ? (int)v : 0;
+    // 界面引擎：默认 Slint(1)；只有用户显式选过 GDI(0) 才走旧引擎
+    uiEngine = 1;
+    if (RegGetDword(L"UiEngine", v)) uiEngine = (v <= 1) ? (int)v : 1;
 
     centerWake = 1;
     if (RegGetDword(L"CenterWake", v)) centerWake = v ? 1 : 0;

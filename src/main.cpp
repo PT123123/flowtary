@@ -13,6 +13,7 @@
 #include "version.h"  // FT_APPICON_ID（应用图标资源）、版本号等
 #include "themes.h"  // struct Theme / kThemes / ThemeTune（与设置 sidecar 共用）
 #include "settings_ipc.h"  // sidecar ↔ 主进程消息协议
+#include "slint_bridge.h"  // Slint 渲染器 ↔ 主进程 共享内存桥
 #include "settings_model.h"  // 设置项的唯一真源：注册表值名、编辑器语法、默认文本
 #include "search_history.h"  // 搜索历史台账（诊断用纯文本，行格式与落盘都在这一份）
 #include <atomic>
@@ -180,7 +181,7 @@ struct WinInfo {
 };
 
 struct App {
-    int uiEngine = 0;          // 界面引擎：0=GDI 稳定版（默认）1=Slint 新版
+    int uiEngine = 1;          // 界面引擎：0=GDI 稳定版 1=Slint 新版（默认 Slint）
     HWND hwnd = nullptr;
     HFONT fInput = nullptr;
     HFONT fList = nullptr;
@@ -326,6 +327,8 @@ struct App {
     bool captureEnabled = true;        // ss 命令开关（默认开）
     std::wstring captureExe;           // ScreenCapture.exe 完整路径
     std::wstring captureArgs;          // 本次启动的命令行参数
+    // —— Slint 渲染器（共享内存桥）——
+    slintbridge::Bridge* bridge = nullptr;  // 共享内存映射（懒创建）
 } g;
 
 // —— 主窗版式（Raycast 风格，逻辑像素）——
@@ -438,6 +441,13 @@ static void NoteHistoryFirstPaint();
 static void TrayBalloon(const std::wstring& title, const std::wstring& msg);
 static HWND TopTargetWindow();  // top 命令的目标窗口（唤醒前的前台窗口）
 static void ShowTopToast(HWND target, const std::wstring& text);  // 屏幕居中半透明 toast（打开提示/top 命令共用）
+// Slint 渲染器（共享内存桥）：定义在窗口过程之前，本文件多处要调用
+static void SlintBridgeEnsure();
+static void SlintPushState();
+static void SlintSendCmd(int cmd);
+static void SlintHandleRequests();
+static bool TryAltHotkeyDirect(WPARAM wParam);
+static HWND SlintIpcWindow();
 
 // 行 → 可触发序号（Hint 行不算）：返回第几个可执行项（用于分配数字徽章），-1=不可触发
 static int HotkeySeq(int itemIdx) {
@@ -1729,6 +1739,7 @@ static void AppendTrace(const char* tag) {
 
 static void Layout() {
     AnnotateRowUsage();
+    if (g.uiEngine == 1) return;  // Slint 渲染器自己排版，GDI 窗口不参与
     RECT rc;
     GetClientRect(g.hwnd, &rc);
     int rows = (std::min)((int)g.items.size(), (int)kMaxVisibleResults);
@@ -1771,6 +1782,8 @@ static void Layout() {
 
 static void RepaintNow() {
     RedrawWindow(g.hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+    // Slint 模式：界面由渲染器画，这里把最新状态推给渲染器
+    if (g.uiEngine == 1) SlintPushState();
 }
 
 static void LayoutAndRepaint() {
@@ -1778,28 +1791,46 @@ static void LayoutAndRepaint() {
     RepaintNow();
 }
 
-// Slint 引擎：唤起时拉起同目录的 flowtary-slint.exe。
-// 系统层（全局热键 Alt+Space / Alt+数字）继续留在 GDI 主程序，Slint 只做搜索 UI。
-static void LaunchSlintEngine() {
-    // 已在运行则直接前置，避免多开
-    if (HWND slintWnd = FindWindowW(L"Window Class", L"flowtary-slint")) {
-        ShowWindow(slintWnd, SW_SHOW);
-        SetForegroundWindow(slintWnd);
-        return;
+// Slint 引擎：唤起时拉起同目录的 flowtary-slint.exe（渲染器）。
+// 系统层（全局热键 Alt+Space / Alt+数字 / 搜索管线 / 自学习）继续留在 GDI 主程序，
+// Slint 只负责画界面 —— 两个引擎功能完全一致。
+// 返回 false 表示渲染器不可用（缺 exe），调用方应回退到 GDI 引擎。
+static bool LaunchSlintEngine() {
+    SlintBridgeEnsure();
+    if (HWND ipc = SlintIpcWindow()) {
+        // 渲染器已在运行：下发状态 + 命令它显示
+        SlintPushState();
+        SlintSendCmd(slintbridge::kCmdShow);
+        return true;
     }
     std::wstring exe = GetExePath();
     size_t slash = exe.find_last_of(L"\\/");
     std::wstring path = (slash == std::wstring::npos) ? L"flowtary-slint.exe"
                                                       : exe.substr(0, slash + 1) + L"flowtary-slint.exe";
-    ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        AppendTrace("Slint renderer missing -> fallback to GDI engine");
+        g.uiEngine = 0;
+        return false;
+    }
+    // 渲染器起来后会发 kReqReady，那时才真正显示（此刻还没有窗口）。
+    // 用 CreateProcess 而不是 ShellExecute：不经过 Explorer，启动更快也更可控。
+    std::wstring cmdLine = L"\"" + path + L"\"" + (g.centerWake ? L" --center" : L" --mouse");
+    std::wstring workDir = (slash == std::wstring::npos) ? std::wstring() : exe.substr(0, slash + 1);
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(path.c_str(), cmdLine.data(), nullptr, nullptr, FALSE, DETACHED_PROCESS,
+                        nullptr, workDir.empty() ? nullptr : workDir.c_str(), &si, &pi)) {
+        AppendTrace("Slint renderer launch failed -> fallback to GDI engine");
+        g.uiEngine = 0;
+        return false;
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return true;
 }
 
 static void Show() {
-    if (g.uiEngine == 1) {
-        AppendTrace("SHOW(wake) -> Slint engine");
-        LaunchSlintEngine();
-        return;
-    }
     AppendTrace("SHOW(wake)");
     g.text.clear();
     g.compText.clear();
@@ -1822,11 +1853,15 @@ static void Show() {
     g.qSettledMs = -1;
     KillTimer(g.hwnd, kTimerDebounce);
     KillTimer(g.hwnd, kTimerLatency);
-    Layout();
     // 前台被其他进程占用时，借助 AttachThreadInput 提高抢占成功率
     DWORD myTid = GetCurrentThreadId();
     HWND fg = GetForegroundWindow();
     g.prevForeground = fg;  // 记录唤醒前的前台窗口（top 命令的目标窗口）
+    if (g.uiEngine == 1) {
+        if (LaunchSlintEngine()) return;  // Slint 渲染器接管
+        // 渲染器不可用 → 落回 GDI 引擎
+    }
+    Layout();
     DWORD fgTid = fg ? GetWindowThreadProcessId(fg, nullptr) : 0;
     bool attached = fgTid && fgTid != myTid && AttachThreadInput(myTid, fgTid, TRUE);
     ShowWindow(g.hwnd, SW_SHOW);
@@ -1837,6 +1872,23 @@ static void Show() {
 
 static void Hide() {
     AppendTrace("HIDE");
+    if (g.uiEngine == 1) {
+        KillTimer(g.hwnd, kTimerDebounce);
+        KillTimer(g.hwnd, kTimerLatency);
+        ++g.dfGen;
+        g.searchRoute = ft::search::Route::Unavailable;
+        g.dragging = false;
+        g.selStart = g.selEnd = 0;
+        // 若正在组词，先取消 IME 组合，避免残留未上屏状态
+        HIMC hIMC = ImmGetContext(g.hwnd);
+        if (hIMC) {
+            ImmNotifyIME(hIMC, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
+            ImmReleaseContext(g.hwnd, hIMC);
+        }
+        g.compText.clear();
+        SlintSendCmd(slintbridge::kCmdHide);
+        return;
+    }
     if (!IsWindowVisible(g.hwnd)) return;
     KillTimer(g.hwnd, kTimerDebounce);
     KillTimer(g.hwnd, kTimerLatency);
@@ -5088,7 +5140,7 @@ static void ReplaySettings() {
     g.windowCacheTick = 0;
     ApplyTheme();
     ApplyBeautify();
-    if (IsWindowVisible(g.hwnd)) LayoutAndRepaint();
+    if (IsWindowVisible(g.hwnd) || g.uiEngine == 1) LayoutAndRepaint();
     TakeSettingsSnapshot();  // 已提交：把新状态当回退基线
 }
 
@@ -5133,7 +5185,7 @@ static void OnSettingsSessionEnded() {
     EndSettingsSession();
     if (!committed) {
         RestoreSettingsSnapshot();
-        if (IsWindowVisible(g.hwnd)) LayoutAndRepaint();
+        if (IsWindowVisible(g.hwnd) || g.uiEngine == 1) LayoutAndRepaint();
     }
 }
 
@@ -5159,7 +5211,7 @@ static void HandleSettingsIpc(const COPYDATASTRUCT* cds) {
             return;
         case ipc::MsgCancel:
             RestoreSettingsSnapshot();
-            if (IsWindowVisible(g.hwnd)) LayoutAndRepaint();
+            if (IsWindowVisible(g.hwnd) || g.uiEngine == 1) LayoutAndRepaint();
             sSidecarCommitted = false;  // 取消后仍可继续改，基线仍是打开时的状态
             return;
         case ipc::MsgClosed:
@@ -5247,6 +5299,220 @@ static bool TryAltHotkey(WPARAM wParam) {
     return true;  // Alt+键但无匹配项：吞掉，避免系统蜂鸣
 }
 
+// Alt+数字/字母 —— 渲染器转发过来的版本。
+// GetKeyState 是线程级的：渲染器进程里按着 Alt，本进程查不到，
+// 所以修饰键由渲染器侧判断（Ctrl 组合在那边就拦掉了），这里只按键位判定。
+static bool TryAltHotkeyDirect(WPARAM wParam) {
+    if (g.hotkeyMode == 2) return false;
+    WCHAR k = 0;
+    if (g.hotkeyMode == 0) {
+        if (wParam >= '0' && wParam <= '9') k = (WCHAR)wParam;
+        else if (wParam >= VK_NUMPAD0 && wParam <= VK_NUMPAD9)
+            k = (WCHAR)('0' + (wParam - VK_NUMPAD0));
+    } else if (g.hotkeyMode == 1) {
+        if (wParam >= 'A' && wParam <= 'Z') k = (WCHAR)wParam;
+        else if (wParam >= 'a' && wParam <= 'z') k = (WCHAR)(wParam - 32);
+    }
+    if (!k) return false;
+    for (int i = 0; i < (int)g.items.size(); ++i) {
+        if (HotkeyChar(i) == k) {
+            g.sel = i;
+            ExecuteSelected();
+            return true;
+        }
+    }
+    return true;  // Alt+键但无匹配项：吞掉，避免系统蜂鸣
+}
+
+// ---------------- Slint 渲染器（大脑 ↔ 皮，共享内存桥） ----------------
+// 渲染器把用户意图写进请求环，主进程消费后把结果写进状态槽；
+// 两侧只用 PostMessage 做「有更新了」的纯通知，因此不存在互等 SendMessage 的死锁。
+
+static void SlintBridgeEnsure() {
+    if (g.bridge) return;
+    std::wstring path = slintbridge::BridgeFilePath();
+    if (path.empty()) {
+        AppendTrace("SlintBridge: no bridge path");
+        return;
+    }
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+                           FILE_ATTRIBUTE_HIDDEN, nullptr);
+    if (f == INVALID_HANDLE_VALUE) {
+        AppendTrace("SlintBridge: open bridge file failed");
+        return;
+    }
+    LARGE_INTEGER sz{};
+    sz.QuadPart = (LONGLONG)sizeof(slintbridge::Bridge);
+    SetFilePointerEx(f, sz, nullptr, FILE_BEGIN);
+    SetEndOfFile(f);
+    HANDLE h = CreateFileMappingW(f, nullptr, PAGE_READWRITE, 0,
+                                  (DWORD)sizeof(slintbridge::Bridge), nullptr);
+    if (!h) {
+        CloseHandle(f);
+        AppendTrace("SlintBridge: CreateFileMapping failed");
+        return;
+    }
+    g.bridge = (slintbridge::Bridge*)MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0,
+                                                   sizeof(slintbridge::Bridge));
+    CloseHandle(h);
+    CloseHandle(f);
+    if (!g.bridge) {
+        AppendTrace("SlintBridge: MapView failed");
+        return;
+    }
+    // 启动时没有渲染器在跑：清空上次运行遗留的请求/命令环
+    if (!SlintIpcWindow()) memset(g.bridge, 0, sizeof(slintbridge::Bridge));
+    AppendTrace("SlintBridge: mapped");
+}
+
+// 渲染器的 IPC 窗口：大脑用它定位渲染器 + 通知「状态更新了」
+static HWND SlintIpcWindow() {
+    return FindWindowW(slintbridge::kIpcClass, nullptr);
+}
+
+// 渲染器的 Slint 界面窗口（标题固定）：用于判断「启动器当前开着没有」
+static HWND SlintUiWindow() {
+    return FindWindowW(nullptr, L"flowtary-slint");
+}
+
+// 启动器当前是否处于打开状态（GDI 看窗口可见性；Slint 看渲染器界面窗口）
+static bool LauncherVisible() {
+    if (g.uiEngine == 1) {
+        HWND ui = SlintUiWindow();
+        return ui && IsWindowVisible(ui);
+    }
+    return IsWindowVisible(g.hwnd);
+}
+
+// 行区序列化：把 g.items 的可见行打包成「RowHead + utf8 字段」序列
+static void SlintBuildRows(std::vector<char>& out) {
+    int n = (int)((std::min)((size_t)kMaxVisibleResults, g.items.size()));
+    for (int i = 0; i < n; ++i) {
+        const Row& r = g.items[i];
+        std::string title = WideToUtf8(r.title);
+        std::string sub = WideToUtf8(r.sub);
+        std::string icon;
+        switch (r.kind) {
+            case Row::Prog:
+                if (r.prog) icon = WideToUtf8(r.prog->path);
+                break;
+            case Row::File:
+            case Row::Folder:
+            case Row::Reveal:
+                icon = WideToUtf8(r.action);
+                break;
+            default:
+                break;
+        }
+        slintbridge::RowHead h {};
+        h.kind = (int)r.kind;
+        h.hotkey = (int)HotkeyChar(i);
+        h.usage = r.usage;
+        h.titleLen = (unsigned)title.size();
+        h.subLen = (unsigned)sub.size();
+        h.iconLen = (unsigned)icon.size();
+        out.insert(out.end(), (const char*)&h, (const char*)&h + sizeof(h));
+        out.insert(out.end(), title.begin(), title.end());
+        out.insert(out.end(), sub.begin(), sub.end());
+        out.insert(out.end(), icon.begin(), icon.end());
+    }
+}
+
+// 大脑 → 渲染器：下发完整状态（文本 + 行列表）
+static void SlintPushState() {
+    if (g.uiEngine != 1) return;
+    SlintBridgeEnsure();
+    if (!g.bridge) return;
+    LONG seq = g.bridge->stateSeq + 1;
+    slintbridge::StateSlot& slot = g.bridge->state[seq % slintbridge::kStateSlots];
+    std::string text = WideToUtf8(g.text);
+    std::vector<char> rows;
+    SlintBuildRows(rows);
+    if (text.size() > (size_t)slintbridge::kTextMax) text.resize(slintbridge::kTextMax);
+    if (rows.size() > (size_t)slintbridge::kRowsMax) rows.resize(slintbridge::kRowsMax);
+    slot.selected = g.sel;
+    slot.hotkeyMode = g.hotkeyMode;
+    slot.rowCount = (int)((std::min)((size_t)kMaxVisibleResults, g.items.size()));
+    slot.centerWake = g.centerWake ? 1 : 0;
+    slot.textLen = (unsigned)text.size();
+    slot.rowsLen = (unsigned)rows.size();
+    if (!text.empty()) memcpy(slot.payload, text.data(), text.size());
+    if (!rows.empty()) memcpy(slot.payload + text.size(), rows.data(), rows.size());
+    slot.seq = (unsigned)seq;
+    InterlockedExchange(&g.bridge->stateSeq, seq);  // 写完负载再发布（渲染器按 seq 取槽）
+    if (HWND ipc = SlintIpcWindow()) PostMessageW(ipc, slintbridge::kKickToRender, 0, 0);
+}
+
+// 大脑 → 渲染器：投递一条命令（显示 / 隐藏 / 退出）
+static void SlintSendCmd(int cmd) {
+    if (g.uiEngine != 1) return;
+    SlintBridgeEnsure();
+    if (!g.bridge) return;
+    LONG head = g.bridge->cmdHead;
+    LONG tail = g.bridge->cmdTail;
+    if (head - tail >= (LONG)(sizeof(g.bridge->cmd) / sizeof(g.bridge->cmd[0]))) return;  // 满了就丢
+    g.bridge->cmd[head % (LONG)(sizeof(g.bridge->cmd) / sizeof(g.bridge->cmd[0]))] = cmd;
+    InterlockedExchange(&g.bridge->cmdHead, head + 1);
+    if (HWND ipc = SlintIpcWindow()) PostMessageW(ipc, slintbridge::kKickToRender, 0, 0);
+}
+
+// 大脑消费渲染器的请求环
+static void SlintHandleRequests() {
+    SlintBridgeEnsure();   // 首次唤起时映射可能还没建（渲染器先建也一样）
+    if (!g.bridge) return;
+    LONG head = InterlockedCompareExchange(&g.bridge->reqHead, 0, 0);
+    LONG tail = g.bridge->reqTail;
+    bool needPush = false;
+    bool showAfterPush = false;
+    while (tail < head) {
+        const slintbridge::Req& r = g.bridge->req[tail % slintbridge::kReqRingSize];
+        switch (r.op) {
+            case slintbridge::kReqText: {
+                unsigned n = r.textLen;
+                if (n > (unsigned)slintbridge::kTextMax) n = (unsigned)slintbridge::kTextMax;
+                std::wstring w = Utf8ToWide(std::string(r.text, r.text + n));
+                if (g.text != w) {
+                    g.text = w;
+                    g.caret = g.text.size();
+                    g.selStart = g.selEnd = 0;
+                }
+                AfterEdit();  // → Refresh()：重新出结果（内部会推状态）
+                needPush = true;
+                break;
+            }
+            case slintbridge::kReqNav: {
+                if (!g.items.empty()) {
+                    int n = (int)g.items.size();
+                    g.sel = (g.sel + r.arg + n) % n;
+                    needPush = true;
+                }
+                break;
+            }
+            case slintbridge::kReqActivate: {
+                if (r.arg >= 0 && r.arg < (int)g.items.size()) g.sel = r.arg;
+                ExecuteSelected();
+                break;
+            }
+            case slintbridge::kReqHide:
+                Hide();
+                break;
+            case slintbridge::kReqAltKey:
+                TryAltHotkeyDirect((WPARAM)r.arg);
+                break;
+            case slintbridge::kReqReady:
+                // 渲染器刚起来：先下发状态，再让它显示（避免旧结果闪一下）
+                needPush = true;
+                showAfterPush = true;
+                break;
+        }
+        ++tail;
+    }
+    InterlockedExchange(&g.bridge->reqTail, tail);
+    if (needPush) SlintPushState();
+    if (showAfterPush) SlintSendCmd(slintbridge::kCmdShow);
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (g.msgTaskbarCreated && msg == g.msgTaskbarCreated) {
         TrayAdd();  // Explorer 重启后恢复托盘图标
@@ -5294,6 +5560,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (g.fListHot) { DeleteObject(g.fListHot); g.fListHot = nullptr; }
             if (g.brDivider) { DeleteObject(g.brDivider); g.brDivider = nullptr; }
             if (g.brMenuBg) { DeleteObject(g.brMenuBg); g.brMenuBg = nullptr; }
+            SlintSendCmd(slintbridge::kCmdQuit);  // 通知 Slint 渲染器自行退出
             PostQuitMessage(0);
             return 0;
 
@@ -5306,7 +5573,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     return 0;
                 }
                 AppendTrace(IsWindowVisible(hwnd) ? "HOTKEY toggle -> hide" : "HOTKEY toggle -> show");
-                if (IsWindowVisible(hwnd)) Hide();
+                if (LauncherVisible()) Hide();
                 else Show();
             } else if (wParam == 2) {
                 // Ctrl+Alt+G：文件对话框激活时，把前台资源管理器当前目录同步到对话框
@@ -5468,6 +5735,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return TRUE;
         }
 
+        case slintbridge::kKickToBrain:
+            // Slint 渲染器：请求环里有新请求（用户输入 / 键盘 / 激活行）
+            SlintHandleRequests();
+            return 0;
+
         case WM_APP_SETTINGS_GONE:
             // sidecar 进程结束（正常关闭 / 被杀 / 崩溃）：未提交就回退实时预览
             OnSettingsSessionEnded();
@@ -5492,7 +5764,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             s_programScanState->running=false;
             g.startingUp = false;
             TrayUpdateTip();  // 提示文案从「正在启动中」切回热键名
-            if (IsWindowVisible(hwnd)) {
+            if (IsWindowVisible(hwnd) || g.uiEngine == 1) {
                 if(g.mode==Mode::Programs)Refresh();
                 else LayoutAndRepaint();
             }
@@ -5511,7 +5783,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_APP_TRAY: {
             UINT ev = (UINT)lParam;
             if (ev == WM_LBUTTONUP || ev == WM_LBUTTONDBLCLK) {
-                if (IsWindowVisible(hwnd)) Hide();
+                if (LauncherVisible()) Hide();
                 else Show();
             } else if (ev == WM_RBUTTONUP || ev == WM_CONTEXTMENU) {
                 SetForegroundWindow(hwnd);
