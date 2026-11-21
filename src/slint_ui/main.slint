@@ -152,7 +152,7 @@ component Keycap inherits Rectangle {
 }
 
 export component MainWindow inherits Window {
-    width: 680px;
+    width: 744px;
     height: root.window-height;
     title: "flowtary-slint";   // 主进程靠这个标题找到渲染器界面窗口（判断「启动器开着没」）
     no-frame: true;
@@ -212,17 +212,31 @@ export component MainWindow inherits Window {
     callback alias-cancelled();
 
     // —— 面板底板：外投影 + 主题渐变 + 顶部高光 ——
-    // 窗口四周留 10px 透明边距给外投影（与 C++ 的 kUiMargin 对应）
+    // 窗口四周留 32px 透明边距容纳完整投影（与 C++ 的 kUiMargin 对应）
     Rectangle {
-        x: 10px; y: root.revealed ? 10px : 18px;
-        width: parent.width - 20px; height: parent.height - 20px;
+        x: 32px; y: root.revealed ? 32px : 40px;
+        width: parent.width - 64px; height: parent.height - 64px;
         opacity: root.revealed ? 1 : 0;
         animate opacity { duration: 150ms; easing: ease-out; }
         animate y { duration: 180ms; easing: ease-out; }
         border-radius: root.th-radius;
         background: transparent;
         border-width: 1px;
-        border-color: #ffffff1a;
+        border-color: #ffffff16;
+
+        // 柔和投影：软件渲染不支持高斯模糊，用多层低透明度圆角描边叠出渐变
+        for i in 8: Rectangle {
+            x: -3px - i * 2.5px;
+            y: -3px - i * 2.5px + 5px;
+            width: parent.width + 6px + i * 5px;
+            height: parent.height + 6px + i * 5px;
+            border-radius: root.th-radius + 3px + i * 2.5px;
+            background: transparent;
+            border-width: 4px;
+            border-color: i == 0 ? #00000012 : i == 1 ? #00000010 : i == 2 ? #0000000d
+                        : i == 3 ? #0000000a : i == 4 ? #00000008 : i == 5 ? #00000006
+                        : i == 6 ? #00000004 : #00000002;
+        }
 
         // 玻璃底色：单独一层并留一点透，DWM 模糊从背后透上来
         Rectangle {
@@ -230,9 +244,6 @@ export component MainWindow inherits Window {
             border-radius: root.th-radius;
             background: @linear-gradient(180deg, root.th-panel-top 0%, root.th-panel-bottom 100%);
             opacity: 0.88;
-            drop-shadow-blur: 26px;
-            drop-shadow-color: #0000007d;
-            drop-shadow-offset-y: 6px;
         }
 
         // 顶部极淡强调色氛围光，避免整块玻璃发灰

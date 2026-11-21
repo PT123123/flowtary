@@ -34,23 +34,7 @@
 #  define NOMINMAX
 #endif
 
-// ---- DWM Acrylic（未公开 API）----
-enum ACCENT_STATE { ACCENT_ENABLE_ACRYLICBLURBEHIND = 4 };
-struct ACCENT_POLICY { DWORD AccentState, AccentFlags, GradientColor, AnimationId; };
-struct WINDOWCOMPOSITIONATTRIBDATA { DWORD Attrib; void* pvData; SIZE_T cbData; };
-using SetWindowCompositionAttributeFn = BOOL(WINAPI*)(HWND, WINDOWCOMPOSITIONATTRIBDATA*);
-static void enable_acrylic(HWND hwnd, unsigned tint = 0xAA181218)
-{
-    auto fn = reinterpret_cast<SetWindowCompositionAttributeFn>(
-        GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetWindowCompositionAttribute"));
-    if (!fn) return;
-    ACCENT_POLICY p {};
-    p.AccentState = ACCENT_ENABLE_ACRYLICBLURBEHIND;
-    p.AccentFlags = 2;
-    p.GradientColor = tint;  // ABGR：跟随主题底色，玻璃更通透
-    WINDOWCOMPOSITIONATTRIBDATA d { 19, &p, sizeof(p) };
-    fn(hwnd, &d);
-}
+// ---- 窗口圆角区域 ----
 static void apply_rounded_region(HWND hwnd)
 {
     RECT rc {};
@@ -141,7 +125,8 @@ struct RowView {
 };
 
 // 窗口四周留给外投影的透明边距（与 main.slint 的 panel 内缩保持一致）
-static constexpr int kUiMargin = 10;
+static constexpr int kUiMargin = 32;
+static constexpr int kUiWidth = 744;   // 面板 680 + 两侧投影边距
 
 struct UiCtx {
     slint::ComponentHandle<MainWindow> ui;
@@ -151,7 +136,7 @@ struct UiCtx {
     std::unordered_map<std::wstring, slint::Image> iconCache;   // 小写路径 -> 图标
     std::unordered_map<std::wstring, bool> iconRequested;        // 小写路径 -> 已排队
     bool centerWake = true;   // 屏幕居中唤醒（跟随鼠标为 false）
-    int windowHeight = 320;   // 逻辑像素；按结果行数动态伸缩（含投影边距）
+    int windowHeight = 364;   // 逻辑像素；按结果行数动态伸缩（含投影边距）
     // Slint 自绘右键菜单的状态（不再有原生菜单窗口）
     bool menuOpen = false;
     int menuRow = -1;         // 锚定的结果行
@@ -171,14 +156,25 @@ static std::shared_ptr<UiCtx> g_ctx;
 static constexpr UINT kMsgOutsideClick = WM_APP + 0x40;
 static HHOOK g_outsideHook = nullptr;
 
+// 判断屏幕坐标是否落在玻璃面板之外（窗口四周的投影边距也算外）
+static bool point_outside_panel(HWND h, POINT screenPt)
+{
+    RECT rc{};
+    if (!h || !GetWindowRect(h, &rc)) return false;
+    UINT dpi = GetDpiForWindow(h);
+    if (!dpi) dpi = 96;
+    const int m = MulDiv(kUiMargin, (int)dpi, 96);
+    InflateRect(&rc, -m, -m);
+    return !PtInRect(&rc, screenPt);
+}
+
 static LRESULT CALLBACK OutsideClickProc(int code, WPARAM wp, LPARAM lp)
 {
     if (code == HC_ACTION && (wp == WM_LBUTTONDOWN || wp == WM_RBUTTONDOWN || wp == WM_MBUTTONDOWN) &&
         g_ctx) {
         HWND h = g_ctx->ui->window().win32_hwnd();
-        RECT rc{};
         POINT p{ (LONG)(short)LOWORD(lp), (LONG)(short)HIWORD(lp) };
-        if (h && GetWindowRect(h, &rc) && !PtInRect(&rc, p))
+        if (h && IsWindowVisible(h) && point_outside_panel(h, p))
             PostMessageW(h, kMsgOutsideClick, 0, 0);  // 回到 UI 线程再收尾，避免钩子里重入
     }
     return CallNextHookEx(g_outsideHook, code, wp, lp);
@@ -380,7 +376,7 @@ static void request_row_menu(int idx)
 // 窗口高度：与 main.slint 的排版常量对应（70 行区起点 + 行高 + 12 底栏间距 + 34 底栏 + 上下投影边距）
 static int compute_window_height(const UiCtx& ctx, bool hasQuery)
 {
-    if (ctx.rows.empty()) return hasQuery ? 250 : 320;
+    if (ctx.rows.empty()) return hasQuery ? 294 : 364;  // 面板 230 / 300 + 上下投影边距
     int content = 0;
     for (auto& r : ctx.rows)
         content += (r.kind == slintbridge::kRowHint ? 34 : 54);
@@ -439,7 +435,7 @@ static void show_row_menu(UiCtx& ctx)
                           ? ctx.menuBaseH
                           : y + menuH + 10 + kUiMargin;
 
-    ctx.menuX = 680 - kUiMargin - 8 - ctx.menuW;
+    ctx.menuX = kUiWidth - kUiMargin - 8 - ctx.menuW;
     ctx.menuY = y + kUiMargin;
     ctx.menuOpen = true;
     ctx.menuHeightNow = needH;
@@ -511,9 +507,6 @@ static void apply_theme(UiCtx& ctx)
     ctx.ui->set_th_sel_b(color_from_wire(w.selB));
     ctx.ui->set_th_on_accent(color_from_wire(w.onAccent));
     ctx.ui->set_th_radius((float)w.radius);
-    // 亚克力染色跟随主题：保留主题底色 RGB，压低不透明度让模糊透出来
-    if (HWND h = ctx.ui->window().win32_hwnd())
-        enable_acrylic(h, (w.panelTop & 0x00FFFFFFu) | 0x8A000000u);
 }
 
 static void apply_state(UiCtx& ctx)
@@ -685,7 +678,7 @@ static void show_alias_prompt(UiCtx& ctx)
     std::string name = read_text_slot(seq, g_bridge->alias);
     if (ctx.menuOpen) close_row_menu(ctx, false);
     ctx.aliasPrevH = ctx.windowHeight;
-    if (ctx.windowHeight < 320) ctx.ui->set_window_height(320);  // 覆盖层放得下
+    if (ctx.windowHeight < 364) ctx.ui->set_window_height(364);  // 覆盖层放得下
     ctx.ui->set_alias_text(slint::SharedString(name.c_str()));
     ctx.ui->set_alias_open(true);
 }
@@ -899,9 +892,8 @@ static LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case WM_MBUTTONDOWN: {
             // 兜底捕获生效时，窗口外的点击也会送到这里
             POINT p{ (LONG)(short)LOWORD(lp), (LONG)(short)HIWORD(lp) };
-            RECT rc{};
-            GetClientRect(hwnd, &rc);
-            if (!PtInRect(&rc, p)) {
+            ClientToScreen(hwnd, &p);
+            if (point_outside_panel(hwnd, p)) {
                 if (!g_holdHide) {
                     send_req(slintbridge::kReqHide);
                     hide_ui();
@@ -1072,12 +1064,11 @@ int main()
         if (g_ctx) g_ctx->ui->invoke_focus_input();
     });
 
-    // 窗口创建后置顶/圆角/Acrylic
+    // 窗口创建后置顶/圆角
     slint::Timer::single_shot(std::chrono::milliseconds(80), [ctx]() {
         HWND hwnd = ctx->ui->window().win32_hwnd();
         if (!hwnd) return;
         remove_native_frame(hwnd);
-        enable_acrylic(hwnd);
         apply_rounded_region(hwnd);
         // 接管窗口过程：Alt+数字 / 关闭 / 失焦
         if (!g_origUiWndProc)
@@ -1109,7 +1100,6 @@ int main()
     ctx->ui->window().show();
     HWND h0 = ctx->ui->window().win32_hwnd();
     remove_native_frame(h0);
-    enable_acrylic(h0);
     apply_rounded_region(h0);
     apply_topmost(h0);
     apply_tool_window(h0);
