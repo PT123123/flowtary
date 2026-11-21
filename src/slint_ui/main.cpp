@@ -300,19 +300,13 @@ static void apply_state(UiCtx& ctx)
     }
     ctx.rows = std::move(rows);
     ctx.centerWake = slot.centerWake != 0;
+    // 高度变化只改尺寸、不重新居中：窗口顶边固定、向下伸展。
+    // 之前每次按键都调 position_ui 按屏幕重新居中，整块面板会上下跳，
+    // 看起来就像卡顿；圆角区域交给 WM_SIZE 同步更新。
     int h = compute_window_height(ctx, tl > 0);
     if (h != ctx.windowHeight) {
         ctx.windowHeight = h;
         ctx.ui->set_window_height((float)h);
-        if (g_uiActive) {
-            slint::Timer::single_shot(std::chrono::milliseconds(30), []() {
-                if (!g_ctx || !g_uiActive) return;
-                HWND hwnd = g_ctx->ui->window().win32_hwnd();
-                remove_native_frame(hwnd);
-                apply_rounded_region(hwnd);
-                position_ui(hwnd, g_ctx->centerWake);
-            });
-        }
     }
     int sel = slot.selected;
     if (sel < 0 || sel >= (int)ctx.rows.size()) sel = 0;
@@ -444,6 +438,21 @@ static LRESULT CALLBACK IpcWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 static LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
+        case WM_STYLECHANGING:
+            // winit 在显示/隐藏/改尺寸时会重新写窗口样式，把 WS_CAPTION 加回来，
+            // 用户就会看到原生标题栏闪一下。这里直接改掉「准备写入的样式」，
+            // 从源头保证窗口始终是无边框弹出窗。
+            if (wp == GWL_STYLE) {
+                auto* ss = reinterpret_cast<STYLESTRUCT*>(lp);
+                ss->styleNew = (ss->styleNew &
+                                ~(WS_CAPTION | WS_THICKFRAME | WS_BORDER | WS_DLGFRAME |
+                                  WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX)) | WS_POPUP;
+            }
+            return 0;
+        case WM_SIZE:
+            // 动态高度：尺寸一落地就同步更新圆角区域，避免旧区域的残帧
+            if (wp != SIZE_MINIMIZED) apply_rounded_region(hwnd);
+            break;
         case WM_SYSKEYDOWN: {
             WPARAM vk = wp;
             bool digit = (vk >= '0' && vk <= '9') || (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9);
