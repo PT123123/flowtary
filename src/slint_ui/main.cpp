@@ -525,6 +525,10 @@ int main()
         return 0;
     }
 
+    // 启动器是 2D 小面板，软件光栅化足够；GPU 后端（Skia/D3D）会常驻
+    // 近 200MB 私有内存，换成 CPU 渲染后只有 ~12MB。必须在创建组件前选。
+    slint::select_backend({ .backend = "winit-software" });
+
     auto ctx = std::make_shared<UiCtx>();
     g_ctx = ctx;
     parse_launch_args();
