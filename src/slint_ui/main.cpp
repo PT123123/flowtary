@@ -165,6 +165,49 @@ struct UiCtx {
 };
 static std::shared_ptr<UiCtx> g_ctx;
 
+// ---- 点击窗口外即隐藏 ----
+// 只靠 WM_ACTIVATE 失焦不可靠：SetForegroundWindow 被系统拒绝时窗口虽显示但从未激活，
+// 之后点击外部不会产生失焦通知。这里挂一个 WH_MOUSE_LL，仅观察按键，不吞事件。
+static constexpr UINT kMsgOutsideClick = WM_APP + 0x40;
+static HHOOK g_outsideHook = nullptr;
+
+static LRESULT CALLBACK OutsideClickProc(int code, WPARAM wp, LPARAM lp)
+{
+    if (code == HC_ACTION && (wp == WM_LBUTTONDOWN || wp == WM_RBUTTONDOWN || wp == WM_MBUTTONDOWN) &&
+        g_ctx) {
+        HWND h = g_ctx->ui->window().win32_hwnd();
+        RECT rc{};
+        POINT p{ (LONG)(short)LOWORD(lp), (LONG)(short)HIWORD(lp) };
+        if (h && GetWindowRect(h, &rc) && !PtInRect(&rc, p))
+            PostMessageW(h, kMsgOutsideClick, 0, 0);  // 回到 UI 线程再收尾，避免钩子里重入
+    }
+    return CallNextHookEx(g_outsideHook, code, wp, lp);
+}
+
+static void arm_outside_hook(bool on)
+{
+    if (on && !g_outsideHook)
+        g_outsideHook = SetWindowsHookExW(WH_MOUSE_LL, OutsideClickProc, nullptr, 0);
+    else if (!on && g_outsideHook) {
+        UnhookWindowsHookEx(g_outsideHook);
+        g_outsideHook = nullptr;
+    }
+}
+
+// 兜底：唤起时若没抢到前台，就设鼠标捕获，窗口外的点击也会回到这里。
+static bool g_outsideCapture = false;
+
+static void arm_outside_capture(HWND h, bool on)
+{
+    if (on && !g_outsideCapture) {
+        SetCapture(h);
+        g_outsideCapture = (GetCapture() == h);
+    } else if (!on && g_outsideCapture) {
+        if (GetCapture() == h) ReleaseCapture();
+        g_outsideCapture = false;
+    }
+}
+
 // 顶部 toast（独立无边框窗口）：点击穿透、置顶、2.2 秒自动消失
 static std::optional<slint::ComponentHandle<ToastWindow>> g_toast;
 static int g_toastGen = 0;
@@ -592,6 +635,8 @@ static void show_ui()
     // 只有真的拿到前台才算「活跃」：SetForegroundWindow 被系统拒绝时窗口虽显示，
     // 键盘仍在前一个窗口，不能把它当成已激活（否则后续失焦逻辑会错乱）。
     g_uiActive = (GetForegroundWindow() == hwnd);
+    arm_outside_hook(true);  // 点击窗口外直接收掉
+    if (!g_uiActive) arm_outside_capture(hwnd, true);  // 没抢到前台时用捕获兜底
     slint::Timer::single_shot(std::chrono::milliseconds(40), []() {
         if (!g_ctx) return;
         g_ctx->ui->invoke_focus_input();
@@ -606,6 +651,8 @@ static void show_ui()
 static void hide_ui()
 {
     if (!g_ctx) return;
+    arm_outside_hook(false);
+    arm_outside_capture(g_ctx->ui->window().win32_hwnd(), false);
     g_uiActive = false;
     if (g_ctx->menuOpen) close_row_menu(*g_ctx, false);  // 隐藏时顺手收掉菜单
     if (g_ctx->ui->get_alias_open()) {
@@ -833,10 +880,33 @@ static LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
             break;
         }
+        case kMsgOutsideClick:
+            // 点击了启动器窗口以外的区域：直接隐藏（别名覆盖层等主进程对话框期间除外）
+            if (IsWindowVisible(hwnd) && !g_holdHide) {
+                send_req(slintbridge::kReqHide);
+                hide_ui();
+            }
+            return 0;
         case WM_CLOSE:
             send_req(slintbridge::kReqHide);
             hide_ui();
             return 0;
+        case WM_LBUTTONDOWN:
+        case WM_RBUTTONDOWN:
+        case WM_MBUTTONDOWN: {
+            // 兜底捕获生效时，窗口外的点击也会送到这里
+            POINT p{ (LONG)(short)LOWORD(lp), (LONG)(short)HIWORD(lp) };
+            RECT rc{};
+            GetClientRect(hwnd, &rc);
+            if (!PtInRect(&rc, p)) {
+                if (!g_holdHide) {
+                    send_req(slintbridge::kReqHide);
+                    hide_ui();
+                }
+                return 0;
+            }
+            break;
+        }
         case WM_ACTIVATE:
             if (LOWORD(wp) == WA_INACTIVE) {
                 if (g_uiActive && !g_holdHide) {
@@ -845,6 +915,7 @@ static LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 }
             } else {
                 g_uiActive = true;
+                arm_outside_capture(hwnd, false);  // 已激活就不再需要捕获
                 // 点回来时再压一遍：个别路径下 winit 会把带标题栏的样式写回去，
                 // 这里无条件恢复无边框 + 关掉 DWM 非客户区渲染。
                 remove_native_frame(hwnd);
