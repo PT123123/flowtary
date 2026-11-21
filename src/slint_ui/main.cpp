@@ -427,9 +427,85 @@ static void arm_outside_capture(HWND h, bool on)
     }
 }
 
-// 顶部 toast（独立无边框窗口）：点击穿透、置顶、2.2 秒自动消失
+// 顶部 toast（独立无边框工具窗）：点击穿透、屏幕居中、2.2 秒自动消失
+// 尺寸与 main.slint 的 ToastWindow 保持一致，用于在 show 之前算好居中位置
+static constexpr int kToastW = 360;
+static constexpr int kToastH = 56;
+static constexpr int kToastRadius = 14;  // 药丸圆角（逻辑像素）
+
 static std::optional<slint::ComponentHandle<ToastWindow>> g_toast;
+static WNDPROC g_origToastProc = nullptr;
 static int g_toastGen = 0;
+static bool g_toastStyled = false;  // 原生窗口已接管样式（首次建窗期间为 false）
+static bool g_toastReveal = false;  // 首次建窗完成后需要回来居中显示
+
+// 圆角裁剪：软件渲染没有逐像素透明，靠窗口区域把药丸四角裁掉，避免露出直角底
+static void toast_region(HWND hwnd)
+{
+    RECT rc {};
+    if (!GetClientRect(hwnd, &rc)) return;
+    const int w = rc.right - rc.left, h = rc.bottom - rc.top;
+    if (w < kToastRadius * 2 || h < kToastRadius * 2) return;
+    UINT dpi = GetDpiForWindow(hwnd);
+    if (!dpi) dpi = 96;
+    const int r = MulDiv(kToastRadius, (int)dpi, 96);
+    // CreateRoundRectRgn 的后两个参数是「直径」，不是半径
+    if (HRGN rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, r * 2, r * 2))
+        SetWindowRgn(hwnd, rgn, TRUE);  // takes ownership
+}
+
+// winit 显示/隐藏 toast 时会把窗口样式重写成「带标题栏的普通窗口 + APPWINDOW」，
+// 于是任务栏、Alt+Tab 里都会冒出一个窗口。与主窗同一套做法：在 STYLECHANGING
+// 里改掉「准备写入的样式」，从源头保证工具窗语义。
+static LRESULT CALLBACK ToastWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+        case WM_NCACTIVATE:
+            return TRUE;
+        case WM_NCPAINT:
+            return 0;
+        case 0x00AE:  // WM_NCUAHDRAWCAPTION（主题标题栏绘制）
+        case 0x00AF:  // WM_NCUAHDRAWFRAME（主题边框绘制）
+            return 0;
+        case WM_NCCALCSIZE:
+            if (wp) return 0;
+            break;
+        case WM_SIZE:
+            if (wp != SIZE_MINIMIZED) toast_region(hwnd);
+            break;
+        case WM_STYLECHANGING: {
+            auto* ss = reinterpret_cast<STYLESTRUCT*>(lp);
+            if (wp == GWL_STYLE) {
+                ss->styleNew = (ss->styleNew &
+                                ~(WS_CAPTION | WS_THICKFRAME | WS_BORDER | WS_DLGFRAME |
+                                  WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX)) | WS_POPUP;
+            } else if (wp == GWL_EXSTYLE) {
+                ss->styleNew = (ss->styleNew | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
+                                WS_EX_TRANSPARENT) & ~WS_EX_APPWINDOW;
+            }
+            break;
+        }
+    }
+    return CallWindowProcW(g_origToastProc, hwnd, msg, wp, lp);
+}
+
+// 把 toast 窗口钉成无边框工具窗：不进任务栏/Alt+Tab，不抢焦点，点击穿透
+static void toast_style_native(HWND hwnd)
+{
+    LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    LONG_PTR want = (style & ~(WS_CAPTION | WS_THICKFRAME | WS_BORDER | WS_DLGFRAME |
+                               WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX)) | WS_POPUP;
+    if (want != style) SetWindowLongPtrW(hwnd, GWL_STYLE, want);
+    LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    LONG_PTR wex = (ex | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT) &
+                   ~WS_EX_APPWINDOW;
+    if (wex != ex) SetWindowLongPtrW(hwnd, GWL_EXSTYLE, wex);
+    int ncPolicy = 1;  // DWMNCRP_DISABLED
+    DwmSetWindowAttribute(hwnd, 2, &ncPolicy, sizeof(ncPolicy));
+    const DWORD kDwmwaBorderColor = 34;
+    COLORREF none = 0xFFFFFFFE;  // DWMWA_COLOR_NONE
+    DwmSetWindowAttribute(hwnd, kDwmwaBorderColor, &none, sizeof(none));
+}
 
 static ft::apps::AsyncIcons g_icons;
 
@@ -973,7 +1049,79 @@ static void show_alias_prompt(UiCtx& ctx)
     ctx.ui->set_alias_open(true);
 }
 
-// 顶部 toast：独立窗口，定位到鼠标所在显示器工作区中央（与原 GDI 版一致）
+// 目标显示器的缩放：toast 要跨显示器居中，必须按「鼠标所在显示器」的 DPI 算尺寸/位置，
+// 否则 200% 屏上会被 winit 的 DPI 变更放大一倍，看起来又偏又大。
+static UINT monitor_dpi(HMONITOR mon)
+{
+    static auto getDpi = reinterpret_cast<HRESULT(WINAPI*)(HMONITOR, int, UINT*, UINT*)>(
+        GetProcAddress(LoadLibraryW(L"shcore.dll"), "GetDpiForMonitor"));
+    UINT x = 96, y = 96;
+    if (getDpi && SUCCEEDED(getDpi(mon, 0 /* MDT_EFFECTIVE_DPI */, &x, &y)) && x) return x;
+    return 96;
+}
+
+// 屏幕居中显示：先算好位置和尺寸再 show，避免窗口先出现在默认位置再跳过来
+static void toast_present()
+{
+    if (!g_toast.has_value()) return;
+    auto& win = (*g_toast)->window();
+    POINT cur {};
+    GetCursorPos(&cur);
+    MONITORINFO mi {};
+    mi.cbSize = sizeof(mi);
+    HMONITOR mon = MonitorFromPoint(cur, MONITOR_DEFAULTTONEAREST);
+    if (GetMonitorInfoW(mon, &mi)) {
+        const UINT dpi = monitor_dpi(mon);
+        // 只定位、不强行改尺寸：窗口逻辑尺寸本来就是 360x56，winit 会按目标显示器
+        // 的 DPI 自己缩放；手动设物理尺寸会在跨 DPI 移动时被再放大一次。
+        const int W = MulDiv(kToastW, (int)dpi, 96), H = MulDiv(kToastH, (int)dpi, 96);
+        slint::PhysicalPosition pos;
+        pos.x = mi.rcWork.left + (mi.rcWork.right - mi.rcWork.left - W) / 2;
+        pos.y = mi.rcWork.top + (mi.rcWork.bottom - mi.rcWork.top - H) / 2;
+        win.set_position(pos);
+    }
+    win.show();
+    HWND h = win.win32_hwnd();
+    if (h) {
+        toast_style_native(h);
+        toast_region(h);
+        SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+    const int gen = ++g_toastGen;
+    slint::Timer::single_shot(std::chrono::milliseconds(2200), [gen]() {
+        if (gen != g_toastGen || !g_toast.has_value()) return;
+        (*g_toast)->window().hide();
+    });
+}
+
+// 首次显示时 winit 的 HWND 是异步建出来的：等它就绪后接管窗口过程与样式。
+// 这期间窗口藏在屏幕外，不会出现「带标题栏的普通窗口」在角落闪一帧。
+static void toast_bind_native(int attempt)
+{
+    if (!g_toast.has_value()) return;
+    HWND h = (*g_toast)->window().win32_hwnd();
+    if (!h || !IsWindow(h)) {
+        if (attempt < 60) {
+            slint::Timer::single_shot(std::chrono::milliseconds(8),
+                                      [attempt]() { toast_bind_native(attempt + 1); });
+            return;
+        }
+    } else {
+        if (!g_origToastProc)
+            g_origToastProc =
+                (WNDPROC)SetWindowLongPtrW(h, GWLP_WNDPROC, (LONG_PTR)ToastWndProc);
+        toast_style_native(h);
+        toast_region(h);
+    }
+    g_toastStyled = true;
+    if (g_toastReveal) {
+        g_toastReveal = false;
+        toast_present();
+    }
+}
+
+// 顶部 toast：独立工具窗，定位到鼠标所在显示器工作区中央（与原 GDI 版一致）
 static void show_toast(const std::string& text)
 {
     if (!g_toast.has_value()) {
@@ -984,39 +1132,21 @@ static void show_toast(const std::string& text)
         (*g_toast)->set_th_menu(color_from_wire(g_bridge->theme.menu));
         (*g_toast)->set_th_text(color_from_wire(g_bridge->theme.text));
     }
-    (*g_toast)->window().show();
-    HWND h = (*g_toast)->window().win32_hwnd();
-    if (!h) return;
-    LONG_PTR style = GetWindowLongPtrW(h, GWL_STYLE);
-    style = (style & ~(WS_CAPTION | WS_THICKFRAME | WS_BORDER | WS_DLGFRAME | WS_SYSMENU)) |
-            WS_POPUP;
-    SetWindowLongPtrW(h, GWL_STYLE, style);
-    LONG_PTR ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
-    ex = (ex | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_LAYERED) &
-         ~WS_EX_APPWINDOW;
-    SetWindowLongPtrW(h, GWL_EXSTYLE, ex);
-    int ncPolicy = 1;  // DWMNCRP_DISABLED
-    DwmSetWindowAttribute(h, 2, &ncPolicy, sizeof(ncPolicy));
-
-    RECT rc{};
-    GetWindowRect(h, &rc);
-    const int W = rc.right - rc.left, H = rc.bottom - rc.top;
-    POINT cur{};
-    GetCursorPos(&cur);
-    MONITORINFO mi{};
-    mi.cbSize = sizeof(mi);
-    HMONITOR mon = MonitorFromPoint(cur, MONITOR_DEFAULTTONEAREST);
-    if (GetMonitorInfoW(mon, &mi)) {
-        int x = mi.rcWork.left + (mi.rcWork.right - mi.rcWork.left - W) / 2;
-        int y = mi.rcWork.top + (mi.rcWork.bottom - mi.rcWork.top - H) / 2;
-        SetWindowPos(h, HWND_TOPMOST, x, y, 0, 0,
-                     SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    if (g_toastStyled) {
+        toast_present();
+        return;
     }
-    const int gen = ++g_toastGen;
-    slint::Timer::single_shot(std::chrono::milliseconds(2200), [gen]() {
-        if (gen != g_toastGen || !g_toast.has_value()) return;
-        (*g_toast)->window().hide();
-    });
+    if (!g_toastReveal) {
+        // 第一次：先在屏幕外把原生窗口建出来（不可见），样式接管后再回来居中显示
+        auto& win = (*g_toast)->window();
+        slint::PhysicalPosition pos;
+        pos.x = -20000;
+        pos.y = -20000;
+        win.set_position(pos);
+        win.show();
+        g_toastReveal = true;
+        toast_bind_native(0);
+    }
 }
 
 // 首帧位置由主进程通过命令行传入：常驻渲染器被复用时则用状态槽里的最新值
