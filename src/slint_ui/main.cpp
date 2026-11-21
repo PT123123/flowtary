@@ -155,6 +155,7 @@ static constexpr int kUiWidth = 744;   // 面板 680 + 两侧投影边距
 static HWND g_glass = nullptr;
 static unsigned g_glassTint = 0x8A181218;  // ABGR，随主题底色更新
 static int g_uiRadius = 20;                // 面板圆角（逻辑 px），与 Slint 的 th-radius 同步
+static bool g_glassArmed = false;          // 面板定位好并开始淡入后才允许背板出现
 
 static LRESULT CALLBACK GlassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
@@ -238,6 +239,12 @@ static void sync_glass(HWND ui)
     if (r > pad) r -= pad;  // 圆角跟着内缩，保持与面板边缘平行
     if (HRGN rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, r * 2, r * 2))
         SetWindowRgn(g_glass, rgn, TRUE);  // takes ownership
+    // 没 arm 时只同步几何、保持隐藏：否则唤起瞬间会先看到一块模糊背板从旧位置跳过来
+    if (!g_glassArmed) {
+        SetWindowPos(g_glass, ui, x, y, w, h, SWP_NOACTIVATE);
+        ShowWindow(g_glass, SW_HIDE);
+        return;
+    }
     SetWindowPos(g_glass, ui, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
 }
 
@@ -742,7 +749,10 @@ static void show_ui()
     ctx.ui->set_query(slint::SharedString(""));  // 主进程每次唤起都清空输入
     ctx.ui->set_selected(0);
     ctx.ui->set_alias_open(false);
-    if (!wasVisible) ctx.ui->set_revealed(false);  // 重新播放淡入
+    if (!wasVisible) {
+        ctx.ui->set_revealed(false);  // 重新播放淡入
+        g_glassArmed = false;         // 淡入前不亮背板，位置定了再说
+    }
     remove_native_frame(hwnd);
     apply_rounded_region(hwnd);
     position_ui(hwnd, ctx.centerWake);  // 先摆好位置再显示，避免旧位置闪一下
@@ -759,11 +769,13 @@ static void show_ui()
     slint::Timer::single_shot(std::chrono::milliseconds(40), []() {
         if (!g_ctx) return;
         g_ctx->ui->invoke_focus_input();
-        g_ctx->ui->set_revealed(true);
         HWND h = g_ctx->ui->window().win32_hwnd();
         remove_native_frame(h);
         apply_rounded_region(h);
         position_ui(h, g_ctx->centerWake);
+        // 位置确定后再显形：面板淡入与磨砂背板同一帧出现，不会先跳到别处再回中间
+        g_ctx->ui->set_revealed(true);
+        g_glassArmed = true;
         sync_glass(h);
     });
     // 设置窗刚关掉时前台锁可能晚一拍才释放：再抢一次并补一次输入框聚焦
@@ -785,13 +797,14 @@ static void hide_ui()
     arm_outside_capture(g_ctx->ui->window().win32_hwnd(), false);
     g_uiActive = false;
     if (g_ctx->menuOpen) close_row_menu(*g_ctx, false);  // 隐藏时顺手收掉菜单
-    if (g_ctx->ui->get_alias_open()) {
+    if (g_ctx->ui->get_alias_open() || g_ctx->aliasPrevH) {
         g_ctx->ui->set_alias_open(false);
         if (g_ctx->aliasPrevH) {
             g_ctx->ui->set_window_height((float)g_ctx->windowHeight);
             g_ctx->aliasPrevH = 0;
         }
     }
+    g_glassArmed = false;
     g_ctx->ui->window().hide();
     hide_glass();
 }
@@ -1241,13 +1254,16 @@ int main()
         }
     });
 
+    // 首帧先整块透明：等主进程的 Show 指令到位、位置算好后再淡入，
+    // 避免窗口先出现在默认位置再跳回屏幕中央
+    ctx->ui->set_revealed(false);
     ctx->ui->window().show();
     HWND h0 = ctx->ui->window().win32_hwnd();
     remove_native_frame(h0);
     apply_rounded_region(h0);
     apply_topmost(h0);
     apply_tool_window(h0);
-    sync_glass(h0);
+    sync_glass(h0);  // 未 arm：只同步背板几何，不显示
     if (!g_origUiWndProc)
         g_origUiWndProc = (WNDPROC)SetWindowLongPtrW(h0, GWLP_WNDPROC, (LONG_PTR)UiWndProc);
     position_ui(h0, ctx->centerWake);
