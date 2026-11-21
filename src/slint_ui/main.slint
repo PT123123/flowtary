@@ -194,11 +194,16 @@ export component MainWindow inherits Window {
     in-out property <color> th-on-accent: #0b1017;
     in-out property <length> th-radius: 16px;
 
+    // 唤起动效：内容淡入 + 轻微上浮（由 C++ 在 show 后触发）
+    // 默认 true：渲染器启动时先建窗口，避免首帧出现空面板
+    in-out property <bool> revealed: true;
+
     // → C++ 回调
     callback query-changed(string);
     callback item-activated(int);       // 回车激活（携带 Ctrl/Shift 语义，由 C++ 侧读键态）
     callback item-clicked(int);         // 鼠标点击激活（始终按普通方式执行）
     callback escape-pressed();
+    callback clear-query();
     callback move-selection(int);       // -1 / +1
     callback focus-input();              // 请求把焦点给搜索框
     callback menu-picked(int);           // 选中右键菜单第 idx 项
@@ -209,7 +214,11 @@ export component MainWindow inherits Window {
     // —— 面板底板：外投影 + 主题渐变 + 顶部高光 ——
     // 窗口四周留 10px 透明边距给外投影（与 C++ 的 kUiMargin 对应）
     Rectangle {
-        x: 10px; y: 10px; width: parent.width - 20px; height: parent.height - 20px;
+        x: 10px; y: root.revealed ? 10px : 18px;
+        width: parent.width - 20px; height: parent.height - 20px;
+        opacity: root.revealed ? 1 : 0;
+        animate opacity { duration: 150ms; easing: ease-out; }
+        animate y { duration: 180ms; easing: ease-out; }
         border-radius: root.th-radius;
         background: @linear-gradient(180deg, root.th-panel-top 0%, root.th-panel-bottom 100%);
         border-width: 1px;
@@ -280,6 +289,24 @@ export component MainWindow inherits Window {
             color: root.th-sub;
             font-size: 10.5px; font-weight: 600;
             horizontal-alignment: center; vertical-alignment: center;
+        }
+    }
+    // 有输入时的清空按钮
+    if root.query != "": Rectangle {
+        x: parent.width - 96px; y: 20px; width: 24px; height: 24px;
+        border-radius: 12px;
+        background: clear-ta.has-hover ? #ffffff18 : #ffffff0a;
+        animate background { duration: 90ms; }
+        Text {
+            width: 100%; height: 100%;
+            text: "×";
+            color: root.th-sub;
+            font-size: 15px; font-weight: 600;
+            horizontal-alignment: center; vertical-alignment: center;
+        }
+        clear-ta := TouchArea {
+            mouse-cursor: pointer;
+            clicked => { root.clear-query(); }
         }
     }
     // 搜索区 / 结果区的发丝分隔线（两端淡出）

@@ -51,23 +51,36 @@ export component SettingsWindow inherits Window {
     // —— 侧栏 ——
     Rectangle {
         x: 0; y: 0; width: 184px; height: 100%;
-        background: #0b0e13;
-        VerticalLayout {
-            x: 10px; y: 16px; width: 164px;
-            spacing: 2px;
+        background: @linear-gradient(180deg, #0c1016 0%, #090c11 100%);
+        // 品牌标
+        Rectangle {
+            x: 18px; y: 22px; width: 24px; height: 24px;
+            border-radius: 7px;
+            background: @linear-gradient(135deg, #59d2c7 0%, #2b7f7a 100%);
+            border-width: 1px; border-color: #ffffff33;
             Text {
-                height: 34px;
-                text: "Flowtary 设置";
-                color: #eaf0fa;
-                font-size: 15px; font-weight: 600;
-                vertical-alignment: center;
-                x: 8px;
+                width: 100%; height: 100%;
+                text: "F"; color: #ffffff;
+                font-size: 13px; font-weight: 800;
+                horizontal-alignment: center; vertical-alignment: center;
             }
-            Rectangle { height: 10px; background: transparent; }
+        }
+        Text {
+            x: 50px; y: 22px; width: 120px; height: 24px;
+            text: "Flowtary";
+            color: #eaf0fa;
+            font-size: 13px; font-weight: 600;
+            letter-spacing: 0.3px;
+            vertical-alignment: center;
+        }
+        VerticalLayout {
+            x: 10px; y: 58px; width: 164px;
+            spacing: 2px;
             for name[idx] in root.tabs: Rectangle {
                 height: 34px;
                 border-radius: 9px;
                 background: idx == root.tab ? #1f2a33 : hover.has-hover ? #151b23 : transparent;
+                animate background { duration: 110ms; easing: ease-out; }
                 hover := TouchArea {
                     mouse-cursor: pointer;
                     clicked => { root.tab-changed(idx); }
@@ -77,6 +90,7 @@ export component SettingsWindow inherits Window {
                     border-radius: 2px;
                     background: #63d8cd;
                     opacity: idx == root.tab ? 1 : 0;
+                    animate opacity { duration: 120ms; }
                 }
                 Text {
                     x: 14px; y: 0; width: parent.width - 20px; height: 100%;
@@ -85,6 +99,7 @@ export component SettingsWindow inherits Window {
                     font-size: 12.5px;
                     font-weight: idx == root.tab ? 600 : 400;
                     vertical-alignment: center;
+                    animate color { duration: 120ms; }
                 }
             }
         }
@@ -151,6 +166,8 @@ export component SettingsWindow inherits Window {
                         background: r.checked ? #2f8f8a : #151b23;
                         border-width: 1px;
                         border-color: r.checked ? #6fd7cd80 : #ffffff22;
+                        animate background { duration: 110ms; }
+                        animate border-color { duration: 110ms; }
                         Path {
                             x: 5px; y: 5px; width: 8px; height: 8px;
                             fill: transparent;
@@ -158,6 +175,7 @@ export component SettingsWindow inherits Window {
                             stroke-width: 1.8px;
                             commands: "M 0 4 L 3 7 L 8 0";
                             opacity: r.checked ? 1 : 0;
+                            animate opacity { duration: 110ms; }
                         }
                     }
                     Text {
@@ -227,8 +245,9 @@ export component SettingsWindow inherits Window {
                         border-radius: 8px;
                         background: #0d1117;
                         border-width: 1px;
-                        border-color: #ffffff18;
-                        TextInput {
+                        border-color: si.has-focus ? #63d8cd66 : #ffffff18;
+                        animate border-color { duration: 120ms; }
+                        si := TextInput {
                             x: 10px; y: 0; width: parent.width - 20px; height: 100%;
                             vertical-alignment: center;
                             text: r.value;
@@ -255,8 +274,9 @@ export component SettingsWindow inherits Window {
                         border-radius: 8px;
                         background: #0d1117;
                         border-width: 1px;
-                        border-color: #ffffff18;
-                        TextEdit {
+                        border-color: te.has-focus ? #63d8cd66 : #ffffff18;
+                        animate border-color { duration: 120ms; }
+                        te := TextEdit {
                             x: 8px; y: 6px; width: parent.width - 16px; height: parent.height - 12px;
                             text: r.value;
                             read-only: !r.enabled;
@@ -327,6 +347,8 @@ export component SettingsWindow inherits Window {
                             border-radius: 7px;
                             background: #ffffff;
                             border-width: 1px; border-color: #63d8cd;
+                            drop-shadow-blur: 8px;
+                            drop-shadow-color: #63d8cd55;
                         }
                         TouchArea {
                             mouse-cursor: pointer;
@@ -366,6 +388,7 @@ export component SettingsWindow inherits Window {
         border-radius: 9px;
         background: rb.has-hover ? #232c38 : #1a212b;
         border-width: 1px; border-color: #ffffff1c;
+        animate background { duration: 90ms; }
         rb := TouchArea {
             mouse-cursor: pointer;
             clicked => { root.reset-clicked(); }
@@ -382,6 +405,7 @@ export component SettingsWindow inherits Window {
         border-radius: 9px;
         background: cb.has-hover ? #232c38 : #1a212b;
         border-width: 1px; border-color: #ffffff1c;
+        animate background { duration: 90ms; }
         cb := TouchArea {
             mouse-cursor: pointer;
             clicked => { root.cancel-clicked(); }
@@ -397,6 +421,7 @@ export component SettingsWindow inherits Window {
         border-radius: 9px;
         background: sb.has-hover ? #37a49e : #2f8f8a;
         border-width: 1px; border-color: #6fd7cd66;
+        animate background { duration: 90ms; }
         sb := TouchArea {
             mouse-cursor: pointer;
             clicked => { root.save-clicked(); }
@@ -420,6 +445,9 @@ export component SettingsWindow inherits Window {
         border-radius: 14px;
         background: #1b212bf7;
         border-width: 1px; border-color: #ffffff20;
+        drop-shadow-blur: 30px;
+        drop-shadow-color: #000000aa;
+        drop-shadow-offset-y: 10px;
         Text {
             x: 20px; y: 14px; width: parent.width - 40px; height: 28px;
             text: root.picker-title;
@@ -440,6 +468,7 @@ export component SettingsWindow inherits Window {
                     border-radius: 8px;
                     background: idx == root.picker-index ? #2f8f8a3d
                                 : po.has-hover ? #ffffff10 : transparent;
+                    animate background { duration: 90ms; }
                     po := TouchArea {
                         mouse-cursor: pointer;
                         clicked => {

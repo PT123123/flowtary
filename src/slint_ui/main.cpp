@@ -567,10 +567,12 @@ static void show_ui()
 {
     if (!g_ctx) return;
     auto& ctx = *g_ctx;
+    HWND hwnd = ctx.ui->window().win32_hwnd();
+    const bool wasVisible = hwnd && IsWindowVisible(hwnd);
     ctx.ui->set_query(slint::SharedString(""));  // 主进程每次唤起都清空输入
     ctx.ui->set_selected(0);
     ctx.ui->set_alias_open(false);
-    HWND hwnd = ctx.ui->window().win32_hwnd();
+    if (!wasVisible) ctx.ui->set_revealed(false);  // 重新播放淡入上浮
     remove_native_frame(hwnd);
     apply_rounded_region(hwnd);
     position_ui(hwnd, ctx.centerWake);  // 先摆好位置再显示，避免旧位置闪一下
@@ -593,6 +595,7 @@ static void show_ui()
     slint::Timer::single_shot(std::chrono::milliseconds(40), []() {
         if (!g_ctx) return;
         g_ctx->ui->invoke_focus_input();
+        g_ctx->ui->set_revealed(true);
         HWND h = g_ctx->ui->window().win32_hwnd();
         remove_native_frame(h);
         apply_rounded_region(h);
@@ -956,6 +959,12 @@ int main()
     ctx->ui->on_escape_pressed([]() {
         send_req(slintbridge::kReqHide);
         hide_ui();
+    });
+    ctx->ui->on_clear_query([]() {
+        if (!g_ctx) return;
+        g_ctx->ui->set_query(slint::SharedString(""));
+        send_req(slintbridge::kReqText, 0, std::string());
+        g_ctx->ui->invoke_focus_input();
     });
     // Slint 自绘右键菜单
     ctx->ui->on_menu_picked([](int idx) {
