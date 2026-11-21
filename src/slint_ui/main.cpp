@@ -34,6 +34,27 @@
 #  define NOMINMAX
 #endif
 
+// ---- DWM Acrylic（未公开 API）----
+// 只作用在「面板背板」窗口上：整窗亚克力会在 32px 投影边距里留下硬边矩形，
+// 所以模糊交给贴在面板正下方的一层独立窗口，主窗继续画投影与内容。
+enum ACCENT_STATE { ACCENT_ENABLE_ACRYLICBLURBEHIND = 4 };
+struct ACCENT_POLICY { DWORD AccentState, AccentFlags, GradientColor, AnimationId; };
+struct WINDOWCOMPOSITIONATTRIBDATA { DWORD Attrib; void* pvData; SIZE_T cbData; };
+using SetWindowCompositionAttributeFn = BOOL(WINAPI*)(HWND, WINDOWCOMPOSITIONATTRIBDATA*);
+static void enable_acrylic(HWND hwnd, unsigned tint = 0x8A181218)
+{
+    if (!hwnd) return;
+    auto fn = reinterpret_cast<SetWindowCompositionAttributeFn>(
+        GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetWindowCompositionAttribute"));
+    if (!fn) return;
+    ACCENT_POLICY p {};
+    p.AccentState = ACCENT_ENABLE_ACRYLICBLURBEHIND;
+    p.AccentFlags = 2;
+    p.GradientColor = tint;  // ABGR：跟随主题底色
+    WINDOWCOMPOSITIONATTRIBDATA d { 19, &p, sizeof(p) };
+    fn(hwnd, &d);
+}
+
 // ---- 窗口圆角区域 ----
 static void apply_rounded_region(HWND hwnd)
 {
@@ -127,6 +148,93 @@ struct RowView {
 // 窗口四周留给外投影的透明边距（与 main.slint 的 panel 内缩保持一致）
 static constexpr int kUiMargin = 32;
 static constexpr int kUiWidth = 744;   // 面板 680 + 两侧投影边距
+
+// ---- 磨砂玻璃背板窗口 ----
+// 只覆盖面板矩形（不含投影边距），模糊边界就是面板圆角本身；
+// 主窗是逐像素透明的，叠在它上面画投影/高光/内容。
+static HWND g_glass = nullptr;
+static unsigned g_glassTint = 0x8A181218;  // ABGR，随主题底色更新
+
+static LRESULT CALLBACK GlassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+        case WM_ERASEBKGND:
+            return 1;  // 不刷底色，让 DWM 的亚克力透出来
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            BeginPaint(hwnd, &ps);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        case WM_NCHITTEST:
+            return HTTRANSPARENT;  // 点击穿透，不影响主窗整行交互
+        case WM_MOUSEACTIVATE:
+            return MA_NOACTIVATE;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void ensure_glass()
+{
+    if (g_glass) return;
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc {};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = GlassProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = L"FlowtaryGlass";
+        registered = RegisterClassExW(&wc) != 0;
+        if (!registered) return;
+    }
+    g_glass = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_TOPMOST,
+        L"FlowtaryGlass", L"", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr,
+        GetModuleHandleW(nullptr), nullptr);
+    if (!g_glass) return;
+    enable_acrylic(g_glass, g_glassTint);
+    // Win11：让 DWM 也按圆角裁一遍，避免区域与 DWM 圆角不一致时四角露出模糊
+    const DWORD kDwmwaCornerPref = 33;  // DWMWA_WINDOW_CORNER_PREFERENCE
+    int pref = 2;                       // DWMWCP_ROUND
+    DwmSetWindowAttribute(g_glass, kDwmwaCornerPref, &pref, sizeof(pref));
+}
+
+static void set_glass_tint(unsigned tint)
+{
+    g_glassTint = tint;
+    if (g_glass) enable_acrylic(g_glass, tint);
+}
+
+static void hide_glass()
+{
+    if (g_glass) ShowWindow(g_glass, SW_HIDE);
+}
+
+// 背板对齐到主窗面板矩形，并保持在主窗正下方（两窗同为置顶时按 z 序紧贴）
+static void sync_glass(HWND ui)
+{
+    ensure_glass();
+    if (!g_glass) return;
+    if (!ui || !IsWindowVisible(ui)) {
+        hide_glass();
+        return;
+    }
+    RECT rc {};
+    if (!GetWindowRect(ui, &rc)) return;
+    UINT dpi = GetDpiForWindow(ui);
+    if (!dpi) dpi = 96;
+    const int m = MulDiv(kUiMargin, (int)dpi, 96);
+    const int x = rc.left + m, y = rc.top + m;
+    const int w = (rc.right - rc.left) - m * 2, h = (rc.bottom - rc.top) - m * 2;
+    if (w < 32 || h < 32) {
+        hide_glass();
+        return;
+    }
+    const int r = MulDiv(16, (int)dpi, 96);
+    if (HRGN rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, r * 2, r * 2))
+        SetWindowRgn(g_glass, rgn, TRUE);  // takes ownership
+    SetWindowPos(g_glass, ui, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+}
 
 struct UiCtx {
     slint::ComponentHandle<MainWindow> ui;
@@ -507,6 +615,8 @@ static void apply_theme(UiCtx& ctx)
     ctx.ui->set_th_sel_b(color_from_wire(w.selB));
     ctx.ui->set_th_on_accent(color_from_wire(w.onAccent));
     ctx.ui->set_th_radius((float)w.radius);
+    // 亚克力背板染色跟随主题底色：保留 RGB，压低不透明度让背后的模糊透出来
+    set_glass_tint((w.panelTop & 0x00FFFFFFu) | 0x8A000000u);
 }
 
 static void apply_state(UiCtx& ctx)
@@ -619,6 +729,7 @@ static void show_ui()
     remove_native_frame(hwnd);  // show 之后 winit 会重写样式，立刻再压一遍
     apply_topmost(hwnd);
     apply_tool_window(hwnd);  // winit 可能在 show 时又把 APPWINDOW 写回来
+    sync_glass(hwnd);         // 磨砂背板跟着面板走（在投影边距内不铺模糊）
     if (hwnd) {
         DWORD myTid = GetCurrentThreadId();
         HWND fg = GetForegroundWindow();
@@ -641,6 +752,7 @@ static void show_ui()
         remove_native_frame(h);
         apply_rounded_region(h);
         position_ui(h, g_ctx->centerWake);
+        sync_glass(h);
     });
 }
 
@@ -659,6 +771,7 @@ static void hide_ui()
         }
     }
     g_ctx->ui->window().hide();
+    hide_glass();
 }
 
 // 读取桥里的单段文本槽（别名预填 / toast 文案）
@@ -816,7 +929,16 @@ static LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             break;
         case WM_SHOWWINDOW:
             // 每次重新显示都压一遍无边框样式：窗口隐藏期间 winit 可能写过样式
-            if (wp) remove_native_frame(hwnd);
+            if (wp) {
+                remove_native_frame(hwnd);
+                sync_glass(hwnd);
+            } else {
+                hide_glass();
+            }
+            break;
+        case WM_WINDOWPOSCHANGED:
+            // 移动/改高（结果增减、菜单撑高、别名覆盖层）时背板同步贴合面板
+            if (IsWindowVisible(hwnd)) sync_glass(hwnd);
             break;
         case WM_SIZE:
             // 动态高度：尺寸一落地就同步更新圆角区域，避免旧区域的残帧
@@ -1103,6 +1225,7 @@ int main()
     apply_rounded_region(h0);
     apply_topmost(h0);
     apply_tool_window(h0);
+    sync_glass(h0);
     if (!g_origUiWndProc)
         g_origUiWndProc = (WNDPROC)SetWindowLongPtrW(h0, GWLP_WNDPROC, (LONG_PTR)UiWndProc);
     position_ui(h0, ctx->centerWake);
