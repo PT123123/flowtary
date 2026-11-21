@@ -123,7 +123,7 @@ static LONG g_lastStateSeq = 0;
 static LONG g_lastCmdTail = 0;
 static bool g_uiActive = false;
 static bool g_brainSeen = false;
-static bool g_menuOpen = false;  // 主进程正弹结果右键菜单：期间不因失焦自动隐藏
+static bool g_holdHide = false;  // 主进程自己的对话框开着：失焦不隐藏
 
 // 一行结果（来自主进程的状态槽）
 struct RowView {
@@ -139,11 +139,20 @@ struct RowView {
 struct UiCtx {
     slint::ComponentHandle<MainWindow> ui;
     std::shared_ptr<slint::VectorModel<ResultItem>> model;
+    std::shared_ptr<slint::VectorModel<MenuItem>> menuModel;
     std::vector<RowView> rows;
     std::unordered_map<std::wstring, slint::Image> iconCache;   // 小写路径 -> 图标
     std::unordered_map<std::wstring, bool> iconRequested;        // 小写路径 -> 已排队
     bool centerWake = true;   // 屏幕居中唤醒（跟随鼠标为 false）
     int windowHeight = 300;   // 逻辑像素；按结果行数动态伸缩
+    // Slint 自绘右键菜单的状态（不再有原生菜单窗口）
+    bool menuOpen = false;
+    int menuRow = -1;         // 锚定的结果行
+    int menuSel = 0;          // 高亮项
+    int menuX = 392, menuY = 70, menuW = 288;
+    int menuBaseH = 0;        // 打开菜单前的内容高度
+    int menuHeightNow = 0;    // 菜单打开时窗口实际高度
+    std::vector<int> menuIds; // 菜单项对应的命令 id
     UiCtx() : ui(MainWindow::create()) {}
 };
 static std::shared_ptr<UiCtx> g_ctx;
@@ -277,6 +286,15 @@ static void apply_topmost(HWND hwnd)
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 
+// 工具窗：不进任务栏/Alt+Tab（GDI 版一直如此，winit 默认带 WS_EX_APPWINDOW）
+static void apply_tool_window(HWND hwnd)
+{
+    if (!hwnd) return;
+    LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    LONG_PTR want = (ex | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW;
+    if (want != ex) SetWindowLongPtrW(hwnd, GWL_EXSTYLE, want);
+}
+
 static void position_ui(HWND hwnd, bool center);
 
 // 与 main.slint 结果列表排版对应：y=70 起、行间距 2px、提示行 34px 其余 54px
@@ -291,19 +309,11 @@ static int row_at_client_y(const UiCtx& ctx, int y)
     return -1;
 }
 
-// 请求主进程弹第 idx 行的右键菜单（-1 = 当前选中行）。
-// 菜单由主进程创建（那里才有行数据和全部命令逻辑），这里先压住失焦隐藏。
+// 请求第 idx 行的右键菜单（-1 = 当前选中行）。命令表由主进程写进桥，
+// 菜单本身由 Slint 在本窗口内自绘。
 static void request_row_menu(int idx)
 {
     if (!g_ctx || g_ctx->rows.empty()) return;
-    g_menuOpen = true;
-    // 菜单由主进程弹出，而此刻前台是本进程：允许大脑把菜单 owner 设为前台，
-    // 否则菜单收不到键盘（Esc/方向键），点菜单外也不会关闭。
-    if (g_brain && IsWindow(g_brain)) {
-        DWORD pid = 0;
-        GetWindowThreadProcessId(g_brain, &pid);
-        if (pid) AllowSetForegroundWindow(pid);
-    }
     send_req(slintbridge::kReqRowMenu, idx);
 }
 
@@ -316,6 +326,90 @@ static int compute_window_height(const UiCtx& ctx, bool hasQuery)
         content += (r.kind == slintbridge::kRowHint ? 34 : 54);
     content += ((int)ctx.rows.size() - 1) * 2;
     return 70 + content + 12 + 34;
+}
+
+// 某一行在列表里的顶部坐标（与 main.slint 排版一致）
+static int row_top_of(const UiCtx& ctx, int row)
+{
+    int top = 70;
+    for (int i = 0; i < row && i < (int)ctx.rows.size(); ++i)
+        top += (ctx.rows[i].kind == slintbridge::kRowHint ? 34 : 54) + 2;
+    return top;
+}
+
+// Slint 自绘右键菜单：主进程已把命令表写进桥，这里读出来交给界面
+static void show_row_menu(UiCtx& ctx)
+{
+    if (!g_bridge) return;
+    LONG published = InterlockedCompareExchange(&g_bridge->menuSeq, 0, 0);
+    if (published == 0) return;
+    const slintbridge::MenuSlot& m = g_bridge->menu;
+    if ((unsigned)published != m.seq) return;  // 读到半截写入，等下一次
+    if (m.count <= 0 || ctx.rows.empty()) return;
+    const int count = m.count < slintbridge::kMenuMaxItems ? (int)m.count
+                                                          : slintbridge::kMenuMaxItems;
+
+    std::vector<MenuItem> items;
+    ctx.menuIds.clear();
+    items.reserve(count);
+    for (int i = 0; i < count; ++i) {
+        const auto& src = m.items[i];
+        MenuItem mi;
+        const size_t labelLen = src.labelLen < sizeof(src.label) ? src.labelLen : sizeof(src.label);
+        std::string label(src.label, labelLen);
+        mi.label = slint::SharedString(label.c_str());
+        mi.is_default = (src.flags & 1) != 0;
+        items.push_back(std::move(mi));
+        ctx.menuIds.push_back(src.id);
+    }
+
+    int row = m.row;
+    if (row < 0 || row >= (int)ctx.rows.size()) row = 0;
+    ctx.menuRow = row;
+    ctx.menuSel = 0;
+    ctx.menuW = 288;
+    ctx.menuBaseH = ctx.menuOpen ? ctx.menuBaseH : ctx.windowHeight;
+
+    const int menuH = count * 32 + 10;  // 与 main.slint 的菜单排版常量一致
+    int y = row_top_of(ctx, row) - 4;
+    if (y + menuH > ctx.menuBaseH - 10) y = ctx.menuBaseH - 10 - menuH;
+    if (y < 66) y = 66;
+    const int needH = ctx.menuBaseH > y + menuH + 10 ? ctx.menuBaseH : y + menuH + 10;
+
+    ctx.menuX = 680 - 8 - ctx.menuW;
+    ctx.menuY = y;
+    ctx.menuOpen = true;
+    ctx.menuHeightNow = needH;
+    ctx.menuModel->set_vector(std::move(items));
+    ctx.ui->set_menu_x((float)ctx.menuX);
+    ctx.ui->set_menu_y((float)ctx.menuY);
+    ctx.ui->set_menu_width((float)ctx.menuW);
+    ctx.ui->set_menu_selected(0);
+    ctx.ui->set_menu_open(true);
+    if (needH != ctx.windowHeight)
+        ctx.ui->set_window_height((float)needH);  // 菜单可能比内容高，窗口临时撑大
+}
+
+static void close_row_menu(UiCtx& ctx, bool notify)
+{
+    if (!ctx.menuOpen) return;
+    ctx.menuOpen = false;
+    ctx.menuIds.clear();
+    ctx.ui->set_menu_open(false);
+    if (ctx.menuHeightNow != ctx.windowHeight)
+        ctx.ui->set_window_height((float)ctx.windowHeight);  // 收回临时撑高的部分
+    ctx.menuHeightNow = ctx.windowHeight;
+    if (notify) send_req(slintbridge::kReqMenuDismiss);
+    ctx.ui->invoke_focus_input();
+}
+
+static void pick_row_menu(UiCtx& ctx, int idx)
+{
+    if (!ctx.menuOpen) return;
+    if (idx < 0 || idx >= (int)ctx.menuIds.size()) return;
+    const int id = ctx.menuIds[idx];
+    close_row_menu(ctx, false);
+    send_req(slintbridge::kReqMenuPick, id);
 }
 
 static void apply_state(UiCtx& ctx)
@@ -445,6 +539,7 @@ static void hide_ui()
 {
     if (!g_ctx) return;
     g_uiActive = false;
+    if (g_ctx->menuOpen) close_row_menu(*g_ctx, false);  // 隐藏时顺手收掉菜单
     g_ctx->ui->window().hide();
 }
 
@@ -471,12 +566,9 @@ static void on_bridge_update()
                 case slintbridge::kCmdShow: show_ui(); break;
                 case slintbridge::kCmdHide: hide_ui(); break;
                 case slintbridge::kCmdQuit: slint::quit_event_loop(); break;
-                case slintbridge::kCmdMenuBegin: g_menuOpen = true; break;
-                case slintbridge::kCmdMenuEnd:
-                    g_menuOpen = false;
-                    // 菜单关闭后主进程会把前台还回来，这里顺手把焦点给回搜索框
-                    if (g_ctx) g_ctx->ui->invoke_focus_input();
-                    break;
+                case slintbridge::kCmdMenuShow: show_row_menu(*g_ctx); break;
+                case slintbridge::kCmdHoldShow: g_holdHide = true; break;
+                case slintbridge::kCmdReleaseShow: g_holdHide = false; break;
                 default: break;
             }
         }
@@ -511,19 +603,43 @@ static LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                                   WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX)) | WS_POPUP;
             }
             return 0;
+        case WM_NCCALCSIZE:
+            // 最后一道保险：客户区铺满整窗。即使某个时刻样式里混进了
+            // WS_CAPTION，也永远不会画出标题栏/边框。
+            if (wp) return 0;
+            break;
         case WM_SIZE:
             // 动态高度：尺寸一落地就同步更新圆角区域，避免旧区域的残帧
             if (wp != SIZE_MINIMIZED) apply_rounded_region(hwnd);
             break;
         case WM_KEYDOWN:
+            if (g_ctx && g_ctx->menuOpen) {
+                // 菜单打开时自己接管上下/回车/Esc（不让 TextInput 吃掉）
+                int n = (int)g_ctx->menuIds.size();
+                if (wp == VK_UP || wp == VK_DOWN) {
+                    if (n > 0) {
+                        int s = (g_ctx->menuSel + (wp == VK_UP ? -1 : 1) + n) % n;
+                        g_ctx->menuSel = s;
+                        g_ctx->ui->set_menu_selected(s);
+                    }
+                    return 0;
+                }
+                if (wp == VK_RETURN) { pick_row_menu(*g_ctx, g_ctx->menuSel); return 0; }
+                if (wp == VK_ESCAPE) { close_row_menu(*g_ctx, true); return 0; }
+            }
             // 应用键：打开当前结果的右键菜单（与 GDI 版一致）
             if (wp == VK_APPS) {
                 request_row_menu(-1);
                 return 0;
             }
             break;
+        case WM_CHAR:
+        case WM_SYSCHAR:
+            // 菜单打开时不要再用按键改动搜索词（菜单是模态的）
+            if (g_ctx && g_ctx->menuOpen) return 0;
+            break;
         case WM_RBUTTONUP: {
-            // 结果行右键菜单交给主进程弹（行数据与命令逻辑都在那边）
+            if (g_ctx && g_ctx->menuOpen) { close_row_menu(*g_ctx, true); return 0; }
             int y = (int)(short)HIWORD(lp);
             UINT dpi = GetDpiForWindow(hwnd);
             if (!dpi) dpi = 96;
@@ -534,6 +650,7 @@ static LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         case WM_SYSKEYDOWN: {
             WPARAM vk = wp;
+            if (g_ctx && g_ctx->menuOpen) return 0;  // 菜单打开时不响应 Alt 组合
             // Shift+F10：打开当前结果的右键菜单（与 GDI 版一致）
             if (vk == VK_F10 && (GetKeyState(VK_SHIFT) & 0x8000) != 0) {
                 request_row_menu(-1);
@@ -555,8 +672,7 @@ static LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         case WM_ACTIVATE:
             if (LOWORD(wp) == WA_INACTIVE) {
-                // 右键菜单归主进程所有，弹出时本窗口会短暂失焦，不能当成「点走了」
-                if (g_uiActive && !g_menuOpen) {
+                if (g_uiActive && !g_holdHide) {
                     g_uiActive = false;
                     send_req(slintbridge::kReqHide);
                 }
@@ -628,6 +744,8 @@ int main()
     parse_launch_args();
     ctx->model = std::make_shared<slint::VectorModel<ResultItem>>();
     ctx->ui->set_items(ctx->model);
+    ctx->menuModel = std::make_shared<slint::VectorModel<MenuItem>>();
+    ctx->ui->set_menu_items(ctx->menuModel);
 
     // IPC 窗口：主进程靠类名找到我们
     WNDCLASSEXW wc {};
@@ -671,6 +789,13 @@ int main()
         send_req(slintbridge::kReqHide);
         hide_ui();
     });
+    // Slint 自绘右键菜单
+    ctx->ui->on_menu_picked([](int idx) {
+        if (g_ctx) pick_row_menu(*g_ctx, idx);
+    });
+    ctx->ui->on_menu_dismissed([]() {
+        if (g_ctx) close_row_menu(*g_ctx, true);
+    });
 
     // 窗口创建后置顶/圆角/Acrylic
     slint::Timer::single_shot(std::chrono::milliseconds(80), [ctx]() {
@@ -712,6 +837,7 @@ int main()
     enable_acrylic(h0);
     apply_rounded_region(h0);
     apply_topmost(h0);
+    apply_tool_window(h0);
     if (!g_origUiWndProc)
         g_origUiWndProc = (WNDPROC)SetWindowLongPtrW(h0, GWLP_WNDPROC, (LONG_PTR)UiWndProc);
     position_ui(h0, ctx->centerWake);

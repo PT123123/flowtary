@@ -445,6 +445,7 @@ static void ShowTopToast(HWND target, const std::wstring& text);  // 屏幕居�
 static void SlintBridgeEnsure();
 static void SlintPushState();
 static void SlintSendCmd(int cmd);
+static void SlintPushRowMenu();
 static void SlintHandleRequests();
 static bool TryAltHotkeyDirect(WPARAM wParam);
 static HWND SlintIpcWindow();
@@ -2957,50 +2958,7 @@ static void OwnerDrawMenuItem(HWND hwnd, DRAWITEMSTRUCT* dis) {
     DrawTextW(dis->hDC, text, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 }
 
-// 结果右键菜单的 owner 窗口。Slint 引擎下主窗口是隐藏的，隐藏窗口无法成为
-// 前台窗口，菜单收不到键盘（Esc/方向键关不掉）；用 1x1 全透明置顶工具窗做 owner，
-// 菜单就能正常收键盘，点菜单外面也会关闭。GDI 引擎仍用主窗口当 owner。
-static LRESULT CALLBACK MenuOwnerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
-{
-    switch (msg) {
-        case WM_MEASUREITEM:
-            OwnerMeasureMenuItem(hwnd, (MEASUREITEMSTRUCT*)lp);
-            return TRUE;
-        case WM_DRAWITEM:
-            OwnerDrawMenuItem(hwnd, (DRAWITEMSTRUCT*)lp);
-            return TRUE;
-        case WM_ERASEBKGND:
-            return 1;
-        default:
-            break;
-    }
-    return DefWindowProcW(hwnd, msg, wp, lp);
-}
-
-static HWND EnsureMenuOwner()
-{
-    static HWND s_owner = nullptr;
-    if (s_owner && IsWindow(s_owner)) return s_owner;
-    static bool registered = false;
-    if (!registered) {
-        WNDCLASSEXW wc{};
-        wc.cbSize = sizeof(wc);
-        wc.lpfnWndProc = MenuOwnerProc;
-        wc.hInstance = g.inst;
-        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        wc.lpszClassName = L"FlowtaryMenuOwner";
-        if (!RegisterClassExW(&wc)) return nullptr;
-        registered = true;
-    }
-    HWND h = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED,
-                             L"FlowtaryMenuOwner", L"", WS_POPUP, -32000, -32000, 1, 1,
-                             nullptr, nullptr, g.inst, nullptr);
-    if (!h) return nullptr;
-    SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);  // 完全透明，只用来当 owner
-    ShowWindow(h, SW_SHOWNOACTIVATE);
-    s_owner = h;
-    return h;
-}
+static bool RunRowMenuCommand(int cmd);  // 定义在 ShowRowMenu 之后，两个引擎共用
 
 static void ShowRowMenu(HWND hwnd) {
     if (g.sel < 0 || g.sel >= (int)g.items.size()) return;
@@ -3051,6 +3009,15 @@ static void ShowRowMenu(HWND hwnd) {
                              hwnd, nullptr);
     DestroyMenu(menu);
 
+    bool done = RunRowMenuCommand(cmd);
+    if (done) Hide();
+}
+
+// 执行一条右键菜单命令；返回 true 表示处理完应隐藏启动器。
+// GDI 原生菜单与 Slint 自绘菜单共用这一份逻辑。
+static bool RunRowMenuCommand(int cmd) {
+    if (g.sel < 0 || g.sel >= (int)g.items.size()) return false;
+    Row& r = g.items[g.sel];
     bool done = true;
     switch (cmd) {
         case IDM_OPEN:
@@ -3082,7 +3049,10 @@ static void ShowRowMenu(HWND hwnd) {
             // 先拷出目标再弹输入框：弹窗有嵌套消息循环，期间 g.items 可能被刷新改动
             std::wstring target = r.action, name = r.title;
             done = false;  // 加完别名留在启动器里，不自动隐藏
+            // 输入框会让 Slint 启动器短暂失焦；先让它别把这次失焦当成「点走了」
+            if (g.uiEngine == 1) SlintSendCmd(slintbridge::kCmdHoldShow);
             AddAliasForRow(target, name);
+            if (g.uiEngine == 1) SlintSendCmd(slintbridge::kCmdReleaseShow);
             break;
         }
         case IDM_OPENCMD: {
@@ -3118,7 +3088,7 @@ static void ShowRowMenu(HWND hwnd) {
         default:
             done = false;  // 未选择任何项
     }
-    if (done) Hide();
+    return done;
 }
 
 // ---------------- 文本编辑 ----------------
@@ -5513,6 +5483,62 @@ static void SlintSendCmd(int cmd) {
     if (HWND ipc = SlintIpcWindow()) PostMessageW(ipc, slintbridge::kKickToRender, 0, 0);
 }
 
+// 当前菜单锚定的行：菜单开着时结果可能被别处刷新，执行命令时回到这一行
+static int g_slintMenuRow = -1;
+
+// 把当前行的右键菜单命令写进桥，由渲染器用 Slint 自绘展示。
+// 命令条件与 GDI 版 ShowRowMenu 完全一致，执行逻辑也共用 RunRowMenuCommand。
+static void SlintPushRowMenu()
+{
+    if (g.uiEngine != 1 || !g.bridge) return;
+    if (g.sel < 0 || g.sel >= (int)g.items.size()) return;
+    const Row& r = g.items[g.sel];
+    if (r.kind == Row::Hint) return;
+
+    slintbridge::MenuSlot& m = g.bridge->menu;
+    m.row = g.sel;
+    m.count = 0;
+    auto add = [&](int id, const wchar_t* label, bool def = false) {
+        if (m.count >= slintbridge::kMenuMaxItems) return;
+        slintbridge::MenuItemWire& it = m.items[m.count++];
+        it.id = id;
+        it.flags = def ? 1 : 0;
+        int n = WideCharToMultiByte(CP_UTF8, 0, label, -1, it.label,
+                                    slintbridge::kMenuLabelMax, nullptr, nullptr);
+        it.labelLen = n > 0 ? (unsigned)(n - 1) : 0;
+        if (n <= 0) it.label[0] = 0;
+    };
+    if (r.kind == Row::Window) {
+        add(IDM_WIN_SWITCH, L"切换到此窗口", true);
+        add(IDM_WIN_CLOSE, L"关闭窗口");
+        add(IDM_WIN_KILL, L"结束进程");
+        add(IDM_COPYTITLE, L"复制标题");
+        add(IDM_COPYPROC, L"复制进程名");
+    } else {
+        add(IDM_OPEN, r.kind == Row::Reveal ? L"打开所在文件夹" : L"打开", true);
+        if (r.kind == Row::File || r.kind == Row::Folder || r.kind == Row::Prog)
+            add(IDM_OPENLOC, L"打开所在文件夹");
+        if (r.kind == Row::Reveal) add(IDM_OPENFILE, L"打开文件");
+        if ((r.kind == Row::File || r.kind == Row::Folder || r.kind == Row::Prog) &&
+            GetFileAttributesW(r.action.c_str()) != INVALID_FILE_ATTRIBUTES)
+            add(IDM_ADDALIAS, L"添加别名…");
+        if (r.kind == Row::File || r.kind == Row::Prog)
+            add(IDM_RUNAS, L"以管理员模式打开");
+        if (r.kind == Row::Shell) add(IDM_SHELL_ADMIN, L"以管理员运行");
+        if (r.kind == Row::Folder || r.kind == Row::File || r.kind == Row::Reveal ||
+            r.kind == Row::Prog)
+            add(IDM_OPENCMD, r.kind == Row::Folder ? L"用此路径打开命令行"
+                                                   : L"在所在目录打开命令行");
+        add(IDM_COPYPATH, r.kind == Row::Web ? L"复制链接"
+                          : r.kind == Row::Shell ? L"复制命令" : L"复制路径");
+    }
+    if (!m.count) return;
+    g_slintMenuRow = m.row;
+    unsigned seq = ++m.seq;
+    InterlockedExchange(&g.bridge->menuSeq, (LONG)seq);  // 先写数据再发布序号
+    SlintSendCmd(slintbridge::kCmdMenuShow);
+}
+
 // 大脑消费渲染器的请求环
 static void SlintHandleRequests() {
     SlintBridgeEnsure();   // 首次唤起时映射可能还没建（渲染器先建也一样）
@@ -5555,32 +5581,25 @@ static void SlintHandleRequests() {
                 break;
             }
             case slintbridge::kReqRowMenu: {
-                static bool menuOpen = false;
-                if (menuOpen) break;  // 菜单自身的嵌套消息循环里不再重入
                 int idx = r.arg;
                 if (idx >= 0 && idx < (int)g.items.size()) {
                     g.sel = idx;
                     SlintPushState();  // 先把高亮挪到右键那一行
                 }
-                menuOpen = true;
-                // 菜单归主进程创建；先让渲染器别把失焦当成「点走了」而隐藏
-                SlintSendCmd(slintbridge::kCmdMenuBegin);
-                // Slint 模式主窗口是隐藏的，隐藏窗口当 owner 收不到键盘，
-                // 改用专用透明 owner（GDI 模式仍用主窗口）
-                HWND owner = (g.uiEngine == 1) ? EnsureMenuOwner() : nullptr;
-                if (!owner) owner = g.hwnd;
-                if (g.sel >= 0 && g.sel < (int)g.items.size() &&
-                    g.items[g.sel].kind != Row::Hint)
-                    ShowRowMenu(owner);
-                // 先把前台还给渲染器，再撤掉临时 owner，最后通知菜单结束（恢复聚焦）
-                if (owner != g.hwnd) {
-                    if (HWND ui = SlintUiWindow()) SetForegroundWindow(ui);
-                    ShowWindow(owner, SW_HIDE);
-                }
-                SlintSendCmd(slintbridge::kCmdMenuEnd);
-                menuOpen = false;
+                SlintPushRowMenu();    // 命令表写进桥，渲染器用 Slint 自绘菜单
                 break;
             }
+            case slintbridge::kReqMenuPick: {
+                // 菜单选择：与 GDI 原生菜单共用同一份命令执行逻辑
+                if (g_slintMenuRow >= 0 && g_slintMenuRow < (int)g.items.size())
+                    g.sel = g_slintMenuRow;
+                g_slintMenuRow = -1;
+                if (RunRowMenuCommand(r.arg)) Hide();
+                break;
+            }
+            case slintbridge::kReqMenuDismiss:
+                g_slintMenuRow = -1;
+                break;
             case slintbridge::kReqHide:
                 Hide();
                 break;

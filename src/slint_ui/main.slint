@@ -16,6 +16,11 @@ struct ResultItem {
     icon-bg: color,
 }
 
+struct MenuItem {
+    label: string,
+    is-default: bool,
+}
+
 export component MainWindow inherits Window {
     width: 680px;
     height: root.window-height;
@@ -29,6 +34,13 @@ export component MainWindow inherits Window {
     in-out property <string> query: "";
     in-out property <bool> empty: false;          // 无结果时显示 welcome 面板
     in-out property <length> window-height: 300px; // C++ 按结果行数动态设置
+    // Slint 自绘右键菜单（不再使用原生 GDI 菜单）
+    in-out property <[MenuItem]> menu-items: [];
+    in-out property <bool> menu-open: false;
+    in-out property <int> menu-selected: 0;
+    in-out property <length> menu-x: 392px;
+    in-out property <length> menu-y: 70px;
+    in-out property <length> menu-width: 288px;
 
     // → C++ 回调
     callback query-changed(string);
@@ -37,6 +49,8 @@ export component MainWindow inherits Window {
     callback escape-pressed();
     callback move-selection(int);       // -1 / +1
     callback focus-input();              // 请求把焦点给搜索框
+    callback menu-picked(int);           // 选中右键菜单第 idx 项
+    callback menu-dismissed();           // 点击菜单外/按 Esc 关闭
 
     // —— 面板底板：DWM Acrylic 之上再叠一层冷色渐变 + 顶部高光 ——
     Rectangle {
@@ -254,8 +268,8 @@ export component MainWindow inherits Window {
         }
     }
 
-    // —— 底部快捷键提示（有结果时显示）——
-    if !root.empty: Rectangle {
+    // —— 底部快捷键提示（有结果且菜单未打开时显示）——
+    if !root.empty && !root.menu-open: Rectangle {
         x: 16px; y: root.window-height - 34px; width: parent.width - 32px; height: 34px;
         Rectangle {
             x: 0; y: 0; width: 100%; height: 1px;
@@ -382,6 +396,47 @@ export component MainWindow inherits Window {
             color: #8b96ae;
             font-size: 12px;
             horizontal-alignment: center;
+        }
+    }
+
+    // —— Slint 自绘右键菜单 ——
+    // 点击菜单外关闭（透明层只负责吃点击）
+    if root.menu-open: Rectangle {
+        x: 0; y: 0; width: 100%; height: 100%;
+        TouchArea {
+            clicked => { root.menu-dismissed(); }
+        }
+    }
+    if root.menu-open: Rectangle {
+        x: root.menu-x; y: root.menu-y;
+        width: root.menu-width;
+        height: root.menu-items.length * 32px + 10px;
+        border-radius: 12px;
+        background: #191e27f5;
+        border-width: 1px;
+        border-color: #ffffff1f;
+
+        VerticalLayout {
+            x: 5px; y: 5px; width: parent.width - 10px;
+            for item[idx] in root.menu-items: Rectangle {
+                height: 32px;
+                border-radius: 8px;
+                background: idx == root.menu-selected ? #ffffff14 : transparent;
+                Text {
+                    x: 10px; y: 0; width: parent.width - 20px; height: 100%;
+                    text: item.label;
+                    color: item.is-default ? #b7efe8 : #e7ecf5;
+                    font-size: 12.5px;
+                    font-weight: item.is-default ? 600 : 400;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+                TouchArea {
+                    mouse-cursor: pointer;
+                    moved => { root.menu-selected = idx; }
+                    clicked => { root.menu-picked(idx); }
+                }
+            }
         }
     }
 
