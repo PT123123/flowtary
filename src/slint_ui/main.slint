@@ -21,6 +21,102 @@ struct MenuItem {
     is-default: bool,
 }
 
+// 别名输入卡片：铺满启动器窗口（含压暗层 + 居中卡片）
+component AliasCard inherits Rectangle {
+    width: 100%;
+    height: 100%;
+    in-out property <string> title: "添加别名";
+    in-out property <string> value: "";
+    callback value-changed(string);
+    callback committed(string);
+    callback cancelled();
+
+    Rectangle {
+        width: 100%; height: 100%;
+        background: #05070bcc;
+        // 吃掉点击，避免穿透到下面的结果行
+        TouchArea { }
+    }
+    Rectangle {
+        x: 60px; y: 96px;
+        width: parent.width - 120px; height: 172px;
+        border-radius: 14px;
+        background: #1b212bf7;
+        border-width: 1px;
+        border-color: #ffffff20;
+        drop-shadow-blur: 24px;
+        drop-shadow-color: #00000066;
+
+        Text {
+            x: 20px; y: 16px; width: parent.width - 40px; height: 24px;
+            text: root.title;
+            color: #ffffff;
+            font-size: 15px; font-weight: 600;
+            vertical-alignment: center;
+        }
+        Text {
+            x: 20px; y: 40px; width: parent.width - 40px; height: 18px;
+            text: "输入一个更好记的名字，回车确认（Esc 取消）";
+            color: #8b96ae; font-size: 11.5px;
+            vertical-alignment: center;
+        }
+        Rectangle {
+            x: 20px; y: 66px; width: parent.width - 40px; height: 38px;
+            border-radius: 9px;
+            background: #0d1117;
+            border-width: 1px;
+            border-color: #63d8cd55;
+            field := TextInput {
+                x: 10px; y: 0; width: parent.width - 20px; height: 100%;
+                vertical-alignment: center;
+                text <=> root.value;
+                color: #ffffff;
+                font-size: 14px;
+                selection-foreground-color: #0b1017;
+                selection-background-color: #63d8cd;
+                edited => { root.value-changed(root.value); }
+                accepted => { root.committed(root.value); }
+                key-pressed(e) => {
+                    if (e.text == Key.Escape) { root.cancelled(); return accept; }
+                    return reject;
+                }
+            }
+        }
+        // 取消 / 确认
+        Rectangle {
+            x: parent.width - 178px; y: 118px; width: 72px; height: 32px;
+            border-radius: 9px;
+            background: #ffffff0d;
+            border-width: 1px; border-color: #ffffff18;
+            Text {
+                width: 100%; height: 100%;
+                text: "取消"; color: #b9c3d6; font-size: 12px;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
+            TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.cancelled(); }
+            }
+        }
+        Rectangle {
+            x: parent.width - 98px; y: 118px; width: 78px; height: 32px;
+            border-radius: 9px;
+            background: #2f8f8a;
+            border-width: 1px; border-color: #6fd7cd66;
+            Text {
+                width: 100%; height: 100%;
+                text: "确认"; color: #ffffff; font-size: 12px; font-weight: 600;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
+            TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.committed(root.value); }
+            }
+        }
+    }
+    init => { field.focus(); }
+}
+
 export component MainWindow inherits Window {
     width: 680px;
     height: root.window-height;
@@ -41,6 +137,10 @@ export component MainWindow inherits Window {
     in-out property <length> menu-x: 392px;
     in-out property <length> menu-y: 70px;
     in-out property <length> menu-width: 288px;
+    // 添加别名输入覆盖层（替代原生对话框，与启动器同一套视觉）
+    in-out property <bool> alias-open: false;
+    in-out property <string> alias-text: "";
+    in-out property <string> alias-title: "添加别名";
 
     // → C++ 回调
     callback query-changed(string);
@@ -51,6 +151,8 @@ export component MainWindow inherits Window {
     callback focus-input();              // 请求把焦点给搜索框
     callback menu-picked(int);           // 选中右键菜单第 idx 项
     callback menu-dismissed();           // 点击菜单外/按 Esc 关闭
+    callback alias-committed(string);
+    callback alias-cancelled();
 
     // —— 面板底板：DWM Acrylic 之上再叠一层冷色渐变 + 顶部高光 ——
     Rectangle {
@@ -440,5 +542,45 @@ export component MainWindow inherits Window {
         }
     }
 
+    // —— 添加别名：窗口内输入覆盖层（独立组件，方便创建时聚焦输入框） ——
+    if root.alias-open: AliasCard {
+        title: root.alias-title;
+        value: root.alias-text;
+        value-changed(v) => { root.alias-text = v; }
+        committed(t) => { root.alias-committed(t); }
+        cancelled => { root.alias-cancelled(); }
+    }
+
     focus-input => { input.focus(); }
+}
+
+
+// —— 顶部 toast：独立无边框窗口，点击穿透、自动消失 ——
+export component ToastWindow inherits Window {
+    width: 360px;
+    height: 56px;
+    no-frame: true;
+    background: transparent;
+    default-font-family: "Segoe UI";
+    in-out property <string> message: "";
+
+    Rectangle {
+        x: 0; y: 0; width: 100%; height: 100%;
+        border-radius: 14px;
+        background: #1b212bf2;
+        border-width: 1px;
+        border-color: #ffffff1f;
+        drop-shadow-blur: 18px;
+        drop-shadow-color: #00000055;
+        Text {
+            x: 18px; y: 0; width: parent.width - 36px; height: 100%;
+            text: root.message;
+            color: #f2f6fc;
+            font-size: 13px;
+            font-weight: 500;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
 }

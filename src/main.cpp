@@ -426,6 +426,7 @@ static void RecordLearned(const Row& r);
 static void RerankByTier();  // 热度档统一重排（定义在自学习段，Refresh 先用到）
 static void PrependLearnedRows(const std::wstring& term);
 static void AddAliasForRow(const std::wstring& target, const std::wstring& defaultName);
+static bool ApplyAliasForRow(const std::wstring& target, const std::wstring& name);
 static void SaveLearnedNow();
 static void LoadLearned();
 static void ClearLearned();
@@ -446,10 +447,13 @@ static void SlintBridgeEnsure();
 static void SlintPushState();
 static void SlintSendCmd(int cmd);
 static void SlintPushRowMenu();
+static void SlintPushAliasPrompt(const std::wstring& defaultName);
+static void SlintShowToast(const std::wstring& text);
 static void SlintHandleRequests();
 static bool TryAltHotkeyDirect(WPARAM wParam);
 static HWND SlintIpcWindow();
 static HWND SlintUiWindow();
+static std::wstring g_slintAliasTarget;  // Slint 别名覆盖层正在编辑的目标路径
 
 // 行 → 可触发序号（Hint 行不算）：返回第几个可执行项（用于分配数字徽章），-1=不可触发
 static int HotkeySeq(int itemIdx) {
@@ -3049,10 +3053,15 @@ static bool RunRowMenuCommand(int cmd) {
             // 先拷出目标再弹输入框：弹窗有嵌套消息循环，期间 g.items 可能被刷新改动
             std::wstring target = r.action, name = r.title;
             done = false;  // 加完别名留在启动器里，不自动隐藏
-            // 输入框会让 Slint 启动器短暂失焦；先让它别把这次失焦当成「点走了」
-            if (g.uiEngine == 1) SlintSendCmd(slintbridge::kCmdHoldShow);
-            AddAliasForRow(target, name);
-            if (g.uiEngine == 1) SlintSendCmd(slintbridge::kCmdReleaseShow);
+            if (g.uiEngine == 1) {
+                // Slint 引擎：输入覆盖层在渲染器里画，主进程只记住目标等回传
+                g_slintAliasTarget = target;
+                SlintSendCmd(slintbridge::kCmdHoldShow);
+                SlintPushAliasPrompt(name);
+            } else {
+                // GDI 引擎：沿用原生输入框
+                AddAliasForRow(target, name);
+            }
             break;
         }
         case IDM_OPENCMD: {
@@ -4389,11 +4398,18 @@ static void AddAliasForRow(const std::wstring& target, const std::wstring& defau
     std::wstring name = PromptLine(L"添加别名", L"输入一个更好记的名字，回车确认（Esc 取消）",
                                    defaultName);
     if (name.empty()) return;
+    ApplyAliasForRow(target, name);
+}
+
+// 真正落库：把「别名 → 目标」登记为学习项并镜像 .lnk。
+// GDI 版的输入框与 Slint 覆盖层都走到这里，保存逻辑只有这一份。
+static bool ApplyAliasForRow(const std::wstring& target, const std::wstring& name) {
+    if (target.empty()) return false;
     std::wstring term = NormalizeSearchTerm(name);
     // 别名会被当成搜索词：路径/百分号形式学了没意义，直接拒绝
     if (term.empty() || term.find(L'\\') != std::wstring::npos ||
         term.find(L'/') != std::wstring::npos || term.find(L'%') != std::wstring::npos)
-        return;
+        return false;
 
     auto& m = g.learned[term];
     auto it = m.find(target);
@@ -4437,7 +4453,7 @@ static void AddAliasForRow(const std::wstring& target, const std::wstring& defau
                 if (g.learnCount > 0) --g.learnCount;
                 if (m.empty()) g.learned.erase(term);
             }
-            return;
+            return false;
         }
     }
     if (!it->second.lnk.empty() && _wcsicmp(it->second.lnk.c_str(), lnk.c_str()) != 0)
@@ -4447,6 +4463,7 @@ static void AddAliasForRow(const std::wstring& target, const std::wstring& defau
     MarkUsageDirty();
     SaveLearnedNow();  // 立即落盘：别名马上可用，也和目录里的 .lnk 保持一致
     ShowTopToast(g.uiEngine == 1 ? SlintUiWindow() : g.hwnd, L"已添加别名：" + name);
+    return true;
 }
 
 // 立即写盘：按排序键裁剪到上限（连带删除被挤出条目的 .lnk）后整体写出
@@ -5260,9 +5277,15 @@ static void OpenSettings() {
     std::wstring exe = GetExePath();
     size_t slash = exe.find_last_of(L"\\/");
     std::wstring dir = (slash == std::wstring::npos) ? L"" : exe.substr(0, slash + 1);
+    // Slint 引擎走 Slint 设置窗；没构建时回退到 FLTK 版，避免设置入口消失
     std::wstring sidecar = dir + L"flowtary-settings.exe";
+    if (g.uiEngine == 1) {
+        std::wstring slintSidecar = dir + L"flowtary-settings-slint.exe";
+        if (GetFileAttributesW(slintSidecar.c_str()) != INVALID_FILE_ATTRIBUTES)
+            sidecar = slintSidecar;
+    }
     if (GetFileAttributesW(sidecar.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        TrayBalloon(L"Flowtary", L"未找到 flowtary-settings.exe（与主程序同目录）");
+        TrayBalloon(L"Flowtary", L"未找到设置程序（与主程序同目录）");
         return;
     }
     TakeSettingsSnapshot();
@@ -5483,6 +5506,38 @@ static void SlintSendCmd(int cmd) {
     if (HWND ipc = SlintIpcWindow()) PostMessageW(ipc, slintbridge::kKickToRender, 0, 0);
 }
 
+// 大脑 → 渲染器：把一段文本写进单段文本槽并发布序号
+static void SlintWriteTextSlot(volatile LONG* seq, slintbridge::TextSlot& slot,
+                               const std::string& text) {
+    if (!g.bridge) return;
+    size_t n = text.size();
+    if (n > (size_t)slintbridge::kTextSlotMax - 1) n = (size_t)slintbridge::kTextSlotMax - 1;
+    LONG s = *seq + 1;
+    slot.len = (unsigned)n;
+    if (n) memcpy(slot.text, text.data(), n);
+    slot.text[n] = 0;
+    slot.seq = (unsigned)s;
+    InterlockedExchange(seq, s);  // 先写内容再发布
+}
+
+// 让渲染器弹出别名输入覆盖层（预填默认名）
+static void SlintPushAliasPrompt(const std::wstring& defaultName) {
+    if (g.uiEngine != 1) return;
+    SlintBridgeEnsure();
+    if (!g.bridge) return;
+    SlintWriteTextSlot(&g.bridge->aliasSeq, g.bridge->alias, WideToUtf8(defaultName));
+    SlintSendCmd(slintbridge::kCmdAliasPrompt);
+}
+
+// 屏幕顶部轻提示：Slint 引擎走渲染器的独立无边框窗口，GDI 引擎走原生窗口
+static void SlintShowToast(const std::wstring& text) {
+    if (g.uiEngine != 1) return;
+    SlintBridgeEnsure();
+    if (!g.bridge) return;
+    SlintWriteTextSlot(&g.bridge->toastSeq, g.bridge->toast, WideToUtf8(text));
+    SlintSendCmd(slintbridge::kCmdToast);
+}
+
 // 当前菜单锚定的行：菜单开着时结果可能被别处刷新，执行命令时回到这一行
 static int g_slintMenuRow = -1;
 
@@ -5599,6 +5654,21 @@ static void SlintHandleRequests() {
             }
             case slintbridge::kReqMenuDismiss:
                 g_slintMenuRow = -1;
+                break;
+            case slintbridge::kReqAliasCommit: {
+                unsigned n = r.textLen;
+                if (n > (unsigned)slintbridge::kTextMax) n = (unsigned)slintbridge::kTextMax;
+                std::wstring name = Utf8ToWide(std::string(r.text, r.text + n));
+                std::wstring target = g_slintAliasTarget;
+                g_slintAliasTarget.clear();
+                SlintSendCmd(slintbridge::kCmdReleaseShow);
+                ApplyAliasForRow(target, name);  // 校验 + 落库 + toast 都在这份逻辑里
+                needPush = true;                 // 别名立刻参与排序
+                break;
+            }
+            case slintbridge::kReqAliasCancel:
+                g_slintAliasTarget.clear();
+                SlintSendCmd(slintbridge::kCmdReleaseShow);
                 break;
             case slintbridge::kReqHide:
                 Hide();
@@ -6618,6 +6688,11 @@ static LRESULT CALLBACK TopToastProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 
 // 在目标窗口所在屏幕的正中央弹出半透明 toast（无目标时主屏居中），非阻塞、自动消失
 static void ShowTopToast(HWND target, const std::wstring& text) {
+    // Slint 引擎：由渲染器画一个独立的无边框置顶小窗，视觉与启动器一致
+    if (g.uiEngine == 1 && SlintUiWindow()) {
+        SlintShowToast(text);
+        return;
+    }
     static bool registered = false;
     if (!registered) {
         WNDCLASSEXW nc{};

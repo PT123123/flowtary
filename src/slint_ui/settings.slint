@@ -1,0 +1,462 @@
+// Flowtary 设置窗（Slint 版）
+// 数据驱动：C++ 把当前页签的表单行整理成 FormRow 列表，这里只负责画。
+// 与 FLTK 版共用 settings_model / settings_ipc，保存与预览逻辑完全一致。
+import { ScrollView, TextEdit } from "std-widgets.slint";
+
+export struct FormRow {
+    row-id: int,
+    kind: int,        // 0 标题 / 1 勾选 / 2 下拉 / 3 单行输入 / 4 多行编辑 / 5 按钮 / 6 提示 / 7 滑杆 / 8 小字信息
+    label: string,
+    value: string,
+    checked: bool,
+    options: [string],
+    option-index: int,
+    enabled: bool,
+    min: int,
+    max: int,
+    amount: int,
+    row-height: length,
+}
+
+export component SettingsWindow inherits Window {
+    title: "Flowtary 设置";
+    width: 820px;
+    height: 640px;
+    background: #0f131a;
+    default-font-family: "Segoe UI";
+
+    in-out property <[string]> tabs: [];
+    in-out property <int> tab: 0;
+    in-out property <string> tab-title: "";
+    in-out property <[FormRow]> rows: [];
+    in-out property <bool> can-reset: false;
+    in-out property <string> status: "";
+    // 下拉选择的模态列表
+    in-out property <bool> picker-open: false;
+    in-out property <string> picker-title: "";
+    in-out property <[string]> picker-options: [];
+    in-out property <int> picker-index: 0;
+    in-out property <int> picker-id: 0;
+
+    callback tab-changed(int);
+    callback row-toggled(int, bool);
+    callback row-chosen(int, int);
+    callback row-edited(int, string);
+    callback row-clicked(int);
+    callback slider-changed(int, int);
+    callback reset-clicked();
+    callback save-clicked();
+    callback cancel-clicked();
+
+    // —— 侧栏 ——
+    Rectangle {
+        x: 0; y: 0; width: 184px; height: 100%;
+        background: #0b0e13;
+        VerticalLayout {
+            x: 10px; y: 16px; width: 164px;
+            spacing: 2px;
+            Text {
+                height: 34px;
+                text: "Flowtary 设置";
+                color: #eaf0fa;
+                font-size: 15px; font-weight: 600;
+                vertical-alignment: center;
+                x: 8px;
+            }
+            Rectangle { height: 10px; background: transparent; }
+            for name[idx] in root.tabs: Rectangle {
+                height: 34px;
+                border-radius: 9px;
+                background: idx == root.tab ? #1f2a33 : hover.has-hover ? #151b23 : transparent;
+                hover := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.tab-changed(idx); }
+                }
+                Rectangle {
+                    x: 0; y: 9px; width: 3px; height: 16px;
+                    border-radius: 2px;
+                    background: #63d8cd;
+                    opacity: idx == root.tab ? 1 : 0;
+                }
+                Text {
+                    x: 14px; y: 0; width: parent.width - 20px; height: 100%;
+                    text: name;
+                    color: idx == root.tab ? #ffffff : #9aa6ba;
+                    font-size: 12.5px;
+                    font-weight: idx == root.tab ? 600 : 400;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+    Rectangle {
+        x: 184px; y: 0; width: 1px; height: 100%;
+        background: #ffffff10;
+    }
+
+    // —— 标题 ——
+    Text {
+        x: 208px; y: 16px; width: root.width - 232px; height: 32px;
+        text: root.tab-title;
+        color: #ffffff;
+        font-size: 16px; font-weight: 600;
+        vertical-alignment: center;
+    }
+    Rectangle {
+        x: 208px; y: 52px; width: root.width - 232px; height: 1px;
+        background: #ffffff12;
+    }
+
+    // —— 表单区 ——
+    ScrollView {
+        x: 200px; y: 62px;
+        width: root.width - 216px;
+        height: root.height - 62px - 64px;
+        viewport-width: self.width;
+        VerticalLayout {
+            width: 100%;
+            spacing: 8px;
+            for r in root.rows: Rectangle {
+                height: r.row-height;
+                background: transparent;
+
+                // 0 标题
+                if r.kind == 0: Text {
+                    x: 8px; y: 0; width: parent.width - 16px; height: 100%;
+                    text: r.label;
+                    color: #dfe6f2;
+                    font-size: 13px; font-weight: 600;
+                    vertical-alignment: center;
+                }
+                // 8 小字信息
+                if r.kind == 8: Text {
+                    x: 8px; y: 0; width: parent.width - 16px; height: 100%;
+                    text: r.label;
+                    color: #8b96ae;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                }
+                // 1 勾选
+                if r.kind == 1: Rectangle {
+                    background: transparent;
+                    box := TouchArea {
+                        x: 8px; y: 0; width: parent.width - 16px; height: 100%;
+                        mouse-cursor: pointer;
+                        clicked => { root.row-toggled(r.row-id, !r.checked); }
+                    }
+                    Rectangle {
+                        x: 8px; y: (parent.height - 18px) / 2;
+                        width: 18px; height: 18px;
+                        border-radius: 5px;
+                        background: r.checked ? #2f8f8a : #151b23;
+                        border-width: 1px;
+                        border-color: r.checked ? #6fd7cd80 : #ffffff22;
+                        Path {
+                            x: 5px; y: 5px; width: 8px; height: 8px;
+                            fill: transparent;
+                            stroke: #ffffff;
+                            stroke-width: 1.8px;
+                            commands: "M 0 4 L 3 7 L 8 0";
+                            opacity: r.checked ? 1 : 0;
+                        }
+                    }
+                    Text {
+                        x: 34px; y: 0; width: parent.width - 42px; height: 100%;
+                        text: r.label;
+                        color: r.enabled ? #e7ecf5 : #6b7488;
+                        font-size: 12.5px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+                // 2 下拉
+                if r.kind == 2: Rectangle {
+                    background: transparent;
+                    Rectangle {
+                        x: 8px; y: 0; width: 170px; height: 100%;
+                        Text {
+                            width: 100%; height: 100%;
+                            text: r.label;
+                            color: #aab4c6; font-size: 12.5px;
+                            vertical-alignment: center;
+                        }
+                    }
+                    Rectangle {
+                        x: 180px; y: 3px; width: parent.width - 188px; height: parent.height - 6px;
+                        border-radius: 8px;
+                        background: #151b23;
+                        border-width: 1px;
+                        border-color: picker.has-hover ? #63d8cd55 : #ffffff18;
+                        picker := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                root.picker-id = r.row-id;
+                                root.picker-title = r.label;
+                                root.picker-options = r.options;
+                                root.picker-index = r.option-index;
+                                root.picker-open = true;
+                            }
+                        }
+                        Text {
+                            x: 12px; y: 0; width: parent.width - 34px; height: 100%;
+                            text: r.option-index >= 0 && r.option-index < r.options.length
+                                  ? r.options[r.option-index] : "";
+                            color: #e7ecf5; font-size: 12px;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                        Path {
+                            x: parent.width - 20px; y: (parent.height - 6px) / 2;
+                            width: 9px; height: 6px;
+                            fill: #8d99b3;
+                            commands: "M 0 0 L 4.5 5 L 9 0 Z";
+                        }
+                    }
+                }
+                // 3 单行输入
+                if r.kind == 3: Rectangle {
+                    background: transparent;
+                    Text {
+                        x: 8px; y: 0; width: 170px; height: 100%;
+                        text: r.label;
+                        color: #aab4c6; font-size: 12.5px;
+                        vertical-alignment: center;
+                    }
+                    Rectangle {
+                        x: 180px; y: 3px; width: parent.width - 188px; height: parent.height - 6px;
+                        border-radius: 8px;
+                        background: #0d1117;
+                        border-width: 1px;
+                        border-color: #ffffff18;
+                        TextInput {
+                            x: 10px; y: 0; width: parent.width - 20px; height: 100%;
+                            vertical-alignment: center;
+                            text: r.value;
+                            enabled: r.enabled;
+                            color: r.enabled ? #ffffff : #6b7488;
+                            font-size: 12px;
+                            selection-foreground-color: #0b1017;
+                            selection-background-color: #63d8cd;
+                            edited => { root.row-edited(r.row-id, self.text); }
+                        }
+                    }
+                }
+                // 4 多行编辑
+                if r.kind == 4: Rectangle {
+                    background: transparent;
+                    Text {
+                        x: 8px; y: 0; width: parent.width - 16px; height: 22px;
+                        text: r.label;
+                        color: #aab4c6; font-size: 12.5px;
+                        vertical-alignment: center;
+                    }
+                    Rectangle {
+                        x: 8px; y: 24px; width: parent.width - 16px; height: parent.height - 26px;
+                        border-radius: 8px;
+                        background: #0d1117;
+                        border-width: 1px;
+                        border-color: #ffffff18;
+                        TextEdit {
+                            x: 8px; y: 6px; width: parent.width - 16px; height: parent.height - 12px;
+                            text: r.value;
+                            read-only: !r.enabled;
+                            enabled: r.enabled;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                            edited => { root.row-edited(r.row-id, self.text); }
+                        }
+                    }
+                }
+                // 5 按钮
+                if r.kind == 5: Rectangle {
+                    background: transparent;
+                    Rectangle {
+                        x: 8px; y: (parent.height - 34px) / 2;
+                        width: 220px; height: 34px;
+                        border-radius: 9px;
+                        background: btn.has-hover ? #232c38 : #1a212b;
+                        border-width: 1px;
+                        border-color: btn.has-hover ? #63d8cd55 : #ffffff1c;
+                        btn := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.row-clicked(r.row-id); }
+                        }
+                        Text {
+                            x: 12px; y: 0; width: parent.width - 24px; height: 100%;
+                            text: r.label;
+                            color: r.enabled ? #e7ecf5 : #6b7488;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                    }
+                }
+                // 6 提示
+                if r.kind == 6: Text {
+                    x: 8px; y: 0; width: parent.width - 16px; height: 100%;
+                    text: r.label;
+                    color: #7f8ba4;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                    vertical-alignment: top;
+                }
+                // 7 滑杆
+                if r.kind == 7: Rectangle {
+                    background: transparent;
+                    Text {
+                        x: 8px; y: 0; width: 170px; height: 100%;
+                        text: r.label;
+                        color: #aab4c6; font-size: 12.5px;
+                        vertical-alignment: center;
+                    }
+                    Rectangle {
+                        x: 180px; y: (parent.height - 6px) / 2;
+                        width: parent.width - 188px; height: 6px;
+                        border-radius: 3px;
+                        background: #1a212b;
+                        Rectangle {
+                            width: parent.width * (r.amount - r.min) / (r.max - r.min);
+                            height: 100%;
+                            border-radius: 3px;
+                            background: #63d8cd;
+                        }
+                        Rectangle {
+                            x: (parent.width - 14px) * (r.amount - r.min) / (r.max - r.min);
+                            y: (parent.height - 14px) / 2;
+                            width: 14px; height: 14px;
+                            border-radius: 7px;
+                            background: #ffffff;
+                            border-width: 1px; border-color: #63d8cd;
+                        }
+                        TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                root.slider-changed(r.row-id,
+                                    r.min + round((self.mouse-x / self.width) * (r.max - r.min)));
+                            }
+                            moved => {
+                                if (self.pressed) {
+                                    root.slider-changed(r.row-id,
+                                        r.min + round((self.mouse-x / self.width) * (r.max - r.min)));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Rectangle { height: 8px; background: transparent; }
+        }
+    }
+
+    // —— 底部按钮行 ——
+    Rectangle {
+        x: 200px; y: root.height - 63px; width: root.width - 216px; height: 1px;
+        background: #ffffff12;
+    }
+    Text {
+        x: 208px; y: root.height - 54px; width: root.width - 480px; height: 40px;
+        text: root.status;
+        color: #8b96ae; font-size: 11px;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    Rectangle {
+        visible: root.can-reset;
+        x: 208px; y: root.height - 50px; width: 96px; height: 32px;
+        border-radius: 9px;
+        background: rb.has-hover ? #232c38 : #1a212b;
+        border-width: 1px; border-color: #ffffff1c;
+        rb := TouchArea {
+            mouse-cursor: pointer;
+            clicked => { root.reset-clicked(); }
+        }
+        Text {
+            width: 100%; height: 100%;
+            text: "恢复默认";
+            color: #c8d2e2; font-size: 12px;
+            horizontal-alignment: center; vertical-alignment: center;
+        }
+    }
+    Rectangle {
+        x: root.width - 258px; y: root.height - 50px; width: 100px; height: 32px;
+        border-radius: 9px;
+        background: cb.has-hover ? #232c38 : #1a212b;
+        border-width: 1px; border-color: #ffffff1c;
+        cb := TouchArea {
+            mouse-cursor: pointer;
+            clicked => { root.cancel-clicked(); }
+        }
+        Text {
+            width: 100%; height: 100%;
+            text: "取消"; color: #c8d2e2; font-size: 12px;
+            horizontal-alignment: center; vertical-alignment: center;
+        }
+    }
+    Rectangle {
+        x: root.width - 148px; y: root.height - 50px; width: 120px; height: 32px;
+        border-radius: 9px;
+        background: sb.has-hover ? #37a49e : #2f8f8a;
+        border-width: 1px; border-color: #6fd7cd66;
+        sb := TouchArea {
+            mouse-cursor: pointer;
+            clicked => { root.save-clicked(); }
+        }
+        Text {
+            width: 100%; height: 100%;
+            text: "保存"; color: #ffffff; font-size: 12.5px; font-weight: 600;
+            horizontal-alignment: center; vertical-alignment: center;
+        }
+    }
+
+    // —— 下拉选择模态 ——
+    if root.picker-open: Rectangle {
+        x: 0; y: 0; width: 100%; height: 100%;
+        background: #05070bcc;
+        TouchArea { clicked => { root.picker-open = false; } }
+    }
+    if root.picker-open: Rectangle {
+        x: (root.width - 420px) / 2; y: (root.height - 360px) / 2;
+        width: 420px; height: 360px;
+        border-radius: 14px;
+        background: #1b212bf7;
+        border-width: 1px; border-color: #ffffff20;
+        Text {
+            x: 20px; y: 14px; width: parent.width - 40px; height: 28px;
+            text: root.picker-title;
+            color: #ffffff; font-size: 14px; font-weight: 600;
+            vertical-alignment: center;
+        }
+        Rectangle {
+            x: 20px; y: 50px; width: parent.width - 40px; height: 1px;
+            background: #ffffff14;
+        }
+        ScrollView {
+            x: 12px; y: 58px; width: parent.width - 24px; height: parent.height - 74px;
+            viewport-width: self.width;
+            VerticalLayout {
+                spacing: 2px;
+                for opt[idx] in root.picker-options: Rectangle {
+                    height: 36px;
+                    border-radius: 8px;
+                    background: idx == root.picker-index ? #2f8f8a3d
+                                : po.has-hover ? #ffffff10 : transparent;
+                    po := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            root.row-chosen(root.picker-id, idx);
+                            root.picker-open = false;
+                        }
+                    }
+                    Text {
+                        x: 12px; y: 0; width: parent.width - 24px; height: 100%;
+                        text: opt;
+                        color: idx == root.picker-index ? #b7efe8 : #dfe6f2;
+                        font-size: 12.5px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+            }
+        }
+    }
+}

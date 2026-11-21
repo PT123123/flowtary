@@ -19,6 +19,7 @@
 #include <cwchar>
 #include <cwctype>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -153,9 +154,14 @@ struct UiCtx {
     int menuBaseH = 0;        // 打开菜单前的内容高度
     int menuHeightNow = 0;    // 菜单打开时窗口实际高度
     std::vector<int> menuIds; // 菜单项对应的命令 id
+    int aliasPrevH = 0;       // 别名覆盖层打开前的窗口高度（0=未打开）
     UiCtx() : ui(MainWindow::create()) {}
 };
 static std::shared_ptr<UiCtx> g_ctx;
+
+// 顶部 toast（独立无边框窗口）：点击穿透、置顶、2.2 秒自动消失
+static std::optional<slint::ComponentHandle<ToastWindow>> g_toast;
+static int g_toastGen = 0;
 
 static ft::apps::AsyncIcons g_icons;
 
@@ -451,7 +457,10 @@ static void apply_state(UiCtx& ctx)
     // 之前每次按键都调 position_ui 按屏幕重新居中，整块面板会上下跳，
     // 看起来就像卡顿；圆角区域交给 WM_SIZE 同步更新。
     int h = compute_window_height(ctx, tl > 0);
-    if (h != ctx.windowHeight) {
+    if (ctx.ui->get_alias_open()) {
+        // 覆盖层有自己的最小高度，先把新高度记下来，关掉覆盖层时再落地
+        ctx.windowHeight = h;
+    } else if (h != ctx.windowHeight) {
         ctx.windowHeight = h;
         ctx.ui->set_window_height((float)h);
     }
@@ -507,6 +516,7 @@ static void show_ui()
     auto& ctx = *g_ctx;
     ctx.ui->set_query(slint::SharedString(""));  // 主进程每次唤起都清空输入
     ctx.ui->set_selected(0);
+    ctx.ui->set_alias_open(false);
     HWND hwnd = ctx.ui->window().win32_hwnd();
     remove_native_frame(hwnd);
     apply_rounded_region(hwnd);
@@ -541,7 +551,76 @@ static void hide_ui()
     if (!g_ctx) return;
     g_uiActive = false;
     if (g_ctx->menuOpen) close_row_menu(*g_ctx, false);  // 隐藏时顺手收掉菜单
+    if (g_ctx->ui->get_alias_open()) {
+        g_ctx->ui->set_alias_open(false);
+        if (g_ctx->aliasPrevH) {
+            g_ctx->ui->set_window_height((float)g_ctx->windowHeight);
+            g_ctx->aliasPrevH = 0;
+        }
+    }
     g_ctx->ui->window().hide();
+}
+
+// 读取桥里的单段文本槽（别名预填 / toast 文案）
+static std::string read_text_slot(unsigned seq, const slintbridge::TextSlot& slot)
+{
+    if (!seq) return {};
+    unsigned n = slot.len;
+    if (n > (unsigned)slintbridge::kTextSlotMax) n = (unsigned)slintbridge::kTextSlotMax;
+    return std::string(slot.text, slot.text + n);
+}
+
+// 别名输入覆盖层：主进程已经把预填名写进桥
+static void show_alias_prompt(UiCtx& ctx)
+{
+    if (!g_bridge) return;
+    unsigned seq = (unsigned)InterlockedCompareExchange(&g_bridge->aliasSeq, 0, 0);
+    std::string name = read_text_slot(seq, g_bridge->alias);
+    if (ctx.menuOpen) close_row_menu(ctx, false);
+    ctx.aliasPrevH = ctx.windowHeight;
+    if (ctx.windowHeight < 300) ctx.ui->set_window_height(300);  // 覆盖层放得下
+    ctx.ui->set_alias_text(slint::SharedString(name.c_str()));
+    ctx.ui->set_alias_open(true);
+}
+
+// 顶部 toast：独立窗口，定位到鼠标所在显示器工作区中央（与原 GDI 版一致）
+static void show_toast(const std::string& text)
+{
+    if (!g_toast.has_value()) {
+        g_toast = ToastWindow::create();
+    }
+    (*g_toast)->set_message(slint::SharedString(text.c_str()));
+    (*g_toast)->window().show();
+    HWND h = (*g_toast)->window().win32_hwnd();
+    if (!h) return;
+    LONG_PTR style = GetWindowLongPtrW(h, GWL_STYLE);
+    style = (style & ~(WS_CAPTION | WS_THICKFRAME | WS_BORDER | WS_DLGFRAME | WS_SYSMENU)) |
+            WS_POPUP;
+    SetWindowLongPtrW(h, GWL_STYLE, style);
+    LONG_PTR ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+    ex = (ex | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_LAYERED) &
+         ~WS_EX_APPWINDOW;
+    SetWindowLongPtrW(h, GWL_EXSTYLE, ex);
+
+    RECT rc{};
+    GetWindowRect(h, &rc);
+    const int W = rc.right - rc.left, H = rc.bottom - rc.top;
+    POINT cur{};
+    GetCursorPos(&cur);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    HMONITOR mon = MonitorFromPoint(cur, MONITOR_DEFAULTTONEAREST);
+    if (GetMonitorInfoW(mon, &mi)) {
+        int x = mi.rcWork.left + (mi.rcWork.right - mi.rcWork.left - W) / 2;
+        int y = mi.rcWork.top + (mi.rcWork.bottom - mi.rcWork.top - H) / 2;
+        SetWindowPos(h, HWND_TOPMOST, x, y, 0, 0,
+                     SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+    const int gen = ++g_toastGen;
+    slint::Timer::single_shot(std::chrono::milliseconds(2200), [gen]() {
+        if (gen != g_toastGen || !g_toast.has_value()) return;
+        (*g_toast)->window().hide();
+    });
 }
 
 // 首帧位置由主进程通过命令行传入：常驻渲染器被复用时则用状态槽里的最新值
@@ -570,6 +649,12 @@ static void on_bridge_update()
                 case slintbridge::kCmdMenuShow: show_row_menu(*g_ctx); break;
                 case slintbridge::kCmdHoldShow: g_holdHide = true; break;
                 case slintbridge::kCmdReleaseShow: g_holdHide = false; break;
+                case slintbridge::kCmdAliasPrompt: show_alias_prompt(*g_ctx); break;
+                case slintbridge::kCmdToast: {
+                    unsigned seq = (unsigned)InterlockedCompareExchange(&g_bridge->toastSeq, 0, 0);
+                    show_toast(read_text_slot(seq, g_bridge->toast));
+                    break;
+                }
                 default: break;
             }
         }
@@ -801,6 +886,30 @@ int main()
     });
     ctx->ui->on_menu_dismissed([]() {
         if (g_ctx) close_row_menu(*g_ctx, true);
+    });
+    // 添加别名覆盖层：确认把文本回传大脑，取消直接关掉
+    ctx->ui->on_alias_committed([](const slint::SharedString& text) {
+        if (g_ctx) {
+            g_ctx->ui->set_alias_open(false);
+            if (g_ctx->aliasPrevH) {
+                g_ctx->ui->set_window_height((float)g_ctx->windowHeight);
+                g_ctx->aliasPrevH = 0;
+            }
+        }
+        send_req(slintbridge::kReqAliasCommit, 0,
+                 std::string(text.data() ? text.data() : "", text.size()));
+        if (g_ctx) g_ctx->ui->invoke_focus_input();
+    });
+    ctx->ui->on_alias_cancelled([]() {
+        if (g_ctx) {
+            g_ctx->ui->set_alias_open(false);
+            if (g_ctx->aliasPrevH) {
+                g_ctx->ui->set_window_height((float)g_ctx->windowHeight);
+                g_ctx->aliasPrevH = 0;
+            }
+        }
+        send_req(slintbridge::kReqAliasCancel);
+        if (g_ctx) g_ctx->ui->invoke_focus_input();
     });
 
     // 窗口创建后置顶/圆角/Acrylic

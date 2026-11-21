@@ -17,8 +17,25 @@ target_include_directories(flowtary-slint PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..
 slint_target_sources(flowtary-slint main.slint)
 target_link_libraries(flowtary-slint PRIVATE Slint::Slint user32 gdi32 shell32 ole32 uuid)
 
+# 设置窗（Slint 版）：数据层与 IPC 复用主程序的 settings_model / settings_ipc
+add_executable(flowtary-settings-slint WIN32
+  settings_main.cpp
+  ../settings_model.cpp
+  ../search_history.cpp)
+if(MSVC)
+  target_compile_options(flowtary-settings-slint PRIVATE /utf-8 /W3)
+endif()
+target_include_directories(flowtary-settings-slint PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+slint_target_sources(flowtary-settings-slint settings.slint)
+target_link_libraries(flowtary-settings-slint PRIVATE
+  Slint::Slint user32 gdi32 shell32 ole32 uuid dwmapi advapi32 urlmon)
+
 # 部署时把 Slint 运行时 DLL 一起拷到产物目录
 add_custom_command(TARGET flowtary-slint POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
     "${SLINT_SDK}/lib/slint_cpp.dll" $<TARGET_FILE_DIR:flowtary-slint>
+)
+add_custom_command(TARGET flowtary-settings-slint POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${SLINT_SDK}/lib/slint_cpp.dll" $<TARGET_FILE_DIR:flowtary-settings-slint>
 )

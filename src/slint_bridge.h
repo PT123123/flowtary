@@ -58,6 +58,8 @@ enum ReqOp : int {
     kReqRowMenu = 7,   // 请求第 arg 行的右键菜单（arg < 0 = 当前选中行）
     kReqMenuPick = 8,  // 用户在 Slint 右键菜单里选了 arg 对应的菜单命令
     kReqMenuDismiss = 9, // 用户点了菜单外 / 按 Esc，菜单已关闭
+    kReqAliasCommit = 10, // 别名输入框确认（文本在 Req::text）
+    kReqAliasCancel = 11, // 别名输入框取消
 };
 
 // kReqActivate 的 arg 编码：低 16 位是行号，高位是修饰键（与 GDI 版
@@ -75,6 +77,8 @@ enum StateCmd : int {
     kCmdMenuShow = 4, // 菜单数据已写入桥：渲染器用 Slint 自绘菜单
     kCmdHoldShow = 5,   // 主进程要弹自己的对话框（如添加别名）：期间失焦别隐藏
     kCmdReleaseShow = 6, // 对话框结束：恢复正常失焦隐藏
+    kCmdAliasPrompt = 7, // 显示别名输入覆盖层（预填文本在 alias 槽）
+    kCmdToast = 8,       // 显示顶部 toast（文案在 toast 槽）
 };
 
 // 行类型（与主程序 Row::Kind 的取值顺序一一对应，改动必须两边同步）
@@ -142,6 +146,15 @@ struct MenuSlot {
     int count;
     MenuItemWire items[kMenuMaxItems];
 };
+
+// 单段 utf8 文本槽：别名输入框的预填名 / 顶部 toast 文案。
+// 大脑写 seq + len + text，再往命令环投一条命令让渲染器来读。
+constexpr int kTextSlotMax = 512;
+struct TextSlot {
+    unsigned seq;
+    unsigned len;
+    char text[kTextSlotMax];
+};
 #pragma pack(pop)
 
 struct Bridge {
@@ -155,6 +168,11 @@ struct Bridge {
     // 右键菜单数据：大脑写 menuSeq + menu，渲染器按 seq 取
     volatile LONG menuSeq;
     MenuSlot menu;
+    // 单段文本：别名输入预填 / toast 文案
+    volatile LONG aliasSeq;
+    TextSlot alias;
+    volatile LONG toastSeq;
+    TextSlot toast;
     // 命令环：大脑写 cmdHead，渲染器读 cmdTail（显示 / 隐藏 / 退出）
     volatile LONG cmdHead;
     volatile LONG cmdTail;
