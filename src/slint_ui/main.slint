@@ -525,10 +525,11 @@ export component MainWindow inherits Window {
     }
 
     // —— 空态欢迎面板（纯文字，不放图标）——
+    // 统一锚定在搜索行下方的内容区（y >= 96），高度不够时也不会压到输入框
     if empty && root.query == "": Rectangle {
         x: 0; y: 0; width: 100%; height: 100%;
         Text {
-            x: 0; y: (parent.height - 112px) / 2; width: 100%; height: 34px;
+            x: 0; y: max(96px, parent.height / 2 - 24px); width: 100%; height: 34px;
             text: "Flowtary";
             color: root.th-text;
             font-size: 26px; font-weight: 600;
@@ -537,7 +538,7 @@ export component MainWindow inherits Window {
             vertical-alignment: center;
         }
         Text {
-            x: 0; y: (parent.height - 112px) / 2 + 40px; width: 100%; height: 20px;
+            x: 0; y: max(96px, parent.height / 2 - 24px) + 40px; width: 100%; height: 20px;
             text: "搜索程序、文件与网页";
             color: root.th-sub;
             font-size: 12.5px;
@@ -545,7 +546,7 @@ export component MainWindow inherits Window {
             vertical-alignment: center;
         }
         HorizontalLayout {
-            x: 0; y: (parent.height - 112px) / 2 + 68px; width: 100%; height: 24px;
+            x: 0; y: max(96px, parent.height / 2 - 24px) + 68px; width: 100%; height: 24px;
             alignment: center;
             spacing: 8px;
             Rectangle {
@@ -587,11 +588,11 @@ export component MainWindow inherits Window {
         }
     }
 
-    // —— 无结果（整体垂直居中） ——
+    // —— 无结果（锚定在搜索行下方的内容区，避免放大镜压到输入框） ——
     if empty && root.query != "": Rectangle {
         x: 0; y: 0; width: 100%; height: 100%;
         Rectangle {
-            x: (parent.width - 52px) / 2; y: (parent.height - 112px) / 2;
+            x: (parent.width - 52px) / 2; y: max(96px, parent.height / 2 - 24px);
             width: 52px; height: 52px;
             border-radius: 16px;
             background: #ffffff08;
@@ -607,7 +608,7 @@ export component MainWindow inherits Window {
             }
         }
         Text {
-            x: 60px; y: (parent.height - 112px) / 2 + 64px; width: parent.width - 120px; height: 26px;
+            x: 60px; y: max(96px, parent.height / 2 - 24px) + 64px; width: parent.width - 120px; height: 26px;
             text: "没有找到 “" + root.query + "”";
             color: root.th-text;
             font-size: 15.5px; font-weight: 500;
@@ -615,7 +616,7 @@ export component MainWindow inherits Window {
             overflow: elide;
         }
         Text {
-            x: 0; y: (parent.height - 112px) / 2 + 92px; width: 100%; height: 20px;
+            x: 0; y: max(96px, parent.height / 2 - 24px) + 92px; width: 100%; height: 20px;
             text: "换个关键词，或等索引扫描完成再试";
             color: root.th-sub;
             font-size: 12px;
