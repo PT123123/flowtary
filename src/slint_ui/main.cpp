@@ -11,7 +11,10 @@
 #include "slint_bridge.h"
 
 #include <windows.h>
+#include <dwmapi.h>
 #include <shellapi.h>
+
+#pragma comment(lib, "dwmapi.lib")
 
 #include <algorithm>
 #include <atomic>
@@ -274,6 +277,11 @@ static void rebuild_model(UiCtx& ctx)
 static void remove_native_frame(HWND hwnd)
 {
     if (!hwnd) return;
+    // 关掉 DWM 的非客户区渲染：即使样式在某一帧里被 winit 改回带标题栏，
+    // DWM 也不会把标题栏/边框画出来。这是「激活瞬间闪一下标题栏」的最后一道保险。
+    const DWORD kDwmwaNcRenderingPolicy = 2;
+    int ncPolicy = 1;  // DWMNCRP_DISABLED
+    DwmSetWindowAttribute(hwnd, kDwmwaNcRenderingPolicy, &ncPolicy, sizeof(ncPolicy));
     LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
     LONG_PTR want = (style & ~(WS_CAPTION | WS_THICKFRAME | WS_BORDER | WS_DLGFRAME |
                                WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX)) | WS_POPUP;
@@ -522,6 +530,7 @@ static void show_ui()
     apply_rounded_region(hwnd);
     position_ui(hwnd, ctx.centerWake);  // 先摆好位置再显示，避免旧位置闪一下
     ctx.ui->window().show();
+    remove_native_frame(hwnd);  // show 之后 winit 会重写样式，立刻再压一遍
     apply_topmost(hwnd);
     apply_tool_window(hwnd);  // winit 可能在 show 时又把 APPWINDOW 写回来
     if (hwnd) {
@@ -601,6 +610,8 @@ static void show_toast(const std::string& text)
     ex = (ex | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_LAYERED) &
          ~WS_EX_APPWINDOW;
     SetWindowLongPtrW(h, GWL_EXSTYLE, ex);
+    int ncPolicy = 1;  // DWMNCRP_DISABLED
+    DwmSetWindowAttribute(h, 2, &ncPolicy, sizeof(ncPolicy));
 
     RECT rc{};
     GetWindowRect(h, &rc);
@@ -678,6 +689,15 @@ static LRESULT CALLBACK IpcWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 static LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
+        case WM_NCACTIVATE:
+            // 自己从不画非客户区：激活/失焦都直接返回 TRUE，
+            // 不让 DefWindowProc 去重绘标题栏（否则激活瞬间会闪一帧）。
+            return TRUE;
+        case WM_NCPAINT:
+            return 0;  // 非客户区不画
+        case 0x00AE:  // WM_NCUAHDRAWCAPTION（主题标题栏绘制）
+        case 0x00AF:  // WM_NCUAHDRAWFRAME（主题边框绘制）
+            return 0;
         case WM_STYLECHANGING:
             // winit 在显示/隐藏/改尺寸时会重新写窗口样式，把 WS_CAPTION 加回来，
             // 用户就会看到原生标题栏闪一下。这里直接改掉「准备写入的样式」，
@@ -698,6 +718,10 @@ static LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             // 最后一道保险：客户区铺满整窗。即使某个时刻样式里混进了
             // WS_CAPTION，也永远不会画出标题栏/边框。
             if (wp) return 0;
+            break;
+        case WM_SHOWWINDOW:
+            // 每次重新显示都压一遍无边框样式：窗口隐藏期间 winit 可能写过样式
+            if (wp) remove_native_frame(hwnd);
             break;
         case WM_SIZE:
             // 动态高度：尺寸一落地就同步更新圆角区域，避免旧区域的残帧
@@ -769,6 +793,10 @@ static LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 }
             } else {
                 g_uiActive = true;
+                // 点回来时再压一遍：个别路径下 winit 会把带标题栏的样式写回去，
+                // 这里无条件恢复无边框 + 关掉 DWM 非客户区渲染。
+                remove_native_frame(hwnd);
+                apply_rounded_region(hwnd);
             }
             break;
     }
