@@ -220,18 +220,49 @@ export component MainWindow inherits Window {
         animate opacity { duration: 150ms; easing: ease-out; }
         animate y { duration: 180ms; easing: ease-out; }
         border-radius: root.th-radius;
-        background: @linear-gradient(180deg, root.th-panel-top 0%, root.th-panel-bottom 100%);
+        background: transparent;
         border-width: 1px;
-        border-color: #ffffff14;
-        drop-shadow-blur: 26px;
-        drop-shadow-color: #0000007d;
-        drop-shadow-offset-y: 6px;
+        border-color: #ffffff1a;
+
+        // 玻璃底色：单独一层并留一点透，DWM 模糊从背后透上来
+        Rectangle {
+            x: 0; y: 0; width: 100%; height: 100%;
+            border-radius: root.th-radius;
+            background: @linear-gradient(180deg, root.th-panel-top 0%, root.th-panel-bottom 100%);
+            opacity: 0.88;
+            drop-shadow-blur: 26px;
+            drop-shadow-color: #0000007d;
+            drop-shadow-offset-y: 6px;
+        }
 
         // 顶部极淡强调色氛围光，避免整块玻璃发灰
         Rectangle {
             x: 1px; y: 1px; width: parent.width - 2px; height: 150px;
             border-radius: root.th-radius - 1px;
             background: @linear-gradient(180deg, root.th-glow 0%, transparent 100%);
+        }
+        // 玻璃斜向反光：左上亮、右下暗，制造薄玻璃的折射层次
+        Rectangle {
+            x: 1px; y: 1px; width: parent.width - 2px; height: parent.height - 2px;
+            border-radius: root.th-radius - 1px;
+            background: @linear-gradient(122deg,
+                #ffffff24 0%,
+                #ffffff0b 22%,
+                transparent 46%,
+                transparent 68%,
+                #00000018 100%);
+        }
+        // 顶部镜面高光（避开 1px 边框，两端淡出）
+        Rectangle {
+            x: 20px; y: 2px; width: parent.width - 40px; height: 1px;
+            background: @linear-gradient(90deg,
+                transparent 0%, #ffffff70 24%, #ffffff70 76%, transparent 100%);
+        }
+        // 底部暗边，收住玻璃下缘
+        Rectangle {
+            x: 18px; y: parent.height - 3px; width: parent.width - 36px; height: 1px;
+            background: @linear-gradient(90deg,
+                transparent 0%, #00000055 24%, #00000055 76%, transparent 100%);
         }
 
     // —— 搜索区 ——

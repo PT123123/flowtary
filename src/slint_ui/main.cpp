@@ -39,7 +39,7 @@ enum ACCENT_STATE { ACCENT_ENABLE_ACRYLICBLURBEHIND = 4 };
 struct ACCENT_POLICY { DWORD AccentState, AccentFlags, GradientColor, AnimationId; };
 struct WINDOWCOMPOSITIONATTRIBDATA { DWORD Attrib; void* pvData; SIZE_T cbData; };
 using SetWindowCompositionAttributeFn = BOOL(WINAPI*)(HWND, WINDOWCOMPOSITIONATTRIBDATA*);
-static void enable_acrylic(HWND hwnd)
+static void enable_acrylic(HWND hwnd, unsigned tint = 0xAA181218)
 {
     auto fn = reinterpret_cast<SetWindowCompositionAttributeFn>(
         GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetWindowCompositionAttribute"));
@@ -47,7 +47,7 @@ static void enable_acrylic(HWND hwnd)
     ACCENT_POLICY p {};
     p.AccentState = ACCENT_ENABLE_ACRYLICBLURBEHIND;
     p.AccentFlags = 2;
-    p.GradientColor = 0xAA181218;  // ABGR 深蓝灰
+    p.GradientColor = tint;  // ABGR：跟随主题底色，玻璃更通透
     WINDOWCOMPOSITIONATTRIBDATA d { 19, &p, sizeof(p) };
     fn(hwnd, &d);
 }
@@ -511,6 +511,9 @@ static void apply_theme(UiCtx& ctx)
     ctx.ui->set_th_sel_b(color_from_wire(w.selB));
     ctx.ui->set_th_on_accent(color_from_wire(w.onAccent));
     ctx.ui->set_th_radius((float)w.radius);
+    // 亚克力染色跟随主题：保留主题底色 RGB，压低不透明度让模糊透出来
+    if (HWND h = ctx.ui->window().win32_hwnd())
+        enable_acrylic(h, (w.panelTop & 0x00FFFFFFu) | 0x8A000000u);
 }
 
 static void apply_state(UiCtx& ctx)
