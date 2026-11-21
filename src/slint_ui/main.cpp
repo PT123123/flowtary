@@ -158,6 +158,7 @@ static HWND g_glass = nullptr;
 static unsigned g_glassTint = 0x8A181218;  // ABGR，随主题底色更新
 static int g_uiRadius = 20;                // 面板圆角（逻辑 px），与 Slint 的 th-radius 同步
 static bool g_glassArmed = false;          // 面板定位好并开始淡入后才允许背板出现
+static void renderer_trace(const char* tag);  // 诊断日志（定义在文件后半段）
 
 // ---- 面板投影 ----
 // Slint 的软件渲染器实测不画 drop-shadow，这里自己生成一张模糊圆角阴影图交给 Slint，
@@ -835,15 +836,58 @@ static void position_ui(HWND hwnd, bool center)
 static bool activate_ui(HWND hwnd)
 {
     if (!hwnd) return false;
+    if (GetForegroundWindow() == hwnd) return true;
+
+    // 前台锁只认“最近有输入”：先补一次 Alt 轻敲，把前台授权解锁
+    INPUT in[2] = {};
+    in[0].type = INPUT_KEYBOARD;
+    in[0].ki.wVk = VK_MENU;
+    in[1].type = INPUT_KEYBOARD;
+    in[1].ki.wVk = VK_MENU;
+    in[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(2, in, sizeof(INPUT));
+
     DWORD myTid = GetCurrentThreadId();
     HWND fg = GetForegroundWindow();
     DWORD fgTid = fg ? GetWindowThreadProcessId(fg, nullptr) : 0;
     bool attached = fgTid && fgTid != myTid && AttachThreadInput(myTid, fgTid, TRUE);
-    ShowWindow(hwnd, SW_SHOW);
+    ShowWindow(hwnd, SW_SHOWNORMAL);
+    BringWindowToTop(hwnd);
     SetForegroundWindow(hwnd);
     SetActiveWindow(hwnd);
+    SetFocus(hwnd);
     if (attached) AttachThreadInput(myTid, fgTid, FALSE);
-    return GetForegroundWindow() == hwnd;
+    if (GetForegroundWindow() != hwnd) SwitchToThisWindow(hwnd, TRUE);  // 最后的兜底
+
+    const bool ok = GetForegroundWindow() == hwnd;
+    char buf[192];
+    char cls[64] = {0};
+    HWND now = GetForegroundWindow();
+    if (now) GetClassNameA(now, cls, 63);
+    snprintf(buf, sizeof(buf), "Activate: ok=%d fg=%p [%s]", (int)ok, (void*)now, cls);
+    renderer_trace(buf);
+    return ok;
+}
+
+// 唤起后持续补抢前台：系统前台锁释放有延迟，一次失败不代表永远失败
+static void retry_activate(int attempt)
+{
+    if (!g_ctx) return;
+    HWND h = g_ctx->ui->window().win32_hwnd();
+    if (!h || !IsWindowVisible(h)) return;
+    if (GetForegroundWindow() != h) {
+        if (!activate_ui(h)) {
+            if (attempt < 5)
+                slint::Timer::single_shot(std::chrono::milliseconds(180),
+                                          [attempt]() { retry_activate(attempt + 1); });
+            return;
+        }
+        arm_outside_capture(h, false);  // 真拿到了前台，撤掉鼠标捕获兜底
+    }
+    if (!g_uiActive) {
+        g_uiActive = true;
+        g_ctx->ui->invoke_focus_input();
+    }
 }
 
 static void show_ui()
@@ -884,16 +928,8 @@ static void show_ui()
         g_glassArmed = true;
         sync_glass(h);
     });
-    // 设置窗刚关掉时前台锁可能晚一拍才释放：再抢一次并补一次输入框聚焦
-    slint::Timer::single_shot(std::chrono::milliseconds(140), []() {
-        if (!g_ctx) return;
-        HWND h = g_ctx->ui->window().win32_hwnd();
-        if (!h || !IsWindowVisible(h) || GetForegroundWindow() == h) return;
-        if (activate_ui(h)) {
-            g_uiActive = true;
-            g_ctx->ui->invoke_focus_input();
-        }
-    });
+    // 设置窗刚关掉 / 别的进程还占着前台时，前台锁可能晚一拍才释放：多补几次
+    slint::Timer::single_shot(std::chrono::milliseconds(140), []() { retry_activate(0); });
 }
 
 static void hide_ui()
@@ -1165,6 +1201,15 @@ static LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
             break;
         }
+        case WM_SETFOCUS:
+            // 系统焦点真正落到窗口后，再补一次输入框聚焦：
+            // 避免 Slint 的内部焦点在激活事件之前被清掉，出现“窗口在前台但打不了字”
+            if (g_ctx) {
+                slint::Timer::single_shot(std::chrono::milliseconds(0), []() {
+                    if (g_ctx) g_ctx->ui->invoke_focus_input();
+                });
+            }
+            break;
         case WM_ACTIVATE:
             if (LOWORD(wp) == WA_INACTIVE) {
                 if (g_uiActive && !g_holdHide) {
