@@ -513,6 +513,7 @@ static void show_ui()
     position_ui(hwnd, ctx.centerWake);  // 先摆好位置再显示，避免旧位置闪一下
     ctx.ui->window().show();
     apply_topmost(hwnd);
+    apply_tool_window(hwnd);  // winit 可能在 show 时又把 APPWINDOW 写回来
     if (hwnd) {
         DWORD myTid = GetCurrentThreadId();
         HWND fg = GetForegroundWindow();
@@ -601,6 +602,11 @@ static LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 ss->styleNew = (ss->styleNew &
                                 ~(WS_CAPTION | WS_THICKFRAME | WS_BORDER | WS_DLGFRAME |
                                   WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX)) | WS_POPUP;
+            } else if (wp == GWL_EXSTYLE) {
+                // winit 会在启动后把 WS_EX_APPWINDOW 写回来（窗口进任务栏/Alt+Tab），
+                // 这里始终强制工具窗语义，与 GDI 版保持一致。
+                auto* ss = reinterpret_cast<STYLESTRUCT*>(lp);
+                ss->styleNew = (ss->styleNew | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW;
             }
             return 0;
         case WM_NCCALCSIZE:
