@@ -257,6 +257,12 @@ export component MainWindow inherits Window {
             background: @linear-gradient(180deg, root.th-glow 0%, transparent 100%);
         }
 
+        // 点击面板空白处把焦点还给搜索框：否则点一下光标就没了，像“没激活”
+        TouchArea {
+            width: 100%; height: 100%;
+            clicked => { root.focus-input(); }
+        }
+
     // —— 搜索区 ——
     Text {
         x: 24px; y: 0; width: parent.width - 24px - 78px; height: 64px;

@@ -295,9 +295,11 @@ static bool point_outside_panel(HWND h, POINT screenPt)
 static LRESULT CALLBACK OutsideClickProc(int code, WPARAM wp, LPARAM lp)
 {
     if (code == HC_ACTION && (wp == WM_LBUTTONDOWN || wp == WM_RBUTTONDOWN || wp == WM_MBUTTONDOWN) &&
-        g_ctx) {
+        g_ctx && lp) {
         HWND h = g_ctx->ui->window().win32_hwnd();
-        POINT p{ (LONG)(short)LOWORD(lp), (LONG)(short)HIWORD(lp) };
+        // 低级鼠标钩子的 lParam 是 MSLLHOOKSTRUCT*，不是打包坐标；
+        // 之前按 LOWORD/HIWORD 解指针值，点哪都被判成“窗口外”，点主窗也会被收掉
+        POINT p = reinterpret_cast<const MSLLHOOKSTRUCT*>(lp)->pt;
         if (h && IsWindowVisible(h) && point_outside_panel(h, p))
             PostMessageW(h, kMsgOutsideClick, 0, 0);  // 回到 UI 线程再收尾，避免钩子里重入
     }
