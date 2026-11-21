@@ -154,6 +154,7 @@ static constexpr int kUiWidth = 744;   // 面板 680 + 两侧投影边距
 // 主窗是逐像素透明的，叠在它上面画投影/高光/内容。
 static HWND g_glass = nullptr;
 static unsigned g_glassTint = 0x8A181218;  // ABGR，随主题底色更新
+static int g_uiRadius = 20;                // 面板圆角（逻辑 px），与 Slint 的 th-radius 同步
 
 static LRESULT CALLBACK GlassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
@@ -224,13 +225,17 @@ static void sync_glass(HWND ui)
     UINT dpi = GetDpiForWindow(ui);
     if (!dpi) dpi = 96;
     const int m = MulDiv(kUiMargin, (int)dpi, 96);
-    const int x = rc.left + m, y = rc.top + m;
-    const int w = (rc.right - rc.left) - m * 2, h = (rc.bottom - rc.top) - m * 2;
+    // 背板再往里收 1px：模糊边缘压在面板那根 1px 描边下面，避免露出第二层边
+    const int pad = MulDiv(1, (int)dpi, 96);
+    const int x = rc.left + m + pad, y = rc.top + m + pad;
+    const int w = (rc.right - rc.left) - (m + pad) * 2;
+    const int h = (rc.bottom - rc.top) - (m + pad) * 2;
     if (w < 32 || h < 32) {
         hide_glass();
         return;
     }
-    const int r = MulDiv(16, (int)dpi, 96);
+    int r = MulDiv(g_uiRadius, (int)dpi, 96);
+    if (r > pad) r -= pad;  // 圆角跟着内缩，保持与面板边缘平行
     if (HRGN rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, r * 2, r * 2))
         SetWindowRgn(g_glass, rgn, TRUE);  // takes ownership
     SetWindowPos(g_glass, ui, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
@@ -615,6 +620,7 @@ static void apply_theme(UiCtx& ctx)
     ctx.ui->set_th_sel_b(color_from_wire(w.selB));
     ctx.ui->set_th_on_accent(color_from_wire(w.onAccent));
     ctx.ui->set_th_radius((float)w.radius);
+    if (w.radius > 0) g_uiRadius = (int)w.radius;
     // 亚克力背板染色跟随主题底色：保留 RGB，压低不透明度让背后的模糊透出来
     set_glass_tint((w.panelTop & 0x00FFFFFFu) | 0x8A000000u);
 }
@@ -712,6 +718,21 @@ static void position_ui(HWND hwnd, bool center)
     SetWindowPos(hwnd, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER);
 }
 
+// 抢前台：SetForegroundWindow 可能被系统前台锁拒绝，AttachThreadInput 是兼容做法
+static bool activate_ui(HWND hwnd)
+{
+    if (!hwnd) return false;
+    DWORD myTid = GetCurrentThreadId();
+    HWND fg = GetForegroundWindow();
+    DWORD fgTid = fg ? GetWindowThreadProcessId(fg, nullptr) : 0;
+    bool attached = fgTid && fgTid != myTid && AttachThreadInput(myTid, fgTid, TRUE);
+    ShowWindow(hwnd, SW_SHOW);
+    SetForegroundWindow(hwnd);
+    SetActiveWindow(hwnd);
+    if (attached) AttachThreadInput(myTid, fgTid, FALSE);
+    return GetForegroundWindow() == hwnd;
+}
+
 static void show_ui()
 {
     if (!g_ctx) return;
@@ -721,7 +742,7 @@ static void show_ui()
     ctx.ui->set_query(slint::SharedString(""));  // 主进程每次唤起都清空输入
     ctx.ui->set_selected(0);
     ctx.ui->set_alias_open(false);
-    if (!wasVisible) ctx.ui->set_revealed(false);  // 重新播放淡入上浮
+    if (!wasVisible) ctx.ui->set_revealed(false);  // 重新播放淡入
     remove_native_frame(hwnd);
     apply_rounded_region(hwnd);
     position_ui(hwnd, ctx.centerWake);  // 先摆好位置再显示，避免旧位置闪一下
@@ -730,18 +751,9 @@ static void show_ui()
     apply_topmost(hwnd);
     apply_tool_window(hwnd);  // winit 可能在 show 时又把 APPWINDOW 写回来
     sync_glass(hwnd);         // 磨砂背板跟着面板走（在投影边距内不铺模糊）
-    if (hwnd) {
-        DWORD myTid = GetCurrentThreadId();
-        HWND fg = GetForegroundWindow();
-        DWORD fgTid = fg ? GetWindowThreadProcessId(fg, nullptr) : 0;
-        bool attached = fgTid && fgTid != myTid && AttachThreadInput(myTid, fgTid, TRUE);
-        ShowWindow(hwnd, SW_SHOW);
-        SetForegroundWindow(hwnd);
-        if (attached) AttachThreadInput(myTid, fgTid, FALSE);
-    }
+    g_uiActive = activate_ui(hwnd);
     // 只有真的拿到前台才算「活跃」：SetForegroundWindow 被系统拒绝时窗口虽显示，
     // 键盘仍在前一个窗口，不能把它当成已激活（否则后续失焦逻辑会错乱）。
-    g_uiActive = (GetForegroundWindow() == hwnd);
     arm_outside_hook(true);  // 点击窗口外直接收掉
     if (!g_uiActive) arm_outside_capture(hwnd, true);  // 没抢到前台时用捕获兜底
     slint::Timer::single_shot(std::chrono::milliseconds(40), []() {
@@ -753,6 +765,16 @@ static void show_ui()
         apply_rounded_region(h);
         position_ui(h, g_ctx->centerWake);
         sync_glass(h);
+    });
+    // 设置窗刚关掉时前台锁可能晚一拍才释放：再抢一次并补一次输入框聚焦
+    slint::Timer::single_shot(std::chrono::milliseconds(140), []() {
+        if (!g_ctx) return;
+        HWND h = g_ctx->ui->window().win32_hwnd();
+        if (!h || !IsWindowVisible(h) || GetForegroundWindow() == h) return;
+        if (activate_ui(h)) {
+            g_uiActive = true;
+            g_ctx->ui->invoke_focus_input();
+        }
     });
 }
 

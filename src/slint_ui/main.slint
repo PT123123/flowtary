@@ -230,11 +230,10 @@ export component MainWindow inherits Window {
     // —— 面板底板：外投影 + 主题渐变 + 顶部高光 ——
     // 窗口四周留 32px 透明边距容纳完整投影（与 C++ 的 kUiMargin 对应）
     Rectangle {
-        x: 32px; y: root.revealed ? 32px : 40px;
+        x: 32px; y: 32px;
         width: parent.width - 64px; height: parent.height - 64px;
         opacity: root.revealed ? 1 : 0;
         animate opacity { duration: 150ms; easing: ease-out; }
-        animate y { duration: 180ms; easing: ease-out; }
         border-radius: root.th-radius;
         background: transparent;
         border-width: 1px;

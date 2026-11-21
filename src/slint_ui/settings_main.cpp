@@ -504,16 +504,19 @@ static void DoSave() {
     ft::SetStartupPath(g_mainExe, g_s.startupWanted);
     g_s.Save();
     g_committed = true;
+    AllowSetForegroundWindow(ASFW_ANY);  // 交还前台授权：否则主窗拉起后被前台锁拒绝激活，输入框打不了字
     ipc::Header hdr{g_hSelf};
     SendToMain(ipc::MsgCommit, &hdr, sizeof(hdr));
     QuitApp();
 }
 static void DoCancel() {
+    AllowSetForegroundWindow(ASFW_ANY);
     ipc::Header hdr{g_hSelf};
     SendToMain(ipc::MsgCancel, &hdr, sizeof(hdr));
     QuitApp();
 }
 static void DoClose() {
+    AllowSetForegroundWindow(ASFW_ANY);
     ipc::Header hdr{g_hSelf};
     SendToMain(g_committed ? ipc::MsgClosed : ipc::MsgCancel, &hdr, sizeof(hdr));
     QuitApp();
