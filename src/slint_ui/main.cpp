@@ -426,9 +426,48 @@ static void pick_row_menu(UiCtx& ctx, int idx)
     send_req(slintbridge::kReqMenuPick, id);
 }
 
+// 桥里的 COLORREF+alpha（0xAABBGGRR）→ Slint 颜色
+// 纯 COLORREF 字段的高 8 位是 0，这里按不透明处理（否则文字会整块透明）
+static slint::Color color_from_wire(unsigned c)
+{
+    uint8_t a = (uint8_t)(c >> 24);
+    if (a == 0) a = 255;
+    return slint::Color::from_argb_uint8(a, (uint8_t)(c & 0xFF),
+                                         (uint8_t)((c >> 8) & 0xFF), (uint8_t)((c >> 16) & 0xFF));
+}
+
+// 把主进程下发的主题调色板绑定到窗口属性（换主题/微调立即生效）
+static void apply_theme(UiCtx& ctx)
+{
+    if (!g_bridge) return;
+    LONG seq = InterlockedCompareExchange(&g_bridge->themeSeq, 0, 0);
+    static LONG lastThemeSeq = 0;
+    if (seq == 0 || seq == lastThemeSeq) return;
+    lastThemeSeq = seq;
+    const slintbridge::ThemeWire& w = g_bridge->theme;
+    ctx.ui->set_th_panel_top(color_from_wire(w.panelTop));
+    ctx.ui->set_th_panel_bottom(color_from_wire(w.panelBottom));
+    ctx.ui->set_th_glow(color_from_wire(w.glow));
+    ctx.ui->set_th_menu(color_from_wire(w.menu));
+    ctx.ui->set_th_input(color_from_wire(w.input));
+    ctx.ui->set_th_text(color_from_wire(w.text));
+    ctx.ui->set_th_sub(color_from_wire(w.sub));
+    ctx.ui->set_th_accent(color_from_wire(w.accent));
+    ctx.ui->set_th_accent2(color_from_wire(w.accent2));
+    ctx.ui->set_th_accent_dark(color_from_wire(w.accentDark));
+    ctx.ui->set_th_accent_soft(color_from_wire(w.accentSoft));
+    ctx.ui->set_th_accent_line(color_from_wire(w.accentLine));
+    ctx.ui->set_th_accent_border(color_from_wire(w.accentBorder));
+    ctx.ui->set_th_sel_a(color_from_wire(w.selA));
+    ctx.ui->set_th_sel_b(color_from_wire(w.selB));
+    ctx.ui->set_th_on_accent(color_from_wire(w.onAccent));
+    ctx.ui->set_th_radius((float)w.radius);
+}
+
 static void apply_state(UiCtx& ctx)
 {
     if (!g_bridge) return;
+    apply_theme(ctx);
     LONG seq = InterlockedCompareExchange(&g_bridge->stateSeq, 0, 0);
     if (seq == g_lastStateSeq) return;
     g_lastStateSeq = seq;
@@ -599,6 +638,10 @@ static void show_toast(const std::string& text)
         g_toast = ToastWindow::create();
     }
     (*g_toast)->set_message(slint::SharedString(text.c_str()));
+    if (g_bridge && g_bridge->themeSeq) {
+        (*g_toast)->set_th_menu(color_from_wire(g_bridge->theme.menu));
+        (*g_toast)->set_th_text(color_from_wire(g_bridge->theme.text));
+    }
     (*g_toast)->window().show();
     HWND h = (*g_toast)->window().win32_hwnd();
     if (!h) return;

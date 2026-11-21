@@ -300,17 +300,27 @@ static std::vector<FormRow> BuildRows(int tab) {
             v.push_back(RowHint(0, L"每行一条：前缀 + 空格 + 链接模板（{q} 为关键词，回车跳转）", 22));
             break;
         case 2:  // 主题
-            v.push_back(RowCheck(ID_BEAUTIFY, L"启用界面美化（暗色标题栏 / 圆角窗口 / 暗色菜单）",
-                                 g_s.beautify));
-            v.push_back(RowCheck(ID_ANTIGHOST, L"启用抗残影双缓冲（实验性）", g_s.antiGhost));
-            v.push_back(RowHint(0, L"实验性：开启整窗双缓冲消除残影；个别控件可能偶发闪烁", 20));
+            if (g_s.uiEngine == 0) {
+                // GDI 引擎才有的旧选项；Slint 引擎下没有「自绘 + 双缓冲」这一层
+                v.push_back(RowCheck(ID_BEAUTIFY,
+                                     L"启用界面美化（暗色标题栏 / 圆角窗口 / 暗色菜单）",
+                                     g_s.beautify));
+                v.push_back(RowCheck(ID_ANTIGHOST, L"启用抗残影双缓冲（实验性）", g_s.antiGhost));
+                v.push_back(RowHint(0, L"实验性：开启整窗双缓冲消除残影；个别控件可能偶发闪烁", 20));
+            } else {
+                v.push_back(RowHint(
+                    0,
+                    L"当前为 Slint 引擎：界面由主题直接控制，配色、圆角与透明度都会实时生效。"
+                    L"GDI 版的「界面美化 / 抗残影双缓冲」已不再适用，故不在此显示。",
+                    44));
+            }
             {
                 std::vector<ft::Option> themes;
                 for (int i = 0; i < kThemeCount; ++i)
                     themes.push_back({kThemes[i].name, i});
                 v.push_back(RowChoice(ID_THEME, L"主题：", themes, g_s.themeIdx));
             }
-            v.push_back(RowHint(0, L"微调（实时预览，保存后生效）", 20));
+            v.push_back(RowHint(0, L"微调（拖动即预览，保存后长期生效）", 20));
             if (g_s.themeIdx >= 0 && g_s.themeIdx < (int)g_s.tune.size()) {
                 v.push_back(RowSlider(ID_ALPHA, L"透明度：", g_s.tune[g_s.themeIdx].alpha, 0, 255));
                 v.push_back(RowSlider(ID_RADIUS, L"圆角半径：", g_s.tune[g_s.themeIdx].radius, 0, 30));

@@ -5425,6 +5425,45 @@ static bool LauncherVisible() {
     return IsWindowVisible(g.hwnd);
 }
 
+// 主题调色板 → 桥：COLORREF 是 0x00BBGGRR，附 8 位 alpha 方便渲染器直接当 #RRGGBBAA 用
+static unsigned SlintColorWithAlpha(COLORREF c, int a) {
+    return (unsigned)GetRValue(c) | ((unsigned)GetGValue(c) << 8) |
+           ((unsigned)GetBValue(c) << 16) | ((unsigned)(a & 0xFF) << 24);
+}
+static unsigned SlintColorScale(COLORREF c, double k) {
+    int r = (int)(GetRValue(c) * k), g = (int)(GetGValue(c) * k), b = (int)(GetBValue(c) * k);
+    if (r > 255) r = 255;
+    if (g > 255) g = 255;
+    if (b > 255) b = 255;
+    return (unsigned)r | ((unsigned)g << 8) | ((unsigned)b << 16);
+}
+static void SlintPushTheme() {
+    if (!g.bridge || !g.theme) return;
+    const Theme& t = *g.theme;
+    slintbridge::ThemeWire w{};
+    w.panelTop = SlintColorWithAlpha(t.bg, t.alpha);
+    w.panelBottom = SlintColorWithAlpha(t.bg2, t.alpha);
+    w.glow = SlintColorWithAlpha(t.accent, 0x12);
+    w.menu = SlintColorWithAlpha(t.menuBg, 0xF5);
+    w.input = t.editBg;
+    w.text = t.textTitle;
+    w.sub = t.sub;
+    w.accent = t.accent;
+    w.accent2 = t.accent2;
+    w.accentDark = SlintColorScale(t.accent, 0.72);
+    w.selA = SlintColorWithAlpha(t.accent, 0x40);
+    w.selB = SlintColorWithAlpha(t.accent2, 0x22);
+    w.accentLine = SlintColorWithAlpha(t.accent, 0x55);
+    w.accentBorder = SlintColorWithAlpha(t.accent2, 0x66);
+    w.accentSoft = SlintColorWithAlpha(t.accent, 0x1F);
+    const int lum = (GetRValue(t.accent) * 299 + GetGValue(t.accent) * 587 +
+                     GetBValue(t.accent) * 114) / 1000;
+    w.onAccent = lum > 150 ? 0x000000u : 0xFFFFFFu;
+    w.radius = t.radiusWindow;
+    w.seq = (unsigned)InterlockedIncrement((volatile LONG*)&g.bridge->themeSeq);
+    g.bridge->theme = w;
+}
+
 // 行区序列化：把 g.items 的可见行打包成「RowHead + utf8 字段」序列
 static void SlintBuildRows(std::vector<char>& out) {
     int n = (int)((std::min)((size_t)kMaxVisibleResults, g.items.size()));
@@ -5464,6 +5503,7 @@ static void SlintPushState() {
     if (g.uiEngine != 1) return;
     SlintBridgeEnsure();
     if (!g.bridge) return;
+    SlintPushTheme();  // 主题与状态一起下发（换主题/微调都会走到这里）
     LONG seq = g.bridge->stateSeq + 1;
     slintbridge::StateSlot& slot = g.bridge->state[seq % slintbridge::kStateSlots];
     std::string text = WideToUtf8(g.text);

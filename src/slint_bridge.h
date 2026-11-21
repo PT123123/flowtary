@@ -155,6 +155,18 @@ struct TextSlot {
     unsigned len;
     char text[kTextSlotMax];
 };
+
+// 主题调色板：主进程把当前主题（含微调的透明度/圆角）压成一组 COLORREF，
+// 渲染器直接绑定到 Slint 颜色属性上。引擎换了，主题定义仍然只有 kThemes 一份。
+struct ThemeWire {
+    unsigned seq;
+    unsigned panelTop, panelBottom, glow, menu, input;
+    unsigned text, sub;
+    unsigned accent, accent2, accentDark;
+    unsigned selA, selB, accentLine, accentBorder, accentSoft;
+    unsigned onAccent;   // 强调色上的文字色（深/浅自动选）
+    int radius;
+};
 #pragma pack(pop)
 
 struct Bridge {
@@ -173,6 +185,9 @@ struct Bridge {
     TextSlot alias;
     volatile LONG toastSeq;
     TextSlot toast;
+    // 主题调色板
+    volatile LONG themeSeq;
+    ThemeWire theme;
     // 命令环：大脑写 cmdHead，渲染器读 cmdTail（显示 / 隐藏 / 退出）
     volatile LONG cmdHead;
     volatile LONG cmdTail;

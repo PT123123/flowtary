@@ -574,14 +574,20 @@ void Settings::Load() {
     v = 2;
     if (RegGetDword(L"DfIndexTier", v)) dfIndexTier = (v > 3) ? 2 : (int)v;   // 越界回默认档
 
-    // 主题微调 blob：长度与主题数量不符时整块忽略（用 kThemes 预设默认）
+    // 主题微调 blob：允许条目数与当前主题数不同（版本新增主题时保留旧的微调），
+    // 能对上几条就用几条，其余用预设默认。
     tune.assign(kThemeCount, ThemeTune());
     {
         DWORD cbT = 0;
         if (RegGetValueW(HKEY_CURRENT_USER, kRegPath, L"ThemeTune", RRF_RT_REG_BINARY, nullptr,
-                         nullptr, &cbT) == ERROR_SUCCESS && cbT == sizeof(ThemeTune) * kThemeCount) {
+                         nullptr, &cbT) == ERROR_SUCCESS &&
+            cbT >= sizeof(ThemeTune) && cbT % sizeof(ThemeTune) == 0) {
+            size_t n = cbT / sizeof(ThemeTune);
+            std::vector<ThemeTune> all(n);
+            DWORD cbRead = cbT;
             if (RegGetValueW(HKEY_CURRENT_USER, kRegPath, L"ThemeTune", RRF_RT_REG_BINARY, nullptr,
-                             tune.data(), &cbT) == ERROR_SUCCESS) {
+                             all.data(), &cbRead) == ERROR_SUCCESS) {
+                for (size_t i = 0; i < n && i < tune.size(); ++i) tune[i] = all[i];
                 for (auto& t : tune) {
                     t.alpha = (std::max)(0, (std::min)(255, t.alpha));
                     t.radius = (std::max)(0, (std::min)(14, t.radius));
