@@ -649,8 +649,8 @@ export component MainWindow inherits Window {
             for item[idx] in root.menu-items: Rectangle {
                 height: 32px;
                 border-radius: 8px;
-                background: idx == root.menu-selected ? #ffffff14 : transparent;
-                animate background { duration: 90ms; }
+                background: idx == root.menu-selected || menu-item-ta.has-hover ? #ffffff1f : transparent;
+                animate background { duration: 90ms; easing: ease-out; }
                 Text {
                     x: 10px; y: 0; width: parent.width - 20px; height: 100%;
                     text: item.label;
@@ -660,7 +660,7 @@ export component MainWindow inherits Window {
                     vertical-alignment: center;
                     overflow: elide;
                 }
-                TouchArea {
+                menu-item-ta := TouchArea {
                     mouse-cursor: pointer;
                     moved => { root.menu-selected = idx; }
                     clicked => { root.menu-picked(idx); }
