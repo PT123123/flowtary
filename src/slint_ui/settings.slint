@@ -88,7 +88,7 @@ export component SettingsWindow inherits Window {
                 Rectangle {
                     x: 0; y: 9px; width: 3px; height: 16px;
                     border-radius: 2px;
-                    background: #63d8cd;
+                    background: #0a84ff;
                     opacity: idx == root.tab ? 1 : 0;
                     animate opacity { duration: 120ms; }
                 }
@@ -204,7 +204,7 @@ export component SettingsWindow inherits Window {
                         border-radius: 8px;
                         background: #151b23;
                         border-width: 1px;
-                        border-color: picker.has-hover ? #63d8cd55 : #ffffff18;
+                        border-color: picker.has-hover ? #0a84ff55 : #ffffff18;
                         picker := TouchArea {
                             mouse-cursor: pointer;
                             clicked => {
@@ -245,7 +245,7 @@ export component SettingsWindow inherits Window {
                         border-radius: 8px;
                         background: #0d1117;
                         border-width: 1px;
-                        border-color: si.has-focus ? #63d8cd66 : #ffffff18;
+                        border-color: si.has-focus ? #0a84ff66 : #ffffff18;
                         animate border-color { duration: 120ms; }
                         si := TextInput {
                             x: 10px; y: 0; width: parent.width - 20px; height: 100%;
@@ -255,7 +255,7 @@ export component SettingsWindow inherits Window {
                             color: r.enabled ? #ffffff : #6b7488;
                             font-size: 12px;
                             selection-foreground-color: #0b1017;
-                            selection-background-color: #63d8cd;
+                            selection-background-color: #0a84ff;
                             edited => { root.row-edited(r.row-id, self.text); }
                         }
                     }
@@ -274,7 +274,7 @@ export component SettingsWindow inherits Window {
                         border-radius: 8px;
                         background: #0d1117;
                         border-width: 1px;
-                        border-color: te.has-focus ? #63d8cd66 : #ffffff18;
+                        border-color: te.has-focus ? #0a84ff66 : #ffffff18;
                         animate border-color { duration: 120ms; }
                         te := TextEdit {
                             x: 8px; y: 6px; width: parent.width - 16px; height: parent.height - 12px;
@@ -296,7 +296,7 @@ export component SettingsWindow inherits Window {
                         border-radius: 9px;
                         background: btn.has-hover ? #232c38 : #1a212b;
                         border-width: 1px;
-                        border-color: btn.has-hover ? #63d8cd55 : #ffffff1c;
+                        border-color: btn.has-hover ? #0a84ff55 : #ffffff1c;
                         btn := TouchArea {
                             mouse-cursor: pointer;
                             clicked => { root.row-clicked(r.row-id); }
@@ -338,7 +338,7 @@ export component SettingsWindow inherits Window {
                             width: parent.width * (r.amount - r.min) / (r.max - r.min);
                             height: 100%;
                             border-radius: 3px;
-                            background: #63d8cd;
+                            background: #0a84ff;
                         }
                         Rectangle {
                             x: (parent.width - 14px) * (r.amount - r.min) / (r.max - r.min);
@@ -346,9 +346,9 @@ export component SettingsWindow inherits Window {
                             width: 14px; height: 14px;
                             border-radius: 7px;
                             background: #ffffff;
-                            border-width: 1px; border-color: #63d8cd;
+                            border-width: 1px; border-color: #0a84ff;
                             drop-shadow-blur: 8px;
-                            drop-shadow-color: #63d8cd55;
+                            drop-shadow-color: #0a84ff55;
                         }
                         TouchArea {
                             mouse-cursor: pointer;

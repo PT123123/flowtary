@@ -3886,7 +3886,8 @@ static void SlintPushTheme() {
     const int lum = (GetRValue(t.accent) * 299 + GetGValue(t.accent) * 587 +
                      GetBValue(t.accent) * 114) / 1000;
     w.onAccent = lum > 150 ? 0x000000u : 0xFFFFFFu;
-    w.radius = t.radiusWindow;
+    // 液态玻璃至少 20px 圆角：主题微调里常驻的 10px 太生硬，允许继续往大调
+    w.radius = t.radiusWindow < 20 ? 20 : t.radiusWindow;
     w.seq = (unsigned)InterlockedIncrement((volatile LONG*)&g.bridge->themeSeq);
     g.bridge->theme = w;
 }

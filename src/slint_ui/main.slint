@@ -31,16 +31,16 @@ component AliasCard inherits Rectangle {
     callback committed(string);
     callback cancelled();
     // 与主窗共用同一套主题色
-    in-out property <color> th-menu: #1b212bf7;
-    in-out property <color> th-input: #0d1117;
-    in-out property <color> th-text: #ffffff;
-    in-out property <color> th-sub: #8b96ae;
-    in-out property <color> th-accent: #63d8cd;
-    in-out property <color> th-accent2: #6fd7cd;
-    in-out property <color> th-accent-dark: #2f8f8a;
-    in-out property <color> th-accent-line: #63d8cd55;
-    in-out property <color> th-accent-border: #6fd7cd66;
-    in-out property <color> th-on-accent: #0b1017;
+    in-out property <color> th-menu: #1c1d22f5;
+    in-out property <color> th-input: #0c0d10;
+    in-out property <color> th-text: #f7f8fa;
+    in-out property <color> th-sub: #9ba2ae;
+    in-out property <color> th-accent: #0a84ff;
+    in-out property <color> th-accent2: #4da6ff;
+    in-out property <color> th-accent-dark: #0066cc;
+    in-out property <color> th-accent-line: #0a84ff55;
+    in-out property <color> th-accent-border: #4da6ff66;
+    in-out property <color> th-on-accent: #ffffff;
 
     Rectangle {
         width: 100%; height: 100%;
@@ -52,7 +52,7 @@ component AliasCard inherits Rectangle {
         x: (parent.width - 440px) / 2;
         y: (parent.height - 208px) / 2;
         width: 440px; height: 208px;
-        border-radius: 16px;
+        border-radius: 20px;
         background: root.th-menu;
         border-width: 1px;
         border-color: #ffffff1f;
@@ -75,7 +75,7 @@ component AliasCard inherits Rectangle {
         }
         Rectangle {
             x: 24px; y: 84px; width: parent.width - 48px; height: 44px;
-            border-radius: 11px;
+            border-radius: 13px;
             background: field.has-focus ? #10161f : root.th-input;
             border-width: 1px;
             border-color: field.has-focus ? root.th-accent : root.th-accent-line;
@@ -113,7 +113,7 @@ component AliasCard inherits Rectangle {
         // 取消 / 确认
         Rectangle {
             x: parent.width - 188px; y: 146px; width: 74px; height: 34px;
-            border-radius: 9px;
+            border-radius: 17px;
             background: cancel-ta.has-hover ? #ffffff16 : #ffffff0d;
             border-width: 1px; border-color: #ffffff18;
             animate background { duration: 90ms; }
@@ -129,7 +129,7 @@ component AliasCard inherits Rectangle {
         }
         Rectangle {
             x: parent.width - 104px; y: 146px; width: 80px; height: 34px;
-            border-radius: 9px;
+            border-radius: 17px;
             background: ok-ta.has-hover ? root.th-accent : root.th-accent-dark;
             border-width: 1px; border-color: root.th-accent-border;
             animate background { duration: 90ms; }
@@ -192,23 +192,23 @@ export component MainWindow inherits Window {
     in-out property <string> alias-text: "";
     in-out property <string> alias-title: "添加别名";
     // 主题调色板（主进程按 kThemes + 微调下发）
-    in-out property <color> th-panel-top: #12172226;
-    in-out property <color> th-panel-bottom: #080b111f;
-    in-out property <color> th-glow: #4fd0c610;
-    in-out property <color> th-menu: #191e27f5;
-    in-out property <color> th-input: #0d1117;
-    in-out property <color> th-text: #ffffff;
-    in-out property <color> th-sub: #8b96ae;
-    in-out property <color> th-accent: #63d8cd;
-    in-out property <color> th-accent2: #6fd7cd;
-    in-out property <color> th-accent-dark: #2f8f8a;
-    in-out property <color> th-accent-soft: #63d8cd1f;
-    in-out property <color> th-accent-line: #63d8cd55;
-    in-out property <color> th-accent-border: #6fd7cd66;
-    in-out property <color> th-sel-a: #2f8f8a40;
-    in-out property <color> th-sel-b: #1f5f5e22;
-    in-out property <color> th-on-accent: #0b1017;
-    in-out property <length> th-radius: 16px;
+    in-out property <color> th-panel-top: #14151aff;
+    in-out property <color> th-panel-bottom: #0a0b0eff;
+    in-out property <color> th-glow: #0a84ff14;
+    in-out property <color> th-menu: #1c1d22f5;
+    in-out property <color> th-input: #0c0d10;
+    in-out property <color> th-text: #f7f8fa;
+    in-out property <color> th-sub: #9ba2ae;
+    in-out property <color> th-accent: #0a84ff;
+    in-out property <color> th-accent2: #4da6ff;
+    in-out property <color> th-accent-dark: #0066cc;
+    in-out property <color> th-accent-soft: #0a84ff1f;
+    in-out property <color> th-accent-line: #0a84ff55;
+    in-out property <color> th-accent-border: #4da6ff66;
+    in-out property <color> th-sel-a: #0a84ff40;
+    in-out property <color> th-sel-b: #4da6ff22;
+    in-out property <color> th-on-accent: #ffffff;
+    in-out property <length> th-radius: 22px;
 
     // 唤起动效：内容淡入 + 轻微上浮（由 C++ 在 show 后触发）
     // 默认 true：渲染器启动时先建窗口，避免首帧出现空面板
@@ -238,7 +238,7 @@ export component MainWindow inherits Window {
         border-radius: root.th-radius;
         background: transparent;
         border-width: 1px;
-        border-color: #ffffff16;
+        border-color: #ffffff24;
 
         // 柔和投影：软件渲染不支持高斯模糊，用多层低透明度圆角描边叠出渐变
         for i in 8: Rectangle {
@@ -259,7 +259,7 @@ export component MainWindow inherits Window {
             x: 0; y: 0; width: 100%; height: 100%;
             border-radius: root.th-radius;
             background: @linear-gradient(180deg, root.th-panel-top 0%, root.th-panel-bottom 100%);
-            opacity: 0.88;
+            opacity: 0.60;
         }
 
         // 顶部极淡强调色氛围光，避免整块玻璃发灰
@@ -273,11 +273,11 @@ export component MainWindow inherits Window {
             x: 1px; y: 1px; width: parent.width - 2px; height: parent.height - 2px;
             border-radius: root.th-radius - 1px;
             background: @linear-gradient(122deg,
-                #ffffff24 0%,
-                #ffffff0b 22%,
-                transparent 46%,
-                transparent 68%,
-                #00000018 100%);
+                #ffffff2a 0%,
+                #ffffff0c 18%,
+                transparent 45%,
+                transparent 70%,
+                #00000020 100%);
         }
         // 顶部镜面高光（避开 1px 边框，两端淡出）
         Rectangle {
@@ -293,16 +293,8 @@ export component MainWindow inherits Window {
         }
 
     // —— 搜索区 ——
-    // 放大镜：圆环 + 手柄（描边路径，不填充）
-    Path {
-        x: 21px; y: 22px; width: 20px; height: 20px;
-        fill: transparent;
-        stroke: root.query != "" ? root.th-accent : root.th-sub;
-        stroke-width: 1.8px;
-        commands: "M 8 0 A 8 8 0 1 0 8 16 A 8 8 0 1 0 8 0 M 14 14 L 19 19";
-    }
     Text {
-        x: 52px; y: 0; width: parent.width - 52px - 78px; height: 64px;
+        x: 24px; y: 0; width: parent.width - 24px - 78px; height: 64px;
         vertical-alignment: center;
         text: "搜索程序、文件或网页…";
         color: root.th-sub;
@@ -310,7 +302,7 @@ export component MainWindow inherits Window {
         visible: root.query == "";
     }
     input := TextInput {
-        x: 52px; y: 0; width: parent.width - 52px - 78px; height: 64px;
+        x: 24px; y: 0; width: parent.width - 24px - 104px; height: 64px;
         vertical-alignment: center;
         text <=> root.query;
         color: root.th-text;
@@ -552,42 +544,20 @@ export component MainWindow inherits Window {
         }
     }
 
-    // —— 空态欢迎面板（整体垂直居中）——
+    // —— 空态欢迎面板（纯文字，不放图标）——
     if empty && root.query == "": Rectangle {
         x: 0; y: 0; width: 100%; height: 100%;
-        Rectangle {
-            x: (parent.width - 56px) / 2; y: (parent.height - 160px) / 2;
-            width: 56px; height: 56px;
-            border-radius: 17px;
-            background: @linear-gradient(135deg, root.th-accent 0%, root.th-accent-dark 100%);
-            border-width: 1px;
-            border-color: #ffffff33;
-            drop-shadow-blur: 18px;
-            drop-shadow-color: root.th-accent-dark;
-            Rectangle {
-                x: 1px; y: 1px; width: parent.width - 2px; height: 26px;
-                border-radius: 16px;
-                background: @linear-gradient(180deg, #ffffff2e 0%, transparent 100%);
-            }
-            Text {
-                width: 100%; height: 100%;
-                text: "F";
-                color: root.th-text;
-                font-size: 28px; font-weight: 800;
-                horizontal-alignment: center; vertical-alignment: center;
-            }
-        }
         Text {
-            x: 0; y: (parent.height - 160px) / 2 + 72px; width: 100%; height: 30px;
+            x: 0; y: (parent.height - 112px) / 2; width: 100%; height: 34px;
             text: "Flowtary";
             color: root.th-text;
-            font-size: 23px; font-weight: 600;
-            letter-spacing: 0.4px;
+            font-size: 26px; font-weight: 600;
+            letter-spacing: 0.3px;
             horizontal-alignment: center;
             vertical-alignment: center;
         }
         Text {
-            x: 0; y: (parent.height - 160px) / 2 + 104px; width: 100%; height: 20px;
+            x: 0; y: (parent.height - 112px) / 2 + 40px; width: 100%; height: 20px;
             text: "搜索程序、文件与网页";
             color: root.th-sub;
             font-size: 12.5px;
@@ -595,7 +565,7 @@ export component MainWindow inherits Window {
             vertical-alignment: center;
         }
         HorizontalLayout {
-            x: 0; y: (parent.height - 160px) / 2 + 136px; width: 100%; height: 24px;
+            x: 0; y: (parent.height - 112px) / 2 + 68px; width: 100%; height: 24px;
             alignment: center;
             spacing: 8px;
             Rectangle {
