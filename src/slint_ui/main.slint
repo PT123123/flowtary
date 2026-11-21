@@ -44,46 +44,56 @@ component AliasCard inherits Rectangle {
 
     Rectangle {
         width: 100%; height: 100%;
-        background: #05070bcc;
+        background: #05070bd9;
         // 吃掉点击，避免穿透到下面的结果行
         TouchArea { }
     }
     Rectangle {
-        x: 60px; y: 96px;
-        width: parent.width - 120px; height: 172px;
-        border-radius: 14px;
+        x: (parent.width - 440px) / 2;
+        y: (parent.height - 208px) / 2;
+        width: 440px; height: 208px;
+        border-radius: 16px;
         background: root.th-menu;
         border-width: 1px;
-        border-color: #ffffff20;
-        drop-shadow-blur: 28px;
-        drop-shadow-color: #00000088;
-        drop-shadow-offset-y: 8px;
+        border-color: #ffffff1f;
+        drop-shadow-blur: 32px;
+        drop-shadow-color: #00000099;
+        drop-shadow-offset-y: 10px;
 
         Text {
-            x: 20px; y: 16px; width: parent.width - 40px; height: 24px;
+            x: 24px; y: 22px; width: parent.width - 48px; height: 26px;
             text: root.title;
             color: root.th-text;
-            font-size: 15px; font-weight: 600;
+            font-size: 16px; font-weight: 600;
             vertical-alignment: center;
         }
         Text {
-            x: 20px; y: 40px; width: parent.width - 40px; height: 18px;
-            text: "输入一个更好记的名字，回车确认（Esc 取消）";
-            color: root.th-sub; font-size: 11.5px;
+            x: 24px; y: 54px; width: parent.width - 48px; height: 18px;
+            text: "给这个条目起一个好记的名字";
+            color: root.th-sub; font-size: 12px;
             vertical-alignment: center;
         }
         Rectangle {
-            x: 20px; y: 66px; width: parent.width - 40px; height: 38px;
-            border-radius: 9px;
-            background: root.th-input;
+            x: 24px; y: 84px; width: parent.width - 48px; height: 44px;
+            border-radius: 11px;
+            background: field.has-focus ? #10161f : root.th-input;
             border-width: 1px;
-            border-color: root.th-accent-line;
+            border-color: field.has-focus ? root.th-accent : root.th-accent-line;
+            animate background { duration: 120ms; }
+            animate border-color { duration: 120ms; }
+            Text {
+                x: 14px; y: 0; width: 22px; height: 100%;
+                text: "Aa";
+                color: field.has-focus ? root.th-accent : root.th-sub;
+                font-size: 11px; font-weight: 700;
+                vertical-alignment: center;
+            }
             field := TextInput {
-                x: 10px; y: 0; width: parent.width - 20px; height: 100%;
+                x: 40px; y: 0; width: parent.width - 54px; height: 100%;
                 vertical-alignment: center;
                 text <=> root.value;
                 color: root.th-text;
-                font-size: 14px;
+                font-size: 14.5px;
                 selection-foreground-color: root.th-on-accent;
                 selection-background-color: root.th-accent;
                 edited => { root.value-changed(root.value); }
@@ -94,9 +104,15 @@ component AliasCard inherits Rectangle {
                 }
             }
         }
+        Text {
+            x: 24px; y: 146px; width: 200px; height: 34px;
+            text: "回车确认 · Esc 取消";
+            color: root.th-sub; font-size: 11px;
+            vertical-alignment: center;
+        }
         // 取消 / 确认
         Rectangle {
-            x: parent.width - 178px; y: 118px; width: 72px; height: 32px;
+            x: parent.width - 188px; y: 146px; width: 74px; height: 34px;
             border-radius: 9px;
             background: cancel-ta.has-hover ? #ffffff16 : #ffffff0d;
             border-width: 1px; border-color: #ffffff18;
@@ -112,7 +128,7 @@ component AliasCard inherits Rectangle {
             }
         }
         Rectangle {
-            x: parent.width - 98px; y: 118px; width: 78px; height: 32px;
+            x: parent.width - 104px; y: 146px; width: 80px; height: 34px;
             border-radius: 9px;
             background: ok-ta.has-hover ? root.th-accent : root.th-accent-dark;
             border-width: 1px; border-color: root.th-accent-border;
