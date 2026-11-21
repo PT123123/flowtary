@@ -101,18 +101,10 @@ Win11 原生轻量全局启动工具（类 Listary / FlowLauncher 功能阉割�
     - 例：启动组 `美化 D:\Tools\a.exe;D:\Tools\b.exe`；关闭组 `关闭多余软件 chrome;msedge`
     - 分别存 `HKCU\Software\Flowtary\GroupLaunch` 与 `GroupKill`（`REG_SZ`）
   - `主题` 页：
-    - `启用界面美化`：控制「暗色标题栏 + 圆角窗口 + 强制暗色菜单」三项系统级美化，**默认勾选**；
-      取消后窗口标题栏与圆角回归系统默认、菜单回归系统主题（内容配色仍按所选主题绘制）。
-      切换即时预览，存 `HKCU\Software\Flowtary\Beautify`
-    - `毛玻璃背景`：亚克力/模糊背景，依附于 `启用界面美化`（后者关闭时本项置灰不可选），
-      **默认勾选**。实现：设置窗（非分层窗口）走文档化 `DWMWA_SYSTEMBACKDROP_TYPE=3`（Acrylic）；
-      主窗为分层窗口（需保留半透明主题），改用未公开 `SetWindowCompositionAttribute` 的
-      `ACCENT_ENABLE_BLURBEHIND(3)` + `LWA_COLORKEY` 透明键色，让背景完全透明以透出模糊，
-      主题色调由 accent 的 `GradientColor` 提供（透明蓝/星空等各显其色）；失效的
-      `ACCENT_ENABLE_ACRYLICBLURBEHIND(4)` 已弃用。开启时 `Paint` 不再不透明铺底，模糊正常透出。
-      存 `HKCU\Software\Flowtary\Glass`
-    - `主题样式`：黑色简洁 / 透明Mac黑暗 / 透明蓝色 / 星空风格 / 日出浅白
-      （存 `HKCU\Software\Flowtary\Theme`）；**美化关闭时该项置灰不可选**（原先位于 `常规` 页，已移入本页）
+    - `主题样式`：11 套暗色主题（黑色简洁 / 透明Mac黑暗 / 透明蓝色 / 星空风格 / Obsidian /
+      Honey-Amber / 极光青 / 森野绿 / 赛博紫 / 赤霞红 / 石墨灰），存 `HKCU\Software\Flowtary\Theme`
+    - `透明度` / `圆角半径`：拖动即时预览，存 `ThemeTune`
+    - 界面统一由 Slint 引擎按主题属性绘制，不再需要「界面美化 / 抗残影双缓冲」开关
   - `搜索权重` 页：**点击加权排序**的开关与性能参数（见下「点击加权排序」）
     - `启用点击权重记忆`：总开关，**默认勾选**（存 `HKCU\Software\Flowtary\WeightEnabled`）
     - `写入时机`：每次点击立即写入磁盘 / 延迟 3 秒合并写入磁盘（默认）/ 仅程序退出时写入磁盘

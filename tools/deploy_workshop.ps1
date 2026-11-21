@@ -65,7 +65,7 @@ if (Test-Path (Join-Path $src 'flowtary-settings.exe')) {
     Copy-Item (Join-Path $src 'flowtary-settings.exe') (Join-Path $dest 'flowtary-settings.exe') -Force
 } else {
     # Settings window lives in this sidecar; without it the tray "Settings" entry can only warn.
-    Write-Warning 'flowtary-settings.exe missing - run tools\build-fltk.bat then make build'
+    Write-Warning 'flowtary-settings.exe missing - run cmake --build src\slint_ui\build --config Release'
 }
 Copy-Item (Join-Path $src 'filedlg_hook64.dll')  (Join-Path $dest 'filedlg_hook64.dll') -Force
 Copy-Item (Join-Path $src 'filedlg_hook32.dll')  (Join-Path $dest 'filedlg_hook32.dll') -Force

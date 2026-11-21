@@ -1,8 +1,8 @@
-// Flowtary 设置窗 —— Slint 版（flowtary-settings-slint.exe）
+// Flowtary 设置窗 —— Slint 版（flowtary-settings.exe）
 //   · 只做界面：数据模型、注册表读写、与主进程的 IPC 全部复用 settings_model / settings_ipc
 //   · 12 个页签用「数据驱动表单」实现：C++ 把当前页签整理成 FormRow 列表，
 //     settings.slint 负责画，交互通过回调回到这里改 g_s
-//   · 保存 / 取消 / 预览语义与 FLTK 版完全一致
+//   · 保存 / 取消 / 预览语义由 settings_ipc 与主进程共同约定
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -69,9 +69,9 @@ static std::wstring wu8(const std::string& s) {
 
 // ---------------- 控件 id ----------------
 enum Id {
-    ID_UIENGINE = 1, ID_STARTUP, ID_HOTKEYMODE, ID_CENTERWAKE, ID_FDJ, ID_DFBACKEND,
+    ID_STARTUP = 1, ID_HOTKEYMODE, ID_CENTERWAKE, ID_FDJ, ID_DFBACKEND,
     ID_RULES,
-    ID_BEAUTIFY, ID_ANTIGHOST, ID_THEME, ID_ALPHA, ID_RADIUS,
+    ID_THEME, ID_ALPHA, ID_RADIUS,
     ID_LAUNCH, ID_KILL,
     ID_WEIGHT_ENABLED, ID_WEIGHT_FLUSH, ID_WEIGHT_MAX, ID_WIPE_WEIGHTS, ID_WEIGHT_COUNT,
     ID_SKIPDOT, ID_EXCLUDE, ID_RESET_EXCLUDE, ID_EXCLUDE_COUNT,
@@ -104,7 +104,6 @@ static ipc::Preview MakePreview() {
     p.themeIdx = g_s.themeIdx;
     p.hotkeyMode = g_s.hotkeyMode;
     p.centerWake = g_s.centerWake ? TRUE : FALSE;
-    p.beautify = g_s.beautify ? TRUE : FALSE;
     p.skipDotFolders = g_s.skipDotFolders ? TRUE : FALSE;
     p.fdjEnabled = g_s.fdjEnabled ? TRUE : FALSE;
     p.dfBackend = g_s.dfBackend;
@@ -272,7 +271,6 @@ static std::vector<FormRow> BuildRows(int tab) {
     std::vector<FormRow> v;
     switch (tab) {
         case 0:  // 常规
-            v.push_back(RowChoice(ID_UIENGINE, L"界面引擎：", ft::UiEngineOptions(), g_s.uiEngine));
             v.push_back(RowCheck(ID_STARTUP, L"开机自动启动", g_s.startupWanted));
             v.push_back(RowChoice(ID_HOTKEYMODE, L"结果项快捷键：", ft::HotkeyModeOptions(),
                                   g_s.hotkeyMode));
@@ -290,9 +288,8 @@ static std::vector<FormRow> BuildRows(int tab) {
                                 L"范围由系统设置决定。",
                                 52));
             v.push_back(RowHint(0,
-                                L"界面引擎切换（GDI/Slint）在保存后、下次唤起时生效。\n"
                                 L"唤起快捷键（Alt+Space）在托盘菜单里开关；结果项快捷键改动立即生效。",
-                                46));
+                                30));
             break;
         case 1:  // 网页规则
             v.push_back(MakeRow(0, kLabel, L"网页搜索规则：", 22));
@@ -300,20 +297,10 @@ static std::vector<FormRow> BuildRows(int tab) {
             v.push_back(RowHint(0, L"每行一条：前缀 + 空格 + 链接模板（{q} 为关键词，回车跳转）", 22));
             break;
         case 2:  // 主题
-            if (g_s.uiEngine == 0) {
-                // GDI 引擎才有的旧选项；Slint 引擎下没有「自绘 + 双缓冲」这一层
-                v.push_back(RowCheck(ID_BEAUTIFY,
-                                     L"启用界面美化（暗色标题栏 / 圆角窗口 / 暗色菜单）",
-                                     g_s.beautify));
-                v.push_back(RowCheck(ID_ANTIGHOST, L"启用抗残影双缓冲（实验性）", g_s.antiGhost));
-                v.push_back(RowHint(0, L"实验性：开启整窗双缓冲消除残影；个别控件可能偶发闪烁", 20));
-            } else {
-                v.push_back(RowHint(
-                    0,
-                    L"当前为 Slint 引擎：界面由主题直接控制，配色、圆角与透明度都会实时生效。"
-                    L"GDI 版的「界面美化 / 抗残影双缓冲」已不再适用，故不在此显示。",
-                    44));
-            }
+            v.push_back(RowHint(
+                0,
+                L"界面由主题直接控制：配色、圆角与透明度都会实时生效。",
+                24));
             {
                 std::vector<ft::Option> themes;
                 for (int i = 0; i < kThemeCount; ++i)
@@ -680,8 +667,6 @@ static void OnRowToggled(int id, bool on) {
     switch (id) {
         case ID_STARTUP: g_s.startupWanted = on; break;
         case ID_FDJ: g_s.fdjEnabled = on; break;
-        case ID_BEAUTIFY: g_s.beautify = on; break;
-        case ID_ANTIGHOST: g_s.antiGhost = on; break;
         case ID_WEIGHT_ENABLED: g_s.weightEnabled = on; break;
         case ID_SKIPDOT: g_s.skipDotFolders = on; break;
         case ID_SHELLSHOW: g_s.shellShowWindow = on; break;
@@ -711,7 +696,6 @@ static void OnRowChosen(int id, int idx) {
     if (it == g_choice.end() || idx < 0 || idx >= (int)it->second.size()) return;
     int value = it->second[idx].value;
     switch (id) {
-        case ID_UIENGINE: g_s.uiEngine = value; break;
         case ID_HOTKEYMODE: g_s.hotkeyMode = value; break;
         case ID_CENTERWAKE: g_s.centerWake = value; break;
         case ID_DFBACKEND: g_s.dfBackend = value; break;

@@ -39,7 +39,7 @@ constexpr DWORD MsgCaptureInstalled = kMsgBase + 9;  // 截图工具下载完成
 constexpr DWORD MsgStats = kMsgBase + 0x8001;  // {weightCount, learnCount}
 constexpr DWORD MsgMainQuitting = kMsgBase + 0x8002;  // 主进程退出，sidecar 自行关闭
 
-constexpr int kMaxThemes = 16;  // ThemeTune 数组上限（当前 8 个主题）
+constexpr int kMaxThemes = 16;  // ThemeTune 数组上限
 
 // sidecar→主进程 通用头：所有负载以此开头，主进程据此拿到回信地址。
 struct Header {
@@ -61,7 +61,6 @@ struct Preview {
     int themeIdx;
     int hotkeyMode;
     BOOL centerWake;
-    BOOL beautify;
     BOOL skipDotFolders;
     BOOL fdjEnabled;
     int dfBackend;   // d/f 搜索后端：0=自动（Flowtary 优先）1=仅 Flowtary 2=仅 Windows Search

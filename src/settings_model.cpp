@@ -538,10 +538,6 @@ void SyncStartupPath(const std::wstring& mainExePath) {
 void Settings::Load() {
     DWORD v = 0;
 
-    // 界面引擎：默认 Slint(1)；只有用户显式选过 GDI(0) 才走旧引擎
-    uiEngine = 1;
-    if (RegGetDword(L"UiEngine", v)) uiEngine = (v <= 1) ? (int)v : 1;
-
     centerWake = 1;
     if (RegGetDword(L"CenterWake", v)) centerWake = v ? 1 : 0;
 
@@ -563,10 +559,6 @@ void Settings::Load() {
     if (RegGetDword(L"Theme", v)) themeIdx = (int)v;
     if (themeIdx < 0 || themeIdx >= kThemeCount) themeIdx = 0;
 
-    v = 1;
-    beautify = RegGetDword(L"Beautify", v) ? v != 0 : true;
-    v = 0;
-    antiGhost = RegGetDword(L"AntiGhost", v) ? v != 0 : false;
     v = 1;
     skipDotFolders = RegGetDword(L"SkipDotFolders", v) ? v != 0 : true;
     v = 0;
@@ -685,15 +677,12 @@ void Settings::Load() {
 void Settings::Save() {
     Settings& self = *this;
 
-    RegSetDword(L"UiEngine", (DWORD)uiEngine);
     RegSetDword(L"CenterWake", centerWake ? 1 : 0);
     RegSetDword(L"HotkeyMode", (DWORD)hotkeyMode);
     RegSetDword(L"FileDlgJump", fdjEnabled ? 1 : 0);
     RegSetDword(L"Theme", (DWORD)themeIdx);
     RegSetKeyValueW(HKEY_CURRENT_USER, kRegPath, L"ThemeTune", REG_BINARY, tune.data(),
                     (DWORD)(tune.size() * sizeof(ThemeTune)));
-    RegSetDword(L"Beautify", beautify ? 1 : 0);
-    RegSetDword(L"AntiGhost", antiGhost ? 1 : 0);
 
     RegSetDword(L"WeightEnabled", weightEnabled ? 1 : 0);
     RegSetDword(L"WeightFlush", (DWORD)weightFlush);

@@ -104,26 +104,13 @@ static std::vector<ThemeTune> sTuneSaved;  // 打开设置窗口时的快照（�
 // 设置窗 sidecar 会话的运行态快照：预览期间未提交就靠它整体回退
 static ft::Settings sLiveSaved;
 static int sThemeIdxSaved = 0;
-static bool sBeautifySaved = true;
-
-// 星空风格的星星（相对主窗客户区，logical；点亮后每帧绘制）
-struct Star {
-    int x, y;    // 位置
-    int s;       // 大小 1-2
-    BYTE v;      // 亮度基准
-};
 
 // ---------------- 数据结构 ----------------
-struct ProgramIconDeleter {
-    void operator()(HICON icon) const noexcept { if (icon) DestroyIcon(icon); }
-};
 struct Program {
     std::wstring name;    // 显示名称
     std::wstring path;    // .lnk 或 .exe 完整路径（执行用）
     std::wstring target;  // 快捷方式解析出的目标（工作目录用）
     bool startMenu = false;
-    std::unique_ptr<std::remove_pointer_t<HICON>, ProgramIconDeleter> icon;
-    bool iconTried = false;
 };
 
 struct Row {
@@ -181,21 +168,15 @@ struct WinInfo {
 };
 
 struct App {
-    int uiEngine = 1;          // 界面引擎：0=GDI 稳定版 1=Slint 新版（默认 Slint）
     HWND hwnd = nullptr;
     HFONT fInput = nullptr;
     HFONT fList = nullptr;
-    HFONT fListHot = nullptr;  // 常用项加粗字体（与 fList 同字号同字族，随主题/比例重建）
-    HBRUSH brDivider = nullptr;
     HINSTANCE inst = nullptr;
     float scale = 1.0f;          // 全局比例：max(DPI, 屏幕物理高度/1080)，不写死像素
     bool centerWake = true;    // 唤醒位置：true=屏幕居中，false=跟随鼠标
-    bool dwmBorderOk = false;  // DWM 描边可用（否则 Paint 回退 GDI 描边）
     int hotkeyMode = 0;        // 结果项快捷键方案：0=Alt+数字, 1=Alt+字母, 2=关闭
     bool hotkeyWake = true;    // 唤起快捷键总开关（托盘菜单切换；关闭时不再注册 Alt+Space 等）
     int themeIdx = 0;          // 当前主题索引
-    bool beautify = true;      // 界面美化：强制暗色菜单（设置窗风格由 sidecar 自己施加）
-    bool glassEnabled = true;  // 系统亚克力玻璃：分层窗口 alpha 透出背后 + DWM 模糊（注册表 Glass，默认开）
     // 点开头过滤（默认开，UI 在设置「排除路径」Tab）：搜索文件/文件夹时，
     // 路径中任一层名以 '.' 开头（目录 .git / .vscode，或文件 .gitignore）即过滤该行。
     bool skipDotFolders = true;
@@ -242,22 +223,8 @@ struct App {
     int qSettledMs = -1;           // 本轮报齐时定格的总耗时（-1=还没报齐）；底栏非秒出时显示
     bool startingUp = true;    // 程序扫描尚未完成：托盘提示/右键菜单显示「正在启动中」
     Theme* theme = nullptr;
-    std::vector<Star> stars;   // 星空主题星点坐标
 
-    HFONT fontPool[15] = {};   // 逻辑字号 10..24 预建字体池（11-24），永不中途删除
-    HBRUSH brMenuBg = nullptr;   // 弹出菜单背景（跟随主题重建）
-
-    // —— 主题扩展刷子/笔（随 ApplyTheme 重建）——
-    HBRUSH brCardBg = nullptr;   // 卡片/结果面板背景
-    HBRUSH brInputBg = nullptr;  // 输入框背景
-    HBRUSH brAccent = nullptr;   // 主强调色
-    HBRUSH brAccent2 = nullptr;  // 次强调（hover/focus）
-    HBRUSH brTextDis = nullptr;  // 禁用/占位文字
-    HBRUSH brStatusOK = nullptr, brStatusWarn = nullptr, brStatusErr = nullptr; // 状态色
-    HPEN penBorder = nullptr;    // 描边笔（DWM 描边不可用时 GDI 回退）
-    int hoverRow = -1;           // 鼠标悬停的结果行（Phase D 动画 tween 驱动）
-    int pressRow = -1;           // 鼠标按下的结果行
-    double hoverT = 0, pressT = 0; // 悬停/按下动画进度 0..1（Phase D tween 写入）
+    HFONT fontPool[15] = {};   // 逻辑字号 10..24 预建字体池（11-24），供提示弹窗/轻提示使用
 
     std::vector<WebCmd> webCmds;  // 网页跳转规则（设置可编辑）
     std::vector<CmdGroup> groupsLaunch;  // 一键启动组：关键字 → 文件列表
@@ -272,13 +239,6 @@ struct App {
     std::vector<std::wstring> excludePathsNorm;
 
     std::wstring text;
-    size_t caret = 0;
-    size_t selStart = 0;
-    size_t selEnd = 0;
-    bool dragging = false;       // 输入框内左键拖拽选区中
-    int scrollX = 0;
-    bool caretOn = true;
-    std::wstring compText;     // IME 组合中（未上屏）文本：内联渲染，不弹系统浮窗
 
     Mode mode = Mode::None;
     std::vector<Row> items;
@@ -294,9 +254,6 @@ struct App {
 
 
     std::vector<Program> programs;
-    // 文件/文件夹行图标缓存：路径（小写）→ 小图标。File/Folder 结果行（含自学习置顶项）
-    // 与程序行一样显示图标；首次经 shell 抽取后缓存，退出时统一销毁。
-    std::unordered_map<std::wstring, HICON> pathIcons;
     std::wstring hotkeyName = L"Alt+Space";
     HHOOK hWakeHook = nullptr;     // 低级键盘钩子：让首选唤起组合优先于其他程序的 RegisterHotKey
     bool hotkeyRegistered = false; // 唤起热键是否已成功 RegisterHotKey（失败由重试定时器回收）
@@ -353,10 +310,9 @@ constexpr int kBadgeW = 30, kBadgeH = 19, kBadgeR = 5, kBadgeGapR = 15;
 constexpr int kSlowMs = 120;      // 超过这个毫秒数才报耗时；秒出的查询保持干净
 constexpr int kFontMin = 11, kFontMax = 24;  // 字体池逻辑字号范围
 constexpr UINT_PTR kTimerDebounce = 1;
-constexpr UINT_PTR kTimerBlink = 2;
+constexpr UINT_PTR kTimerBlink = 2;        // 目录变更轮询（沿用旧光标闪烁定时器 ID）
 constexpr UINT_PTR kTimerBalloon = 3;
 constexpr UINT_PTR kTimerWeightSave = 4;   // 点击权重延迟合并写盘
-constexpr UINT_PTR kTimerTween = 5;        // 补间动画（与光标闪烁 kTimerBlink 区分，互不干扰）
 constexpr UINT_PTR kTimerHotkeyRetry = 6;  // 唤起快捷键被占用时定时重试回收
 constexpr UINT_PTR kTimerHistFlush = 8;    // 搜索历史：编辑静置后把攒着的 Q 行落盘
 constexpr UINT_PTR kTimerLatency = 9;      // 耗时底栏：pending 期间实时跳毫秒（~30fps）
@@ -364,7 +320,7 @@ constexpr UINT kLatencyTickMs = 33;
 
 // 纯空态：零输入、零待上屏组合串、零结果（有输入但无结果时不算，避免搜不到时误显引导页）
 static inline bool IsWelcomeState() {
-    return g.text.empty() && g.compText.empty() && g.items.empty();
+    return g.text.empty() && g.items.empty();
 }
 constexpr UINT kHistFlushMs = 4000;        // 静置 4s 视为这一轮打完了（程序搜索逐字同步出结果，不落盘会一行一个前缀）
 constexpr int kDebounceMs = 120;
@@ -414,7 +370,6 @@ static const CmdGroup* FindGroup(const std::vector<CmdGroup>& gs, const std::wst
 static int KillProcessesByName(const std::wstring& name);
 static void Layout();
 static void RepaintNow();
-static void GenerateStars();
 // 点击加权排序（定义在「点击权重」小节）
 static std::wstring NormalizeSearchTerm(const std::wstring& s);
 static int GetClickWeight(const std::wstring& term, const std::wstring& path);
@@ -425,7 +380,6 @@ static long long NowUnix();  // 定义在自学习小节；评分函数用它算
 static void RecordLearned(const Row& r);
 static void RerankByTier();  // 热度档统一重排（定义在自学习段，Refresh 先用到）
 static void PrependLearnedRows(const std::wstring& term);
-static void AddAliasForRow(const std::wstring& target, const std::wstring& defaultName);
 static bool ApplyAliasForRow(const std::wstring& target, const std::wstring& name);
 static void SaveLearnedNow();
 static void LoadLearned();
@@ -441,7 +395,9 @@ static void LogHistoryOpen(const Row& r);
 static void NoteHistoryFirstPaint();
 static void TrayBalloon(const std::wstring& title, const std::wstring& msg);
 static HWND TopTargetWindow();  // top 命令的目标窗口（唤醒前的前台窗口）
-static void ShowTopToast(HWND target, const std::wstring& text);  // 屏幕居中半透明 toast（打开提示/top 命令共用）
+static void ShowTopToast(const std::wstring& text);  // 屏幕居中轻提示（打开提示/top 命令共用）
+static void ShowNotice(const std::wstring& title, const std::wstring& body,
+                       const std::wstring& btn, int autoCloseMs = 0);
 // Slint 渲染器（共享内存桥）：定义在窗口过程之前，本文件多处要调用
 static void SlintBridgeEnsure();
 static void SlintPushState();
@@ -508,15 +464,10 @@ static void RebuildFontPool() {
         g.fontPool[i] = MakeFont(kFontMin + i);
     }
 }
-static void RebuildHotFont() {
-    if (g.fListHot) { DeleteObject(g.fListHot); g.fListHot = nullptr; }
-    if (g.theme) g.fListHot = MakeFont(g.theme->fontList, FW_BOLD);
-}
 static void ResetFonts() {
     if (!g.theme) return;
     g.fInput = g.fontPool[FontSlot(g.theme->fontInput)];
     g.fList = g.fontPool[FontSlot(g.theme->fontList)];
-    RebuildHotFont();
 }
 
 // 比例 = max(系统 DPI 缩放, 屏幕物理高度/1080p)。
@@ -537,458 +488,17 @@ static void UpdateScale(HMONITOR mon) {
     ResetFonts();
 }
 
-// 主题应用：字体指针、透明度、各刷子、菜单深色模式、星点，全部按预设重置
-    static void ApplyTheme(bool repaint = true) {
+// 主题应用：字体指针与菜单深浅按预设重置（界面由 Slint 渲染器主题属性控制）
+static void ApplyTheme(bool repaint = true) {
     if (!g.theme) return;
     const Theme& t = *g.theme;
     g.fInput = g.fontPool[FontSlot(t.fontInput)];
     g.fList = g.fontPool[FontSlot(t.fontList)];
-    RebuildHotFont();
-    if (g.hwnd) {
-        if (g.brDivider) { DeleteObject(g.brDivider); g.brDivider = nullptr; }
-        g.brDivider = CreateSolidBrush(t.divider);
-    }
-    if (g.brMenuBg) { DeleteObject(g.brMenuBg); g.brMenuBg = nullptr; }
-    g.brMenuBg = CreateSolidBrush(t.menuBg);
-    // 主题扩展刷子/笔
-    auto rebuild = [](HBRUSH& b, COLORREF c) {
-        if (b) DeleteObject(b);
-        b = CreateSolidBrush(c);
-    };
-    rebuild(g.brCardBg, t.bgCard);
-    rebuild(g.brInputBg, t.bgInput);
-    rebuild(g.brAccent, t.accent);
-    rebuild(g.brAccent2, t.accent2);
-    rebuild(g.brTextDis, t.textDis);
-    rebuild(g.brStatusOK, t.statusOK);
-    rebuild(g.brStatusWarn, t.statusWarn);
-    rebuild(g.brStatusErr, t.statusErr);
-    if (g.penBorder) DeleteObject(g.penBorder);
-    g.penBorder = CreatePen(PS_SOLID, t.borderWidth, t.border);
     EnableDarkMenus();
-    if (t.stars) GenerateStars();
     if (g.hwnd && repaint) {
         Layout();
         RepaintNow();
     }
-}
-
-// 界面美化开关对主进程的唯一影响：弹出菜单深浅。
-// 设置窗（flowtary-settings.exe）的暗色标题栏/圆角由 sidecar 自己施加。
-static void ApplyBeautify() { EnableDarkMenus(); }
-
-// 星空星点：固定种子生成，主题切换时刷新
-static void GenerateStars() {
-    g.stars.clear();
-    unsigned seed = 0x9E3779B9u;
-    auto rnd = [&]() {
-        seed = seed * 1664525u + 1013904223u;
-        return (seed >> 16) & 0xFFFF;
-    };
-    for (int i = 0; i < 96; ++i) {
-        Star st;
-        st.x = 2 + (int)(rnd() % (kBaseW - 4));
-        st.y = 2 + (int)(rnd() % (kBaseInputH + kMaxVisibleResults * kBaseRowH - 6));
-        st.s = (rnd() % 100) < 16 ? 2 : 1;
-        st.v = (BYTE)(120 + rnd() % 135);  // 120..254 亮度
-        g.stars.push_back(st);
-    }
-}
-
-// 垂直渐变填充（bg!=bg2 时）
-static void FillVGradient(HDC hdc, int x, int y, int w, int h, COLORREF c0, COLORREF c1) {
-    if (w <= 0 || h <= 0) return;
-    TRIVERTEX tv[2];
-    GRADIENT_RECT gr{0, 1};
-    tv[0].x = x; tv[0].y = y; tv[0].Red   = GetRValue(c0) << 8;
-    tv[0].Green = GetGValue(c0) << 8; tv[0].Blue = GetBValue(c0) << 8; tv[0].Alpha = 0;
-    tv[1].x = x + w; tv[1].y = y + h; tv[1].Red   = GetRValue(c1) << 8;
-    tv[1].Green = GetGValue(c1) << 8; tv[1].Blue = GetBValue(c1) << 8; tv[1].Alpha = 0;
-    GradientFill(hdc, tv, 2, &gr, 1, GRADIENT_FILL_RECT_V);
-}
-
-// 水平渐变填充（顶部强调条：两端 accent2 → 中段 accent → 两端 accent2）
-static void FillHGradient3(HDC hdc, int x, int y, int w, int h,
-                           COLORREF cEnd, COLORREF cMid) {
-    if (w <= 0 || h <= 0) return;
-    // 三段 TRIVERTEX：0 / 中点 / 末尾，两个 GRADIENT_RECT
-    // H 渐变：TRIVERTEX 的 y 必须一致（高度由 GRADIENT_RECT 的两行隐含），
-    // 只按 x 排布 0 / 中点 / 末尾三个色标。y 写成不同值会让 GradientFill 画出截断。
-    TRIVERTEX tv[3];
-    tv[0].x = x;        tv[0].y = y;  tv[0].Red = GetRValue(cEnd) << 8; tv[0].Green = GetGValue(cEnd) << 8; tv[0].Blue = GetBValue(cEnd) << 8; tv[0].Alpha = 0;
-    tv[1].x = x + w / 2;tv[1].y = y;  tv[1].Red = GetRValue(cMid) << 8; tv[1].Green = GetGValue(cMid) << 8; tv[1].Blue = GetBValue(cMid) << 8; tv[1].Alpha = 0;
-    tv[2].x = x + w;    tv[2].y = y;  tv[2].Red = GetRValue(cEnd) << 8; tv[2].Green = GetGValue(cEnd) << 8; tv[2].Blue = GetBValue(cEnd) << 8; tv[2].Alpha = 0;
-    GRADIENT_RECT gr[2]{{0, 1}, {1, 2}};
-    GradientFill(hdc, tv, 3, gr, 2, GRADIENT_FILL_RECT_H);
-}
-
-// ---------------- 主题扩展绘制辅助 ----------------
-#pragma comment(lib, "msimg32.lib")  // AlphaBlend（半透明阴影/分割线/辉光）
-#pragma comment(lib, "comctl32.lib") // 通用控件（现代主题下的编辑框/滚动条）
-
-static inline COLORREF Lighten(COLORREF c, int p) {
-    int r = (GetRValue(c) * (100 + p)) / 100, g = (GetGValue(c) * (100 + p)) / 100, b = (GetBValue(c) * (100 + p)) / 100;
-    return RGB((BYTE)(r > 255 ? 255 : r), (BYTE)(g > 255 ? 255 : g), (BYTE)(b > 255 ? 255 : b));
-}
-static inline COLORREF Darken(COLORREF c, int p) {
-    int r = (GetRValue(c) * (100 - p)) / 100, g = (GetGValue(c) * (100 - p)) / 100, b = (GetBValue(c) * (100 - p)) / 100;
-    return RGB((BYTE)r, (BYTE)g, (BYTE)b);
-}
-static inline COLORREF Blend(COLORREF a, COLORREF b, float t) {
-    int r = (int)(GetRValue(a) + (GetRValue(b) - GetRValue(a)) * t);
-    int g = (int)(GetGValue(a) + (GetGValue(b) - GetGValue(a)) * t);
-    int bl = (int)(GetBValue(a) + (GetBValue(b) - GetBValue(a)) * t);
-    return RGB((BYTE)r, (BYTE)g, (BYTE)bl);
-}
-
-// 抗锯齿圆角矩形：逐像素 signed-distance 覆盖率（1px 过渡），彻底消除 GDI path 硬边锯齿。
-// colAt(u,v) 返回归一化坐标处的颜色，支持纯色 / 横向渐变 / 三段渐变共用一套边缘处理。
-template <class ColFn>
-static void FillRoundRectAA(HDC h, const RECT& r, int rad, ColFn colAt) {
-    int w = r.right - r.left, hh = r.bottom - r.top;
-    if (w <= 0 || hh <= 0) return;
-    rad = (std::max)(0, (std::min)(rad, (std::min)(w, hh) / 2));
-    HDC tmp = CreateCompatibleDC(h);
-    if (!tmp) return;
-    BITMAPINFO bi{};
-    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -hh;
-    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
-    RGBQUAD* bits = nullptr;
-    HBITMAP dib = CreateDIBSection(tmp, &bi, DIB_RGB_COLORS, (void**)&bits, nullptr, 0);
-    if (!dib) { DeleteDC(tmp); return; }
-    HGDIOBJ old = SelectObject(tmp, dib);
-    const float hw = w * 0.5f, vh = hh * 0.5f;
-    const float innerX = (std::max)(0.0f, hw - 0.5f - rad);
-    const float innerY = (std::max)(0.0f, vh - 0.5f - rad);
-    const float invW = w > 1 ? 1.0f / (w - 1) : 0.0f;
-    const float invH = hh > 1 ? 1.0f / (hh - 1) : 0.0f;
-    for (int y = 0; y < hh; ++y) {
-        float py = y + 0.5f;
-        float qy = std::fabs(py - vh) - innerY; if (qy < 0) qy = 0;
-        for (int x = 0; x < w; ++x) {
-            float px = x + 0.5f;
-            float qx = std::fabs(px - hw) - innerX; if (qx < 0) qx = 0;
-            float cov = 0.5f - (std::sqrt(qx * qx + qy * qy) - rad);  // 内部>0.5，边界=0.5
-            if (cov <= 0) continue;
-            if (cov > 1) cov = 1;
-            COLORREF c = colAt(x * invW, y * invH);
-            BYTE a = (BYTE)(cov * 255 + 0.5f);
-            int i = y * w + x;
-            bits[i].rgbRed   = (BYTE)(GetRValue(c) * a / 255);  // AC_SRC_ALPHA 预乘
-            bits[i].rgbGreen = (BYTE)(GetGValue(c) * a / 255);
-            bits[i].rgbBlue  = (BYTE)(GetBValue(c) * a / 255);
-            bits[i].rgbReserved = a;
-        }
-    }
-    BLENDFUNCTION bf{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-    AlphaBlend(h, r.left, r.top, w, hh, tmp, 0, 0, w, hh, bf);
-    SelectObject(tmp, old); DeleteObject(dib); DeleteDC(tmp);
-}
-
-// 抗锯齿放大镜图标（空态提示用）：圆环 + 斜柄，覆盖率逐像素，无字体依赖。
-static void PaintSearchGlyph(HDC h, int x, int y, int size, COLORREF col) {
-    if (size <= 2) return;
-    RECT r{x, y, x + size, y + size};
-    int w = size, hh = size;
-    HDC tmp = CreateCompatibleDC(h);
-    if (!tmp) return;
-    BITMAPINFO bi{};
-    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -hh;
-    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
-    RGBQUAD* bits = nullptr;
-    HBITMAP dib = CreateDIBSection(tmp, &bi, DIB_RGB_COLORS, (void**)&bits, nullptr, 0);
-    if (!dib) { DeleteDC(tmp); return; }
-    HGDIOBJ old = SelectObject(tmp, dib);
-    (void)r;
-    float cx = w * 0.40f, cy = hh * 0.40f, R = w * 0.25f, ring = w * 0.055f;
-    float ax = cx + R * 0.72f, ay = cy + R * 0.72f;
-    float bx = w * 0.88f, by = hh * 0.88f, hhalf = w * 0.075f;
-    float vx = bx - ax, vy = by - ay, vlen2 = vx * vx + vy * vy;
-    for (int yy = 0; yy < hh; ++yy) {
-        float py = yy + 0.5f;
-        for (int xx = 0; xx < w; ++xx) {
-            float px = xx + 0.5f;
-            float dr = std::sqrt((px - cx) * (px - cx) + (py - cy) * (py - cy));
-            float cov = ring + 0.5f - std::fabs(dr - R);                 // 圆环
-            float t = ((px - ax) * vx + (py - ay) * vy) / (vlen2 ? vlen2 : 1);
-            if (t < 0) t = 0; else if (t > 1) t = 1;
-            float dl = std::sqrt((px - (ax + t * vx)) * (px - (ax + t * vx)) +
-                                 (py - (ay + t * vy)) * (py - (ay + t * vy)));
-            float covLine = hhalf + 0.5f - dl;                           // 斜柄
-            if (covLine > cov) cov = covLine;
-            if (cov <= 0) continue;
-            if (cov > 1) cov = 1;
-            BYTE a = (BYTE)(cov * 255 + 0.5f);
-            int i = yy * w + xx;
-            bits[i].rgbRed   = (BYTE)(GetRValue(col) * a / 255);
-            bits[i].rgbGreen = (BYTE)(GetGValue(col) * a / 255);
-            bits[i].rgbBlue  = (BYTE)(GetBValue(col) * a / 255);
-            bits[i].rgbReserved = a;
-        }
-    }
-    BLENDFUNCTION bf{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-    AlphaBlend(h, x, y, w, hh, tmp, 0, 0, w, hh, bf);
-    SelectObject(tmp, old); DeleteObject(dib); DeleteDC(tmp);
-}
-
-// 圆角矩形填充（GDI path）
-static void FillRoundRect(HDC h, const RECT& r, int rad, HBRUSH b) {
-    if (rad <= 0 || r.right <= r.left || r.bottom <= r.top) { FillRect(h, &r, b); return; }
-    int d = 2 * rad;
-    BeginPath(h);
-    RoundRect(h, r.left, r.top, r.right, r.bottom, d, d);
-    EndPath(h);
-    HBRUSH ob = (HBRUSH)SelectObject(h, b);
-    FillPath(h);
-    SelectObject(h, ob);
-}
-// 空态引导面板：中心品牌图标 + 柔光 + 大引导语 + 键位胶囊。
-// 只在纯空态（零输入零结果）绘制，作为启动器呼出时的"第一印象"。
-static void PaintWelcomePanel(HDC mem, const Theme& t, const RECT& cardR) {
-    int avail = cardR.bottom - cardR.top;
-    if (avail < S(120) || cardR.right <= cardR.left) return;
-    const int cx = (cardR.left + cardR.right) / 2;
-    SetBkMode(mem, TRANSPARENT);  // 本函数先于 Paint 的全局 SetBkMode 执行，必须自己设
-
-    // 品牌图标柔光：低透明度 accent 圆形光晕，托起图标
-    int ls = S(52);
-    int iconTop = cardR.top + S(14);
-    int glowS = ls + S(30);
-    RECT glow{cx - glowS / 2, iconTop - S(11), cx + glowS / 2, iconTop - S(11) + glowS};
-    FillRoundRectAA(mem, glow, glowS / 2, [&](float, float) -> COLORREF {
-        return Blend(t.bgCard, t.accent, 0.18f);
-    });
-    // 品牌图标（应用 ico 多尺寸资源，取大帧绘制）；无资源时用大放大镜兜底，保证焦点不空
-    if (g.hAppIcon)
-        DrawIconEx(mem, cx - ls / 2, iconTop, g.hAppIcon, ls, ls, 0, nullptr, DI_NORMAL);
-    else
-        PaintSearchGlyph(mem, cx - ls / 2, iconTop, ls, Blend(t.textSec, t.accent2, 0.5f));
-
-    // 大引导语
-    int titleTop = iconTop + ls + S(8);
-    HFONT old = (HFONT)SelectObject(mem, g.fontPool[FontSlot(kFontMax)]);
-    SetTextColor(mem, t.textTitle);
-    RECT tr{cardR.left, titleTop, cardR.right, titleTop + S(34)};
-    DrawTextW(mem, L"随时待命 · 一触即达", -1, &tr,
-              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-    // 副标题
-    SelectObject(mem, g.fontPool[FontSlot(13)]);
-    SetTextColor(mem, t.textSec);
-    RECT sr{cardR.left, titleTop + S(34), cardR.right, titleTop + S(58)};
-    DrawTextW(mem, L"输入关键词启动程序 · F 搜文件 · D 搜文件夹", -1, &sr,
-              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-
-    // 键位胶囊：键帽 + 说明
-    struct Chip { const WCHAR* key; const WCHAR* label; };
-    const Chip chips[] = {{L"↵", L"启动"}, {L"F", L"文件"}, {L"D", L"文件夹"}, {L"↑↓", L"选择"}};
-    const int n = 4;
-    const int chipH = S(26), keyW = S(22), chipPad = S(9), chipGap = S(8), keyGap = S(6);
-    SelectObject(mem, g.fontPool[FontSlot(12)]);
-    int widths[4], total = 0;
-    for (int i = 0; i < n; ++i) {
-        SIZE sz{};
-        GetTextExtentPoint32W(mem, chips[i].label, (int)std::wstring(chips[i].label).size(), &sz);
-        widths[i] = keyW + keyGap + sz.cx + chipPad * 2;
-        total += widths[i];
-    }
-    total += chipGap * (n - 1);
-    int chipTop = titleTop + S(66);
-    int x = cx - total / 2;
-    for (int i = 0; i < n; ++i) {
-        RECT cr{x, chipTop, x + widths[i], chipTop + chipH};
-        FillRoundRectAA(mem, cr, chipH / 2, [&](float, float) -> COLORREF {
-            return Blend(t.bgCard, t.accent, 0.15f);
-        });
-        RECT keyR{x + chipPad, chipTop + S(3), x + chipPad + keyW, chipTop + chipH - S(3)};
-        FillRoundRectAA(mem, keyR, S(4), [&](float, float) -> COLORREF {
-            return Blend(t.bgCard, t.textSec, 0.22f);
-        });
-        SelectObject(mem, g.fontPool[FontSlot(11)]);
-        SetTextColor(mem, t.textBody);
-        DrawTextW(mem, chips[i].key, -1, &keyR, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-        SelectObject(mem, g.fontPool[FontSlot(12)]);
-        SetTextColor(mem, t.textSec);
-        RECT lr{x + chipPad + keyW + keyGap, chipTop, cr.right - chipPad, chipTop + chipH};
-        DrawTextW(mem, chips[i].label, -1, &lr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-        x += widths[i] + chipGap;
-    }
-    SelectObject(mem, old);
-}
-
-// 抗锯齿圆角描边：沿圆角矩形边缘画 width px 的半透明描边，逐像素覆盖率消除锯齿。
-static void StrokeRoundRectAA(HDC h, const RECT& r, int rad, COLORREF col, int width) {
-    int w = r.right - r.left, hh = r.bottom - r.top;
-    if (w <= 2 || hh <= 2) return;
-    if (width < 1) width = 1;
-    rad = (std::max)(0, (std::min)(rad, (std::min)(w, hh) / 2));
-    HDC tmp = CreateCompatibleDC(h);
-    if (!tmp) return;
-    BITMAPINFO bi{};
-    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -hh;
-    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
-    RGBQUAD* bits = nullptr;
-    HBITMAP dib = CreateDIBSection(tmp, &bi, DIB_RGB_COLORS, (void**)&bits, nullptr, 0);
-    if (!dib) { DeleteDC(tmp); return; }
-    HGDIOBJ old = SelectObject(tmp, dib);
-    const float hw = w * 0.5f, vh = hh * 0.5f;
-    const float innerX = (std::max)(0.0f, hw - 0.5f - rad);
-    const float innerY = (std::max)(0.0f, vh - 0.5f - rad);
-    const float half = width * 0.5f;
-    for (int y = 0; y < hh; ++y) {
-        float py = y + 0.5f;
-        float qy = std::fabs(py - vh) - innerY; if (qy < 0) qy = 0;
-        for (int x = 0; x < w; ++x) {
-            float px = x + 0.5f;
-            float qx = std::fabs(px - hw) - innerX; if (qx < 0) qx = 0;
-            float d = std::sqrt(qx * qx + qy * qy) - rad;  // <0 内部, 0 边界
-            float cov = half + 0.5f - std::fabs(d);        // 距边界 width/2 内的带
-            if (cov <= 0) continue;
-            if (cov > 1) cov = 1;
-            BYTE a = (BYTE)(cov * 255 + 0.5f);
-            int i = y * w + x;
-            bits[i].rgbRed   = (BYTE)(GetRValue(col) * a / 255);
-            bits[i].rgbGreen = (BYTE)(GetGValue(col) * a / 255);
-            bits[i].rgbBlue  = (BYTE)(GetBValue(col) * a / 255);
-            bits[i].rgbReserved = a;
-        }
-    }
-    BLENDFUNCTION bf{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-    AlphaBlend(h, r.left, r.top, w, hh, tmp, 0, 0, w, hh, bf);
-    SelectObject(tmp, old); DeleteObject(dib); DeleteDC(tmp);
-}
-
-// 圆角矩形描边（GDI path）
-static void StrokeRoundRect(HDC h, const RECT& r, int rad, HPEN p) {
-    if (r.right <= r.left || r.bottom <= r.top) return;
-    int d = 2 * ((rad > 0) ? rad : 0);
-    BeginPath(h);
-    RoundRect(h, r.left, r.top, r.right, r.bottom, d, d);
-    EndPath(h);
-    HPEN op = (HPEN)SelectObject(h, p);
-    StrokePath(h);
-    SelectObject(h, op);
-}
-
-// 软外阴影：在 r 外侧偏移 (ox,oy) 画一张带 alpha 的圆角矩形（无模糊，靠低 alpha 模拟海拔）
-static void PaintOutShadow(HDC h, const RECT& r, int rad, int ox, int oy, int /*blur*/, int a, COLORREF col) {
-    RECT sr{r.left + ox, r.top + oy, r.right + ox, r.bottom + oy};
-    int w = sr.right - sr.left, hh = sr.bottom - sr.top;
-    if (w <= 0 || hh <= 0 || a <= 0) return;
-    HDC tmp = CreateCompatibleDC(h);
-    if (!tmp) return;
-    BITMAPINFO bi{};
-    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -hh;
-    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
-    RGBQUAD* bits = nullptr;
-    HBITMAP dib = CreateDIBSection(tmp, &bi, DIB_RGB_COLORS, (void**)&bits, nullptr, 0);
-    if (!dib) { DeleteDC(tmp); return; }
-    HBITMAP o = (HBITMAP)SelectObject(tmp, dib);
-    int rr = rad, cx0 = rr, cy0 = rr, cx1 = w - rr, cy1 = hh - rr;
-    auto inside = [&](int x, int y) -> bool {
-        if (x < cx0 && y < cy0) { if ((x - cx0)*(x - cx0) + (y - cy0)*(y - cy0) > rr*rr) return false; }
-        else if (x > cx1 && y < cy0) { if ((x - cx1)*(x - cx1) + (y - cy0)*(y - cy0) > rr*rr) return false; }
-        else if (x < cx0 && y > cy1) { if ((x - cx0)*(x - cx0) + (y - cy1)*(y - cy1) > rr*rr) return false; }
-        else if (x > cx1 && y > cy1) { if ((x - cx1)*(x - cx1) + (y - cy1)*(y - cy1) > rr*rr) return false; }
-        return true;
-    };
-    for (int y = 0; y < hh; ++y) {
-        for (int x = 0; x < w; ++x) {
-            int i = y * w + x;
-            // AC_SRC_ALPHA 要求预乘：不预乘时 src+dst*(1-a) 会溢出回绕（亮色辉光变杂色）
-            bits[i].rgbRed = (BYTE)(GetRValue(col) * a / 255);
-            bits[i].rgbGreen = (BYTE)(GetGValue(col) * a / 255);
-            bits[i].rgbBlue = (BYTE)(GetBValue(col) * a / 255);
-            bits[i].rgbReserved = inside(x, y) ? (BYTE)a : 0;
-        }
-    }
-    BLENDFUNCTION bf{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-    AlphaBlend(h, sr.left, sr.top, w, hh, tmp, 0, 0, w, hh, bf);
-    SelectObject(tmp, o); DeleteObject(dib); DeleteDC(tmp);
-}
-
-// 内阴影/高光：顶部内高光 + 底部内暗线，模拟凹陷/玻璃表面反光
-static void PaintInsetShadow(HDC h, const RECT& r, int rad, COLORREF base) {
-    if (r.right <= r.left || r.bottom <= r.top) return;
-    HBRUSH hi = CreateSolidBrush(Lighten(base, 16));
-    HBRUSH lo = CreateSolidBrush(Darken(base, 12));
-    RECT r1{r.left + rad, r.top + 1, r.right - rad, r.top + 2};
-    RECT r2{r.left + rad, r.bottom - 2, r.right - rad, r.bottom - 1};
-    FillRect(h, &r1, hi);
-    FillRect(h, &r2, lo);
-    DeleteObject(hi); DeleteObject(lo);
-}
-
-// 半透明分割线（避免纯黑/纯白硬线）
-static void PaintDivider(HDC h, const RECT& r, COLORREF col, int a) {
-    int w = r.right - r.left, hh = r.bottom - r.top;
-    if (w <= 0 || hh <= 0) return;
-    HDC tmp = CreateCompatibleDC(h);
-    if (!tmp) return;
-    BITMAPINFO bi{};
-    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -hh;
-    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
-    RGBQUAD* bits = nullptr;
-    HBITMAP dib = CreateDIBSection(tmp, &bi, DIB_RGB_COLORS, (void**)&bits, nullptr, 0);
-    if (!dib) { DeleteDC(tmp); return; }
-    HBITMAP o = (HBITMAP)SelectObject(tmp, dib);
-    for (int y = 0; y < hh; ++y)
-        for (int x = 0; x < w; ++x) {
-            int i = y * w + x;
-            bits[i].rgbRed = GetRValue(col); bits[i].rgbGreen = GetGValue(col); bits[i].rgbBlue = GetBValue(col);
-            bits[i].rgbReserved = (BYTE)a;
-        }
-    BLENDFUNCTION bf{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-    AlphaBlend(h, r.left, r.top, w, hh, tmp, 0, 0, w, hh, bf);
-    SelectObject(tmp, o); DeleteObject(dib); DeleteDC(tmp);
-}
-
-// ---------------- 主题动画：轻量补间引擎 ----------------
-// 不干扰光标闪烁定时器（kTimerBlink=2）；所有过渡统一 ease-out，无 linear 无突兀。
-struct Tween {
-    double* val = nullptr;   // 被驱动的双精度字段（如 g.hoverT / g.pressT）
-    double from = 0, to = 0;
-    DWORD t0 = 0, dur = 200;
-    int curve = 0;           // 0=ease-out-cubic（默认）, 1=ease-out-quad
-    bool active = false;
-};
-static std::vector<Tween> sTweens;
-
-static double EaseOut(double t, int curve) {
-    if (t <= 0) return 0;
-    if (t >= 1) return 1;
-    if (curve == 1) return 1 - (1 - t) * (1 - t);  // ease-out quad
-    return 1 - pow(1 - t, 3);                       // ease-out cubic
-}
-
-static void StartTween(double* val, double to, int ms, int curve = 0) {
-    if (!val) return;
-    for (auto& w : sTweens) {
-        if (w.val == val) {            // 同字段已存在 tween：从当前值平滑接管
-            w.from = *val; w.to = to; w.t0 = GetTickCount();
-            w.dur = (DWORD)(ms > 0 ? ms : 1); w.curve = curve; w.active = true;
-            return;
-        }
-    }
-    sTweens.push_back({val, *val, to, GetTickCount(), (DWORD)(ms > 0 ? ms : 1), curve, true});
-    if (g.hwnd) SetTimer(g.hwnd, kTimerTween, 16, nullptr);  // ~60fps
-}
-
-static void TickTweens() {
-    DWORD now = GetTickCount();
-    bool any = false;
-    for (auto& w : sTweens) {
-        if (!w.active) continue;
-        double p = (double)(now - w.t0) / w.dur;
-        if (p >= 1) { *w.val = w.to; w.active = false; }
-        else { *w.val = w.from + (w.to - w.from) * EaseOut(p, w.curve); any = true; }
-    }
-    if (g.hwnd) InvalidateRect(g.hwnd, nullptr, FALSE);  // 600px 双缓冲重绘很便宜
-    if (!any) { sTweens.clear(); if (g.hwnd) KillTimer(g.hwnd, kTimerTween); }
 }
 
 // 重建排除模式的归一化镜像。凡是改写 g.excludePaths 的地方（加载 / 恢复默认 / 设置页保存）
@@ -1197,9 +707,8 @@ struct ProgramScanState {
 static auto s_programScanState=std::make_shared<ProgramScanState>();
 struct ProgramScanContext { std::shared_ptr<ProgramScanState> state; HWND destination; };
 static ft::apps::Stats s_programCatalogStats;
-static ft::apps::AsyncIcons s_programIcons;
 static ft::apps::CatalogWatch s_programWatch;
-static unsigned long long s_programGeneration=0;
+
 struct ProgramBuildReply { std::vector<Program> programs; ft::apps::Stats stats; };
 static void CopyAppCatalog(ft::apps::Result catalog,ProgramBuildReply& reply) {
     for(auto& entry:catalog.entries){
@@ -1314,7 +823,6 @@ static void StopProgramsRefresh(HWND hwnd) {
     MSG message;
     while(PeekMessageW(&message,hwnd,WM_APP_PROGRAMS_READY,WM_APP_PROGRAMS_READY,PM_REMOVE))
         delete (ProgramBuildReply*)message.lParam;
-    s_programIcons.Stop();
     s_programWatch.Stop();
 }
 static std::wstring ProgramWorkingDirectory(Program* p) {
@@ -1604,65 +1112,6 @@ static std::wstring ShortLocationLabel(const std::wstring& path) {
     return L"";
 }
 
-static HICON GetProgramIcon(Program* p) {
-    if(!p->iconTried)p->iconTried=s_programIcons.Request(p->path);
-    return p->icon ? p->icon.get() : LoadIconW(nullptr,IDI_APPLICATION);
-}
-static bool PollProgramIcons() {
-    bool changed=false;
-    for(auto& result:s_programIcons.Drain()){
-        if(result.generation!=s_programGeneration)continue;
-        auto found=std::find_if(g.programs.begin(),g.programs.end(),[&](const Program& p){return p.path==result.path;});
-        if(found==g.programs.end())continue;
-        if(result.icon){
-            size_t cached=(size_t)std::count_if(g.programs.begin(),g.programs.end(),[](const Program& p){return !!p.icon;});
-            if(cached>=128){
-                auto evict=std::find_if(g.programs.begin(),g.programs.end(),[&](const Program& p){
-                    if(!p.icon)return false;
-                    return std::none_of(g.items.begin(),g.items.end(),[&](const Row& r){return r.prog==&p;});
-                });
-                if(evict!=g.programs.end()){evict->icon.reset();evict->iconTried=false;}
-            }
-            found->icon.reset(result.icon.release());
-        }
-        found->iconTried=true;changed=true;
-    }
-    return changed;
-}
-
-// 取任意文件/文件夹的小图标（File/Folder 结果行用）：按路径缓存，首次经 shell 抽取。
-// 路径暂不可达（网络盘/刚移动）时退回 SHGFI_USEFILEATTRIBUTES，按扩展名/目录属性给关联图标。
-static HICON GetPathIcon(const std::wstring& path) {
-    if (path.empty()) return nullptr;
-    std::wstring key = ToLowerW(path);
-    auto it = g.pathIcons.find(key);
-    if (it != g.pathIcons.end()) return it->second;
-    // 缓存容量上限（很宽）：超出先整批销毁重建，防止长期运行无限增长
-    if (g.pathIcons.size() >= 1024) {
-        for (auto& kv : g.pathIcons)
-            if (kv.second) DestroyIcon(kv.second);
-        g.pathIcons.clear();
-    }
-    SHFILEINFOW sfi{};
-    HICON ic = nullptr;
-    if (SHGetFileInfoW(path.c_str(), 0, &sfi, sizeof(sfi), SHGFI_ICON | SHGFI_LARGEICON))
-        ic = sfi.hIcon;
-    if (!ic) {
-        DWORD attr = GetFileAttributesW(path.c_str());
-        attr = (attr == INVALID_FILE_ATTRIBUTES) ? 0 : (attr & FILE_ATTRIBUTE_DIRECTORY);
-        if (SHGetFileInfoW(path.c_str(), attr, &sfi, sizeof(sfi),
-                           SHGFI_ICON | SHGFI_LARGEICON | SHGFI_USEFILEATTRIBUTES))
-            ic = sfi.hIcon;
-    }
-    if (ic) g.pathIcons.emplace(std::move(key), ic);
-    return ic;
-}
-
-// ---------------- UI 布局 ----------------
-
-// 给当前结果行回填历史总使用次数：点击权重按搜索词分桶，这里跨全部词求和，
-// 再叠加自学习的打开次数——衡量的是「这个目标平时用不用」，与当前输入的词无关。
-// 每次 Layout 全量重算（条目上限 5000+500，一次哈希遍历 <1ms），不做增量缓存。
 static void AnnotateRowUsage() {
     bool any = false;
     for (auto& r : g.items) {
@@ -1743,64 +1192,21 @@ static void AppendTrace(const char* tag) {
     CloseHandle(f);
 }
 
+// UI 由 Slint 渲染器排版，主进程只负责把行数据算好。
 static void Layout() {
     AnnotateRowUsage();
-    if (g.uiEngine == 1) return;  // Slint 渲染器自己排版，GDI 窗口不参与
-    RECT rc;
-    GetClientRect(g.hwnd, &rc);
-    int rows = (std::min)((int)g.items.size(), (int)kMaxVisibleResults);
-    POINT cur;
-    GetCursorPos(&cur);
-    HMONITOR mon = MonitorFromPoint(cur, MONITOR_DEFAULTTONEAREST);
-    UpdateScale(mon);  // 按目标屏幕物理分辨率重算比例（字体随比例重建）
-    int fm = 0; bool fl = false;
-    const bool footer = LatencyFooter(fm, fl);
-    int W = S(kBaseW);
-    // 窗口高度 = 输入栏 + 卡片（间距 + 结果行 + 底部内边距）+ 卡片到窗口底的留白 + 耗时底栏。
-    // 末行不再被窗口底边切断：卡片底边与窗口底边之间必须留出 kBaseWinPadBottom，
-    // 否则最后一行的高亮胶囊/图标托盘会越过卡片圆角、被窗口底缘水平切掉半截。
-    int H;
-    if (rows <= 0) {
-        H = S(kBaseInputH);  // 空态：紧凑输入框，不长卡片
-    } else {
-        H = S(kBaseInputH + kBaseCardGapTop + rows * kBaseRowH +
-               kBaseCardPadBottom + kBaseWinPadBottom + (footer ? kBaseFooterH : 0));
-    }
-    MONITORINFO mi{};
-    mi.cbSize = sizeof(mi);
-    GetMonitorInfoW(mon, &mi);
-    int x, y;
-    if (g.centerWake) {
-        x = mi.rcWork.left + ((mi.rcWork.right - mi.rcWork.left) - W) / 2;
-        y = mi.rcWork.top + ((mi.rcWork.bottom - mi.rcWork.top) - H) / 2;
-    } else {
-        x = cur.x + S(16);
-        y = cur.y + S(12);
-        if (x + W > mi.rcWork.right) x = mi.rcWork.right - W;
-        if (y + H > mi.rcWork.bottom) y = mi.rcWork.bottom - H;
-        if (x < mi.rcWork.left) x = mi.rcWork.left;
-        if (y < mi.rcWork.top) y = mi.rcWork.top;
-    }
-    UINT flags = SWP_NOACTIVATE | SWP_NOZORDER;
-    SetWindowPos(g.hwnd, nullptr, x, y, W, H, flags);
-    (void)rc;
 }
 
-static void RepaintNow() {
-    RedrawWindow(g.hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
-    // Slint 模式：界面由渲染器画，这里把最新状态推给渲染器
-    if (g.uiEngine == 1) SlintPushState();
-}
+static void RepaintNow() { SlintPushState(); }
 
 static void LayoutAndRepaint() {
     Layout();
     RepaintNow();
 }
 
-// Slint 引擎：唤起时拉起同目录的 flowtary-slint.exe（渲染器）。
-// 系统层（全局热键 Alt+Space / Alt+数字 / 搜索管线 / 自学习）继续留在 GDI 主程序，
-// Slint 只负责画界面 —— 两个引擎功能完全一致。
-// 返回 false 表示渲染器不可用（缺 exe），调用方应回退到 GDI 引擎。
+// 唤起时拉起同目录的 flowtary-slint.exe（渲染器）。
+// 系统层（全局热键 Alt+Space / 搜索管线 / 自学习）留在主程序，Slint 只负责画界面。
+// 返回 false 表示渲染器不可用（缺 exe 或启动失败）。
 static bool LaunchSlintEngine() {
     SlintBridgeEnsure();
     if (HWND ipc = SlintIpcWindow()) {
@@ -1814,8 +1220,7 @@ static bool LaunchSlintEngine() {
     std::wstring path = (slash == std::wstring::npos) ? L"flowtary-slint.exe"
                                                       : exe.substr(0, slash + 1) + L"flowtary-slint.exe";
     if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        AppendTrace("Slint renderer missing -> fallback to GDI engine");
-        g.uiEngine = 0;
+        AppendTrace("Slint renderer missing");
         return false;
     }
     // 渲染器起来后会发 kReqReady，那时才真正显示（此刻还没有窗口）。
@@ -1827,8 +1232,7 @@ static bool LaunchSlintEngine() {
     PROCESS_INFORMATION pi{};
     if (!CreateProcessW(path.c_str(), cmdLine.data(), nullptr, nullptr, FALSE, DETACHED_PROCESS,
                         nullptr, workDir.empty() ? nullptr : workDir.c_str(), &si, &pi)) {
-        AppendTrace("Slint renderer launch failed -> fallback to GDI engine");
-        g.uiEngine = 0;
+        AppendTrace("Slint renderer launch failed");
         return false;
     }
     CloseHandle(pi.hThread);
@@ -1839,77 +1243,28 @@ static bool LaunchSlintEngine() {
 static void Show() {
     AppendTrace("SHOW(wake)");
     g.text.clear();
-    g.compText.clear();
-    g.caret = 0;
-    g.selStart = g.selEnd = 0;
-    g.dragging = false;
-    g.scrollX = 0;
     g.items.clear();
     g.sel = 0;
-    g.hoverRow = -1;     // 重置悬停/按下瞬态，避免上次点击残留投影
-    g.pressRow = -1;
-    g.hoverT = 0;
-    g.pressT = 0;
     g.mode = Mode::None;
     g.evTermKey.clear();
     ++g.dfGen;
     g.searchRoute = ft::search::Route::Unavailable;
-    g.caretOn = true;
     g.qT0 = 0;
     g.qSettledMs = -1;
     KillTimer(g.hwnd, kTimerDebounce);
     KillTimer(g.hwnd, kTimerLatency);
-    // 前台被其他进程占用时，借助 AttachThreadInput 提高抢占成功率
-    DWORD myTid = GetCurrentThreadId();
-    HWND fg = GetForegroundWindow();
-    g.prevForeground = fg;  // 记录唤醒前的前台窗口（top 命令的目标窗口）
-    if (g.uiEngine == 1) {
-        if (LaunchSlintEngine()) return;  // Slint 渲染器接管
-        // 渲染器不可用 → 落回 GDI 引擎
-    }
-    Layout();
-    DWORD fgTid = fg ? GetWindowThreadProcessId(fg, nullptr) : 0;
-    bool attached = fgTid && fgTid != myTid && AttachThreadInput(myTid, fgTid, TRUE);
-    ShowWindow(g.hwnd, SW_SHOW);
-    SetForegroundWindow(g.hwnd);
-    if (attached) AttachThreadInput(myTid, fgTid, FALSE);
-    SetFocus(g.hwnd);
+    g.prevForeground = GetForegroundWindow();  // top 命令的目标窗口
+    if (!LaunchSlintEngine())
+        ShowNotice(L"Flowtary", L"界面组件缺失：请确认 flowtary-slint.exe 与主程序在同一目录。", L"好");
 }
 
 static void Hide() {
     AppendTrace("HIDE");
-    if (g.uiEngine == 1) {
-        KillTimer(g.hwnd, kTimerDebounce);
-        KillTimer(g.hwnd, kTimerLatency);
-        ++g.dfGen;
-        g.searchRoute = ft::search::Route::Unavailable;
-        g.dragging = false;
-        g.selStart = g.selEnd = 0;
-        // 若正在组词，先取消 IME 组合，避免残留未上屏状态
-        HIMC hIMC = ImmGetContext(g.hwnd);
-        if (hIMC) {
-            ImmNotifyIME(hIMC, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
-            ImmReleaseContext(g.hwnd, hIMC);
-        }
-        g.compText.clear();
-        SlintSendCmd(slintbridge::kCmdHide);
-        return;
-    }
-    if (!IsWindowVisible(g.hwnd)) return;
     KillTimer(g.hwnd, kTimerDebounce);
     KillTimer(g.hwnd, kTimerLatency);
     ++g.dfGen;
     g.searchRoute = ft::search::Route::Unavailable;
-    g.dragging = false;
-    g.selStart = g.selEnd = 0;
-    // 若正在组词，先取消 IME 组合，避免残留未上屏状态
-    HIMC hIMC = ImmGetContext(g.hwnd);
-    if (hIMC) {
-        ImmNotifyIME(hIMC, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
-        ImmReleaseContext(g.hwnd, hIMC);
-    }
-    g.compText.clear();
-    ShowWindow(g.hwnd, SW_HIDE);
+    SlintSendCmd(slintbridge::kCmdHide);
 }
 
 // ---------------- 文件索引查询 ----------------
@@ -2736,7 +2091,7 @@ static bool ExecuteRow(Row& r, ExecKind ek = ExecKind::Normal) {
             // 并在目标窗口位置弹一个快速消失的轻量 toast（不走系统通知）
             HWND target = TopTargetWindow();
             if (!target) {
-                ShowTopToast(nullptr, L"未找到可置顶的窗口");
+                ShowTopToast(L"未找到可置顶的窗口");
                 return true;
             }
             LONG_PTR ex = GetWindowLongPtrW(target, GWL_EXSTYLE);
@@ -2747,7 +2102,7 @@ static bool ExecuteRow(Row& r, ExecKind ek = ExecKind::Normal) {
             if (GetWindowTextW(target, winTitle, 256) == 0) winTitle[0] = 0;
             std::wstring toast = wasTop ? L"取消置顶" : L"已置顶";
             if (winTitle[0]) toast += L"：" + std::wstring(winTitle);
-            ShowTopToast(target, toast);
+            ShowTopToast(toast);
             return true;
         }
         case Row::Window: {
@@ -2831,10 +2186,9 @@ static void ExecuteSelected(ExecKind ek = ExecKind::Normal) {
     if (ExecuteRow(g.items[g.sel], ek)) {
         RecordLearned(g.items[g.sel]);  // f/d 打开成功 → 记为自学习条目（含 .lnk 快捷方式）
         LogHistoryOpen(g.items[g.sel]); // 台账记「这次实际点了哪条」，与权重分开：关了权重也留痕
-        // 打开成功的轻量提示：贴在启动器原位顶部，淡入淡出自动消失（不抢焦点、不阻塞）
+        // 打开成功的轻量提示：淡入淡出自动消失（不抢焦点、不阻塞）
         std::wstring toast = OpenedToastText(g.items[g.sel]);
-        // toast 按「启动器所在显示器」居中：Slint 引擎下启动器窗口属于渲染器
-        if (!toast.empty()) ShowTopToast(g.uiEngine == 1 ? SlintUiWindow() : g.hwnd, toast);
+        if (!toast.empty()) ShowTopToast(toast);
         Hide();
     }
 }
@@ -2886,139 +2240,12 @@ static void EnableDarkMenus() {
     SetPreferredAppModeFn setMode =
         (SetPreferredAppModeFn)GetProcAddress(ux, MAKEINTRESOURCEA(135));
     FlushMenuThemesFn flush = (FlushMenuThemesFn)GetProcAddress(ux, MAKEINTRESOURCEA(136));
-    // 美化开关关闭时回归系统默认外观；开启时：深色主题→ForceDark(2)，浅色主题→AllowDark(1)
-    int mode = g.beautify ? (g.theme && g.theme->dark ? 2 : 1) : 0;
+    // 深色主题→ForceDark(2)，浅色主题→AllowDark(1)
+    int mode = (g.theme && g.theme->dark) ? 2 : 1;
     if (setMode) setMode(mode);
     if (flush) flush();
 }
 
-static void StyleDarkMenu(HMENU menu) {
-    if (!g.brMenuBg) g.brMenuBg = CreateSolidBrush(g.theme ? g.theme->menuBg : RGB(28, 28, 28));
-    MENUINFO mi{};
-    mi.cbSize = sizeof(mi);
-    mi.fMask = MIM_BACKGROUND | MIM_APPLYTOSUBMENUS;
-    mi.hbrBack = g.brMenuBg;
-    SetMenuInfo(menu, &mi);
-}
-
-// 自绘菜单项：背景/选中/勾选/文字均取当前主题色，不依赖系统暗色菜单 API（EnableDarkMenus）。
-// 托盘菜单与主界面右键菜单共用，保证任何 Windows 版本下文字都可见。
-static void OwnerMeasureMenuItem(HWND hwnd, MEASUREITEMSTRUCT* mis) {
-    if (!mis || mis->CtlType != ODT_MENU) return;
-    const WCHAR* text = (const WCHAR*)mis->itemData;
-    if (text && *text) {
-        HDC hdc = GetDC(hwnd);
-        HGDIOBJ old = SelectObject(hdc, g.fList);
-        SIZE sz{};
-        GetTextExtentPoint32W(hdc, text, (int)wcslen(text), &sz);
-        SelectObject(hdc, old);
-        ReleaseDC(hwnd, hdc);
-        mis->itemWidth = sz.cx + S(44);
-        mis->itemHeight = S(30);
-    } else {
-        mis->itemWidth = S(60);
-        mis->itemHeight = S(9);
-    }
-}
-
-static void OwnerDrawMenuItem(HWND hwnd, DRAWITEMSTRUCT* dis) {
-    (void)hwnd;
-    if (!dis || dis->CtlType != ODT_MENU) return;
-    const WCHAR* text = (const WCHAR*)dis->itemData;
-    const Theme& t = *g.theme;
-    HBRUSH bg = CreateSolidBrush(t.menuBg);
-    FillRect(dis->hDC, &dis->rcItem, bg);
-    DeleteObject(bg);
-    if (!text || !*text) {
-        RECT lr{dis->rcItem.left + S(10), dis->rcItem.top + S(4),
-                dis->rcItem.right - S(10), dis->rcItem.top + S(5)};
-        HBRUSH lb = CreateSolidBrush(t.divider);
-        FillRect(dis->hDC, &lr, lb);
-        DeleteObject(lb);
-        return;
-    }
-    if (dis->itemState & ODS_SELECTED) {
-        HBRUSH hb = CreateSolidBrush(t.menuHi);
-        FillRect(dis->hDC, &dis->rcItem, hb);
-        DeleteObject(hb);
-    }
-    if (dis->itemState & ODS_CHECKED) {
-        int cx = dis->rcItem.left + S(8);
-        int cy = (dis->rcItem.top + dis->rcItem.bottom) / 2;
-        int s = S(4);
-        HPEN pen = CreatePen(PS_SOLID, S(2), t.text);
-        HGDIOBJ oldPen = SelectObject(dis->hDC, pen);
-        MoveToEx(dis->hDC, cx - s, cy, nullptr);
-        LineTo(dis->hDC, cx - s / 2, cy + s / 2);
-        LineTo(dis->hDC, cx + s, cy - s / 2);
-        SelectObject(dis->hDC, oldPen);
-        DeleteObject(pen);
-    }
-    SetBkMode(dis->hDC, TRANSPARENT);
-    SetTextColor(dis->hDC, t.text);
-    SelectObject(dis->hDC, g.fList);
-    RECT tr = dis->rcItem;
-    tr.left += S(16);
-    DrawTextW(dis->hDC, text, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-}
-
-static bool RunRowMenuCommand(int cmd);  // 定义在 ShowRowMenu 之后，两个引擎共用
-
-static void ShowRowMenu(HWND hwnd) {
-    if (g.sel < 0 || g.sel >= (int)g.items.size()) return;
-    Row& r = g.items[g.sel];
-    if (r.kind == Row::Hint) return;
-
-    HMENU menu = CreatePopupMenu();
-    if (r.kind == Row::Window) {
-        AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_WIN_SWITCH, (LPCWSTR)L"切换到此窗口");
-        AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_WIN_CLOSE, (LPCWSTR)L"关闭窗口");
-        AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_WIN_KILL, (LPCWSTR)L"结束进程");
-        AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_COPYTITLE, (LPCWSTR)L"复制标题");
-        AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_COPYPROC, (LPCWSTR)L"复制进程名");
-        SetMenuDefaultItem(menu, IDM_WIN_SWITCH, FALSE);
-    } else {
-        // 路径直达行（Reveal）：默认动作本身就是「打开所在文件夹并选中」，标题照此写
-        AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_OPEN,
-                    (LPCWSTR)(r.kind == Row::Reveal ? L"打开所在文件夹" : L"打开"));
-        if (r.kind == Row::File || r.kind == Row::Folder || r.kind == Row::Prog)
-            AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_OPENLOC, (LPCWSTR)L"打开所在文件夹");
-        if (r.kind == Row::Reveal)
-            AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_OPENFILE, (LPCWSTR)L"打开文件");
-        // 别名：在自学习目录里建一个「别名.lnk」，之后搜别名即可直达（与自学习结果同一套数据）
-        if ((r.kind == Row::File || r.kind == Row::Folder || r.kind == Row::Prog) &&
-            GetFileAttributesW(r.action.c_str()) != INVALID_FILE_ATTRIBUTES)
-            AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_ADDALIAS, (LPCWSTR)L"添加别名…");
-        if (r.kind == Row::File || r.kind == Row::Prog)
-            AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_RUNAS, (LPCWSTR)L"以管理员模式打开");
-        if (r.kind == Row::Shell)
-            AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_SHELL_ADMIN, (LPCWSTR)L"以管理员运行");
-        // 用该路径（文件取所在目录）打开命令行，沿用设置页配置的 Shell 程序
-        if (r.kind == Row::Folder || r.kind == Row::File || r.kind == Row::Reveal ||
-            r.kind == Row::Prog)
-            AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_OPENCMD,
-                        (LPCWSTR)(r.kind == Row::Folder ? L"用此路径打开命令行"
-                                                        : L"在所在目录打开命令行"));
-        AppendMenuW(menu, MF_OWNERDRAW | MF_STRING, IDM_COPYPATH,
-                    (LPCWSTR)(r.kind == Row::Web ? L"复制链接"
-                              : r.kind == Row::Shell ? L"复制命令" : L"复制路径"));
-        SetMenuDefaultItem(menu, IDM_OPEN, FALSE);
-    }
-    StyleDarkMenu(menu);
-
-    POINT p;
-    GetCursorPos(&p);
-    SetForegroundWindow(hwnd);
-    int cmd = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY, p.x, p.y, 0,
-                             hwnd, nullptr);
-    DestroyMenu(menu);
-
-    bool done = RunRowMenuCommand(cmd);
-    if (done) Hide();
-}
-
-// 执行一条右键菜单命令；返回 true 表示处理完应隐藏启动器。
-// GDI 原生菜单与 Slint 自绘菜单共用这一份逻辑。
 static bool RunRowMenuCommand(int cmd) {
     if (g.sel < 0 || g.sel >= (int)g.items.size()) return false;
     Row& r = g.items[g.sel];
@@ -3030,7 +2257,7 @@ static bool RunRowMenuCommand(int cmd) {
                 RecordLearned(r);  // 右键打开成功同样记自学习
                 LogHistoryOpen(r);
                 std::wstring toast = OpenedToastText(r);
-                if (!toast.empty()) ShowTopToast(g.uiEngine == 1 ? SlintUiWindow() : g.hwnd, toast);
+                if (!toast.empty()) ShowTopToast(toast);
             }
             break;
         case IDM_OPENLOC:
@@ -3050,18 +2277,13 @@ static bool RunRowMenuCommand(int cmd) {
             ShellExecuteW(nullptr, L"open", r.action.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
             break;
         case IDM_ADDALIAS: {
-            // 先拷出目标再弹输入框：弹窗有嵌套消息循环，期间 g.items 可能被刷新改动
+            // 先拷出目标再弹输入覆盖层：期间 g.items 可能被刷新改动
             std::wstring target = r.action, name = r.title;
             done = false;  // 加完别名留在启动器里，不自动隐藏
-            if (g.uiEngine == 1) {
-                // Slint 引擎：输入覆盖层在渲染器里画，主进程只记住目标等回传
-                g_slintAliasTarget = target;
-                SlintSendCmd(slintbridge::kCmdHoldShow);
-                SlintPushAliasPrompt(name);
-            } else {
-                // GDI 引擎：沿用原生输入框
-                AddAliasForRow(target, name);
-            }
+            // 输入覆盖层在渲染器里画，主进程只记住目标等回传
+            g_slintAliasTarget = target;
+            SlintSendCmd(slintbridge::kCmdHoldShow);
+            SlintPushAliasPrompt(name);
             break;
         }
         case IDM_OPENCMD: {
@@ -3100,486 +2322,15 @@ static bool RunRowMenuCommand(int cmd) {
     return done;
 }
 
-// ---------------- 文本编辑 ----------------
-static int CaretTextWidth(HDC hdc) {
-    HGDIOBJ old = SelectObject(hdc, g.fInput);
-    std::wstring s = g.text.substr(0, g.caret);
-    SIZE sz{};
-    if (!s.empty()) GetTextExtentPoint32W(hdc, s.c_str(), (int)s.size(), &sz);
-    SelectObject(hdc, old);
-    return sz.cx;
-}
-
-static int CompTextWidth(HDC hdc) {
-    if (g.compText.empty()) return 0;
-    HGDIOBJ old = SelectObject(hdc, g.fInput);
-    SIZE sz{};
-    GetTextExtentPoint32W(hdc, g.compText.c_str(), (int)g.compText.size(), &sz);
-    SelectObject(hdc, old);
-    return sz.cx;
-}
-static int SelectionStartWidth(HDC hdc) {
-    HGDIOBJ old = SelectObject(hdc, g.fInput);
-    std::wstring s = g.text.substr(0, g.selStart);
-    SIZE sz{};
-    if (!s.empty()) GetTextExtentPoint32W(hdc, s.c_str(), (int)s.size(), &sz);
-    SelectObject(hdc, old);
-    return sz.cx;
-}
-static int SelectionEndWidth(HDC hdc) {
-    HGDIOBJ old = SelectObject(hdc, g.fInput);
-    std::wstring s = g.text.substr(0, g.selEnd);
-    SIZE sz{};
-    if (!s.empty()) GetTextExtentPoint32W(hdc, s.c_str(), (int)s.size(), &sz);
-    SelectObject(hdc, old);
-    return sz.cx;
-}
-
-// 输入文字的统一左起点：搜索框左缘 + 放大镜左边距 + 放大镜 + 间距。
-// Paint / 光标定位 / IME 锚点 / 可见性都用它，避免改版式后光标错位。
-static inline int InputTextStartX() {
-    return S(kBasePad) + S(14) + S(16) + S(10);
-}
-
-static void EnsureCaretVisible() {
-    HDC hdc = GetDC(g.hwnd);
-    int cw = CaretTextWidth(hdc) + CompTextWidth(hdc);  // 含输入法组合串，保持整段可见
-    ReleaseDC(g.hwnd, hdc);
-    RECT rc;
-    GetClientRect(g.hwnd, &rc);
-    // 可用宽度 = 搜索框右缘 - 文字起点；留一点右侧余量
-    int avail = (rc.right - S(kBasePad)) - InputTextStartX() - S(8);
-    if (cw - g.scrollX > avail) g.scrollX = cw - avail;
-    if (cw < g.scrollX) g.scrollX = cw;
-    if (g.scrollX < 0) g.scrollX = 0;
-}
-
-// 根据输入行内的 x 坐标反查最近字符索引（按字形宽度累加近似）。
-// 用于鼠标点击 / 拖拽 / 双击选词时光标定位。
-static size_t CaretFromX(int clientX) {
-    HDC hdc = GetDC(g.hwnd);
-    SelectObject(hdc, g.fInput);
-    int targetX = clientX - InputTextStartX() + g.scrollX;
-    if (targetX <= 0) {
-        ReleaseDC(g.hwnd, hdc);
-        return 0;
-    }
-    size_t best = g.text.size();
-    int prevW = 0;
-    for (size_t i = 1; i <= g.text.size(); ++i) {
-        SIZE sz{};
-        GetTextExtentPoint32W(hdc, g.text.c_str(), (int)i, &sz);
-        if (sz.cx > targetX) {
-            // 在 i-1 与 i 之间取中点更接近的那一侧
-            best = (sz.cx - targetX < targetX - prevW) ? i : i - 1;
-            break;
-        }
-        prevW = sz.cx;
-    }
-    ReleaseDC(g.hwnd, hdc);
-    return best;
-}
-
-// 找出光标位置处的“词”边界（连续非空白字符）。用于双击选词。
-static void WordBoundsAt(size_t pos, size_t& a, size_t& b) {
-    a = b = pos;
-    if (g.text.empty()) return;
-    if (pos > g.text.size()) pos = g.text.size();
-    auto isSep = [](WCHAR c) {
-        return c == L' ' || c == L'\t' || c == L',' || c == L';' || c == L'/'
-            || c == L'\\' || c == L'|' || c == L'\'' || c == L'"';
-    };
-    while (a > 0 && !isSep(g.text[a - 1])) a--;
-    while (b < g.text.size() && !isSep(g.text[b])) b++;
-}
-
-// IME 定位：组合窗口与候选窗口都锚定到光标右下（客户区坐标，不可转屏幕坐标——
-// COMPOSITIONFORM/CANDIDATEFORM 的契约是相对包含组合窗口的窗口客户区原点）。
-// CFS_POINT 会被 IME 自行调整甚至忽略，因此用 CFS_FORCE_POSITION / CFS_CANDIDATEPOS。
-static void SetImePos() {
-    if (GetFocus() != g.hwnd) return;
-    HIMC hIMC = ImmGetContext(g.hwnd);
-    if (!hIMC) return;
-    HDC hdc = GetDC(g.hwnd);
-    int cw = CaretTextWidth(hdc);
-    ReleaseDC(g.hwnd, hdc);
-    // 搜索框垂直中心 + 一点下移（候选窗出现在光标右下，符合输入直觉）
-    int searchMidY = S(kBasePad) + (S(kBaseInputH) - S(kBasePad)) / 2;
-    POINT pt{InputTextStartX() - g.scrollX + cw, searchMidY + S(10)};
-    if (pt.x < 0) pt.x = 0;
-    COMPOSITIONFORM cf{};
-    cf.dwStyle = CFS_FORCE_POSITION;
-    cf.ptCurrentPos = pt;
-    ImmSetCompositionWindow(hIMC, &cf);
-    CANDIDATEFORM cdf{};
-    cdf.dwIndex = 0;
-    cdf.dwStyle = CFS_CANDIDATEPOS;
-    cdf.ptCurrentPos = pt;
-    ImmSetCandidateWindow(hIMC, &cdf);
-    ImmReleaseContext(g.hwnd, hIMC);
-}
-
-static void AfterEdit() {
-    g.caretOn = true;
-    EnsureCaretVisible();
-    SetImePos();
-    Refresh();
-}
-
-// 删除当前选区（若有）；返回是否进行了删减。
-static bool DeleteSelection() {
-    if (g.selStart == g.selEnd) return false;
-    size_t a = (g.selStart < g.selEnd) ? g.selStart : g.selEnd;
-    size_t b = (g.selStart < g.selEnd) ? g.selEnd : g.selStart;
-    g.text.erase(a, b - a);
-    g.caret = a;
-    g.selStart = g.selEnd = a;
-    return true;
-}
-
-static void InsertChars(const WCHAR* s, size_t n) {
-    if (n == 0) return;
-    DeleteSelection();
-    g.text.insert(g.caret, s, n);
-    g.caret += n;
-    AfterEdit();
-}
-
-static void CopyAll() {
-    CopyTextToClipboard(g.text);
-}
-
-// 复制当前选区；无选区时退化为全选复制（与原来 Ctrl+C 行为一致）
-static void CopySelection() {
-    if (g.selStart != g.selEnd) {
-        size_t a = (g.selStart < g.selEnd) ? g.selStart : g.selEnd;
-        size_t b = (g.selStart < g.selEnd) ? g.selEnd : g.selStart;
-        CopyTextToClipboard(g.text.substr(a, b - a));
-    } else {
-        CopyAll();
-    }
-}
-
-static void Paste() {
-    if (!OpenClipboard(g.hwnd)) return;
-    HGLOBAL h = GetClipboardData(CF_UNICODETEXT);
-    if (h) {
-        const WCHAR* p = (const WCHAR*)GlobalLock(h);
-        if (p) InsertChars(p, wcslen(p));
-        GlobalUnlock(h);
-    }
-    CloseClipboard();
-}
-
-// 全选：移动光标到末尾，选区覆盖整段文本
-static void SelectAll() {
-    g.selStart = 0;
-    g.selEnd = g.text.size();
-    g.caret = g.text.size();
-    AfterEdit();
-}
-
 // ---------------- 托盘 / 注册表 / 圆角 ----------------
-// Win11 DWM 圆角 + 描边；旧系统调用失败则保持直角（Paint 回退 GDI 描边）
 static void ApplyRoundCorners(HWND h) {
     DWORD pref = DWMWCP_ROUND;
     DwmSetWindowAttribute(h, DWMWA_WINDOW_CORNER_PREFERENCE, &pref, sizeof(pref));
     COLORREF border = (g.theme ? g.theme->border : RGB(80, 80, 80));
-    if (SUCCEEDED(DwmSetWindowAttribute(h, DWMWA_BORDER_COLOR, &border, sizeof(border))))
-        g.dwmBorderOk = true;
+    DwmSetWindowAttribute(h, DWMWA_BORDER_COLOR, &border, sizeof(border));
 }
 
-// ---------------- 单行输入弹窗（添加别名） ----------------
-// 与提示弹窗同款主题化外观：顶部强调条 + 标题 + 说明 + 单行编辑框 + 取消/确定。
-// 用嵌套消息循环做模态；弹窗打开期间主窗的「失焦即隐藏」被 s_promptActive 抑制。
-struct PromptData {
-    std::wstring title;
-    std::wstring label;
-    std::wstring text;    // 用户输入（确定时回填）
-    bool ok = false;
-    HWND edit = nullptr;
-    HBRUSH editBg = nullptr;
-};
-constexpr int IDC_PROMPT_OK = 5002;
-constexpr int IDC_PROMPT_CANCEL = 5003;
-constexpr int kPromptW = 420, kPromptH = 176;
-static PromptData* s_promptActive = nullptr;  // 非空=输入弹窗打开中（主窗不因失焦隐藏）
-static WNDPROC s_promptEditProc = nullptr;
-
-// 单行 EDIT 不会把回车交给父窗：这里接管回车=确定、Esc=取消
-static LRESULT CALLBACK PromptEditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
-    if (msg == WM_KEYDOWN) {
-        if (wp == VK_RETURN) {
-            PostMessageW(GetParent(h), WM_COMMAND, MAKEWPARAM(IDC_PROMPT_OK, 0), 0);
-            return 0;
-        }
-        if (wp == VK_ESCAPE) {
-            PostMessageW(GetParent(h), WM_COMMAND, MAKEWPARAM(IDC_PROMPT_CANCEL, 0), 0);
-            return 0;
-        }
-    }
-    return CallWindowProcW(s_promptEditProc, h, msg, wp, lp);
-}
-
-static LRESULT CALLBACK PromptProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
-    switch (msg) {
-        case WM_CREATE: {
-            PromptData* pd = (PromptData*)((CREATESTRUCTW*)lp)->lpCreateParams;
-            SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)pd);
-            if (!pd || !g.theme) return 0;
-            ApplyRoundCorners(h);
-            RECT rc;
-            GetClientRect(h, &rc);
-            pd->edit = CreateWindowExW(0, L"EDIT", pd->text.c_str(),
-                                       WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-                                       S(22), S(74), rc.right - S(44), S(32), h,
-                                       (HMENU)(INT_PTR)1001, g.inst, nullptr);
-            SendMessageW(pd->edit, WM_SETFONT, (WPARAM)g.fInput, TRUE);
-            SendMessageW(pd->edit, EM_SETSEL, 0, -1);  // 默认名整段选中，直接输入即替换
-            s_promptEditProc = (WNDPROC)SetWindowLongPtrW(pd->edit, GWLP_WNDPROC,
-                                                          (LONG_PTR)PromptEditProc);
-            pd->editBg = CreateSolidBrush(g.theme->editBg);
-            int bw = S(96), bh = S(32), by = rc.bottom - S(18) - bh;
-            HWND cancel = CreateWindowExW(
-                0, L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-                rc.right - S(22) - bw, by, bw, bh, h,
-                (HMENU)(INT_PTR)IDC_PROMPT_CANCEL, g.inst, nullptr);
-            HWND ok = CreateWindowExW(
-                0, L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-                rc.right - S(22) - bw * 2 - S(10), by, bw, bh, h,
-                (HMENU)(INT_PTR)IDC_PROMPT_OK, g.inst, nullptr);
-            SendMessageW(cancel, WM_SETFONT, (WPARAM)g.fInput, TRUE);
-            SendMessageW(ok, WM_SETFONT, (WPARAM)g.fInput, TRUE);
-            return 0;
-        }
-        case WM_PAINT: {
-            PAINTSTRUCT ps;
-            HDC hdc = BeginPaint(h, &ps);
-            RECT rc;
-            GetClientRect(h, &rc);
-            const Theme& t = *g.theme;
-            HBRUSH bg = CreateSolidBrush(t.bg);
-            FillRect(hdc, &rc, bg);
-            DeleteObject(bg);
-            RECT accent{0, 0, rc.right, S(3)};
-            HBRUSH ab = CreateSolidBrush(t.menuHi);
-            FillRect(hdc, &accent, ab);
-            DeleteObject(ab);
-            PromptData* pd = (PromptData*)GetWindowLongPtrW(h, GWLP_USERDATA);
-            if (pd) {
-                SetBkMode(hdc, TRANSPARENT);
-                SelectObject(hdc, g.fontPool[FontSlot(t.fontInput + 2)]);
-                SetTextColor(hdc, t.text);
-                RECT tr{S(22), S(12), rc.right - S(22), S(44)};
-                DrawTextW(hdc, pd->title.c_str(), -1, &tr,
-                          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-                SelectObject(hdc, g.fList);
-                SetTextColor(hdc, t.sub);
-                RECT lr{S(22), S(46), rc.right - S(22), S(70)};
-                DrawTextW(hdc, pd->label.c_str(), -1, &lr,
-                          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-            }
-            EndPaint(h, &ps);
-            return 0;
-        }
-        case WM_CTLCOLOREDIT: {
-            PromptData* pd = (PromptData*)GetWindowLongPtrW(h, GWLP_USERDATA);
-            const Theme& t = *g.theme;
-            SetTextColor((HDC)wp, t.text);
-            SetBkColor((HDC)wp, t.editBg);
-            HBRUSH bg = (pd && pd->editBg) ? pd->editBg : (HBRUSH)GetStockObject(BLACK_BRUSH);
-            return (LRESULT)bg;
-        }
-        case WM_DRAWITEM: {
-            DRAWITEMSTRUCT* dis = (DRAWITEMSTRUCT*)lp;
-            if (!dis || dis->CtlType != ODT_BUTTON) break;
-            const Theme& t = *g.theme;
-            bool primary = (dis->CtlID == IDC_PROMPT_OK);
-            bool pressed = (dis->itemState & ODS_SELECTED) != 0;
-            HBRUSH bg = CreateSolidBrush(pressed ? t.selBg : (primary ? t.accent : t.menuHi));
-            FillRect(dis->hDC, &dis->rcItem, bg);
-            DeleteObject(bg);
-            if (!primary) {
-                HBRUSH bf = CreateSolidBrush(t.divider);
-                FrameRect(dis->hDC, &dis->rcItem, bf);
-                DeleteObject(bf);
-            }
-            SetBkMode(dis->hDC, TRANSPARENT);
-            SetTextColor(dis->hDC, primary ? t.textTitle : t.text);
-            SelectObject(dis->hDC, g.fInput);
-            WCHAR text[32]{};
-            GetWindowTextW(dis->hwndItem, text, 32);
-            DrawTextW(dis->hDC, text, -1, &dis->rcItem,
-                      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-            return TRUE;
-        }
-        case WM_COMMAND: {
-            PromptData* pd = (PromptData*)GetWindowLongPtrW(h, GWLP_USERDATA);
-            int id = LOWORD(wp);
-            if (id == IDC_PROMPT_OK && pd && pd->edit) {
-                int n = GetWindowTextLengthW(pd->edit);
-                std::vector<WCHAR> buf((size_t)n + 1, 0);
-                GetWindowTextW(pd->edit, buf.data(), n + 1);
-                pd->text.assign(buf.data(), (size_t)n);
-                pd->ok = true;
-                DestroyWindow(h);
-            } else if (id == IDC_PROMPT_CANCEL) {
-                DestroyWindow(h);
-            }
-            return 0;
-        }
-        case WM_CLOSE:
-            DestroyWindow(h);
-            return 0;
-        case WM_DESTROY: {
-            PromptData* pd = (PromptData*)GetWindowLongPtrW(h, GWLP_USERDATA);
-            if (pd && pd->editBg) {
-                DeleteObject(pd->editBg);
-                pd->editBg = nullptr;
-            }
-            s_promptActive = nullptr;
-            return 0;
-        }
-        default:
-            break;
-    }
-    return DefWindowProcW(h, msg, wp, lp);
-}
-
-// 弹一个单行输入框并等待关闭；确定返回去空白后的文字，取消/关闭返回空串
-static std::wstring PromptLine(const std::wstring& title, const std::wstring& label,
-                               const std::wstring& defaultText) {
-    static bool registered = false;
-    if (!registered) {
-        WNDCLASSEXW nc{};
-        nc.cbSize = sizeof(nc);
-        nc.lpfnWndProc = PromptProc;
-        nc.hInstance = g.inst;
-        nc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        nc.lpszClassName = L"FlowtaryPrompt";
-        if (RegisterClassExW(&nc)) registered = true;
-    }
-    if (!registered || !g.theme) return L"";
-    int W = S(kPromptW), H = S(kPromptH);
-    RECT owner{};
-    GetWindowRect(g.hwnd, &owner);
-    MONITORINFO mi{};
-    mi.cbSize = sizeof(mi);
-    GetMonitorInfoW(MonitorFromWindow(g.hwnd, MONITOR_DEFAULTTONEAREST), &mi);
-    int x = owner.left + ((owner.right - owner.left) - W) / 2;
-    int y = owner.top + ((owner.bottom - owner.top) - H) / 2;
-    if (x < mi.rcWork.left) x = mi.rcWork.left;
-    if (y < mi.rcWork.top) y = mi.rcWork.top;
-    if (x + W > mi.rcWork.right) x = mi.rcWork.right - W;
-    if (y + H > mi.rcWork.bottom) y = mi.rcWork.bottom - H;
-
-    PromptData pd;
-    pd.title = title;
-    pd.label = label;
-    pd.text = defaultText;
-    s_promptActive = &pd;
-    EnableWindow(g.hwnd, FALSE);  // 模态：弹窗期间启动器不响应输入
-    HWND h = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, L"FlowtaryPrompt",
-                             title.c_str(), WS_POPUP, x, y, W, H, g.hwnd, nullptr, g.inst,
-                             &pd);
-    if (!h) {
-        EnableWindow(g.hwnd, TRUE);
-        s_promptActive = nullptr;
-        return L"";
-    }
-    ShowWindow(h, SW_SHOW);
-    SetForegroundWindow(h);
-    SetFocus(pd.edit);
-    MSG msg;
-    while (IsWindow(h) && GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        if (msg.message == WM_QUIT) {
-            PostQuitMessage(0);
-            break;
-        }
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
-    }
-    EnableWindow(g.hwnd, TRUE);
-    SetForegroundWindow(g.hwnd);
-    s_promptActive = nullptr;
-    return pd.ok ? TrimW(pd.text) : L"";
-}
-
-// ---------------- 系统亚克力玻璃 ----------------
-// 真玻璃 = 两件事同时成立：
-//   ① 分层窗口（WS_EX_LAYERED + LWA_ALPHA）——让窗口真正透出背后桌面；
-//   ② DWM 合成模糊（SetWindowCompositionAttribute / ACCENT_ENABLE_ACRYLICBLURBEHIND）
-//      ——把透出来的桌面模糊成毛玻璃。缺①则②被不透明 BitBlt 盖住看不见。
-// 未公开 API，用 GetProcAddress 动态取，取不到就安全降级（只保留不透明绘制）。
-#ifndef WCA_ACCENT_POLICY
-#define WCA_ACCENT_POLICY 19
-#endif
-enum AccentState {
-    ACCENT_DISABLED = 0,
-    ACCENT_ENABLE_BLURBEHIND = 3,
-    ACCENT_ENABLE_ACRYLICBLURBEHIND = 4,
-};
-struct ACCENT_POLICY { DWORD AccentState; DWORD AccentFlags; DWORD GradientColor; DWORD AnimationId; };
-struct WINDOWCOMPOSITIONATTRIBDATA { DWORD Attrib; PVOID pvData; SIZE_T cbData; };
-
-// 把整窗 alpha 与 DWM 背景模糊一起施加。gradient 用主题底色染一层极淡的色调，
-// alpha 字节给得很低（0x20）——值越低越透、模糊越明显；文字/图标因画在上层仍清晰。
-static void ApplyGlass(HWND h) {
-    if (!h) return;
-    const Theme* t = g.theme;
-    if (g.glassEnabled) {
-        // ① 分层窗口：整窗 alpha（208/255≈82%）让背后 DWM 模糊层透出——
-        // 壁纸透出量 = (1-整窗alpha) × (1-tint alpha)，与 ② 的模糊底色串联。
-        // 真正干净的「背景透 + 文字清晰分离」需 per-pixel alpha（UpdateLayeredWindow），
-        // 那是绘制链路大改；这里用 LWA_ALPHA + 低 tint 的折中，兼顾稳健与通透。
-        LONG_PTR ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
-        if (!(ex & WS_EX_LAYERED))
-            SetWindowLongPtrW(h, GWL_EXSTYLE, ex | WS_EX_LAYERED);
-        // 整窗 alpha 调低：让背后的 DWM 模糊壁纸透出更多。参考 Raycast：
-        // 深色玻璃 tint 盖在模糊壁纸上，壁纸仍明显可见。232→208 让透出从 ~9% 升到 ~18%。
-        // 文字/图标画在最上层，短时淡化可接受，换来的是通透的毛玻璃质感。
-        const BYTE winAlpha = 208;
-        SetLayeredWindowAttributes(h, 0, winAlpha, LWA_ALPHA);
-
-        // ② DWM 毛玻璃：动态解析未公开 API，给窗口背后的内容加模糊。
-        using PFN_SCA = BOOL(WINAPI*)(HWND, WINDOWCOMPOSITIONATTRIBDATA*);
-        static PFN_SCA pSCA = []() -> PFN_SCA {
-            HMODULE u32 = GetModuleHandleW(L"user32.dll");
-            return u32 ? (PFN_SCA)GetProcAddress(u32, "SetWindowCompositionAttribute") : nullptr;
-        }();
-        if (pSCA) {
-            // tint 色取主题的 bg 再提一点蓝紫：毛玻璃染上一层冷色调，比纯黑通透。
-            COLORREF c = t ? t->bg : RGB(12, 16, 48);
-            c = Blend(c, RGB(60, 90, 150), 0.28f);
-            // GradientColor 是 0xAABBGGRR；alpha 从 0xC8(78%) 降到 0x50(31%)，
-            // 让背后模糊壁纸明显透出——这是「真毛玻璃」和「不透明色块」的分水岭。
-            DWORD grad = (DWORD)(0x50u << 24) | ((DWORD)GetBValue(c) << 16) |
-                         ((DWORD)GetGValue(c) << 8) | (DWORD)GetRValue(c);
-            ACCENT_POLICY ap{ACCENT_ENABLE_ACRYLICBLURBEHIND, 0, grad, 0};
-            WINDOWCOMPOSITIONATTRIBDATA d{WCA_ACCENT_POLICY, &ap, sizeof(ap)};
-            pSCA(h, &d);
-        }
-    } else {
-        // 关闭：摘掉分层标志，恢复完全不透明；关掉 DWM 模糊。
-        LONG_PTR ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
-        if (ex & WS_EX_LAYERED)
-            SetWindowLongPtrW(h, GWL_EXSTYLE, ex & ~WS_EX_LAYERED);
-        using PFN_SCA = BOOL(WINAPI*)(HWND, WINDOWCOMPOSITIONATTRIBDATA*);
-        static PFN_SCA pSCA = []() -> PFN_SCA {
-            HMODULE u32 = GetModuleHandleW(L"user32.dll");
-            return u32 ? (PFN_SCA)GetProcAddress(u32, "SetWindowCompositionAttribute") : nullptr;
-        }();
-        if (pSCA) {
-            ACCENT_POLICY ap{ACCENT_DISABLED, 0, 0, 0};
-            WINDOWCOMPOSITIONATTRIBDATA d{WCA_ACCENT_POLICY, &ap, sizeof(ap)};
-            pSCA(h, &d);
-        }
-    }
-}
-
-// 应用图标从内置 .ico 资源（flowtary.ico，多尺寸：16/24/32/48/64/128/256）加载。
-// 取代原先的字体自绘方案：exe 文件、窗口、任务栏/alt-tab、托盘都用同一套图标。
-// 传给目标尺寸（px）让 LoadImageW 从多帧 ico 里取最合适的那一帧。
+// ---------------- 托盘 / 注册表 / 圆角 ----------------
 static HICON LoadAppIcon(int px) {
     HINSTANCE hi = GetModuleHandleW(nullptr);
     HICON h = (HICON)LoadImageW(hi, MAKEINTRESOURCE(FT_APPICON_ID), IMAGE_ICON,
@@ -3747,19 +2498,11 @@ static std::wstring GetExePath() {
 // 重放、sidecar 取消时回退快照 —— 保证运行态只有一种被写法。
 static ft::Settings sSnap;
 static void ApplySettingsToRuntime(const ft::Settings& s) {
-    g.uiEngine = s.uiEngine;
     g.centerWake = s.centerWake != 0;
     g.hotkeyMode = s.hotkeyMode;
     g.hotkeyWake = s.hotkeyWake;
     g.themeIdx = s.themeIdx;
     g.theme = &kThemes[g.themeIdx];
-    g.beautify = s.beautify;
-    // 系统亚克力玻璃开关：注册表 Glass（缺省=1 开启）。旧版本遗留值为 0，
-    // 但本次是新功能，缺省按开启处理，只有显式写 0 才关闭。
-    {
-        DWORD gv = 1;
-        if (ft::RegGetDword(L"Glass", gv)) g.glassEnabled = (gv != 0);
-    }
     g.skipDotFolders = s.skipDotFolders;
     g.dfBackend = s.dfBackend;
     sTune = s.tune;
@@ -4392,17 +3135,9 @@ static void RecordLearned(const Row& r) {
 }
 
 // 给条目加一个别名：在自学习目录里建「别名.lnk」，并登记为学习项（与自学习结果同一套数据）。
-// 之后搜别名（或其前缀）即可直接置顶打开；启动时的 .lnk 双向同步也会把它当普通学习项吸收。
-static void AddAliasForRow(const std::wstring& target, const std::wstring& defaultName) {
-    if (target.empty()) return;
-    std::wstring name = PromptLine(L"添加别名", L"输入一个更好记的名字，回车确认（Esc 取消）",
-                                   defaultName);
-    if (name.empty()) return;
-    ApplyAliasForRow(target, name);
-}
-
+// 之后搜别名（或其前缀）即可直接置顶打开。
 // 真正落库：把「别名 → 目标」登记为学习项并镜像 .lnk。
-// GDI 版的输入框与 Slint 覆盖层都走到这里，保存逻辑只有这一份。
+// Slint 覆盖层提交后走到这里，保存逻辑只有这一份。
 static bool ApplyAliasForRow(const std::wstring& target, const std::wstring& name) {
     if (target.empty()) return false;
     std::wstring term = NormalizeSearchTerm(name);
@@ -4462,7 +3197,7 @@ static bool ApplyAliasForRow(const std::wstring& target, const std::wstring& nam
     g.learnedDirty = true;
     MarkUsageDirty();
     SaveLearnedNow();  // 立即落盘：别名马上可用，也和目录里的 .lnk 保持一致
-    ShowTopToast(g.uiEngine == 1 ? SlintUiWindow() : g.hwnd, L"已添加别名：" + name);
+    ShowTopToast(L"已添加别名：" + name);
     return true;
 }
 
@@ -4757,299 +3492,6 @@ static void RerankByTier() {
     for (size_t i = 0; i < slots.size(); ++i) g.items[slots[i]] = std::move(picked[i]);
 }
 
-// ---------------- 绘制 ----------------
-static void Paint(HDC hdc) {
-    RECT rc;
-    GetClientRect(g.hwnd, &rc);
-    int W = rc.right, H = rc.bottom;
-    int pad = S(kBasePad), inputH = S(kBaseInputH), rowH = S(kBaseRowH);
-    const Theme& t = *g.theme;
-
-    HDC mem;
-    HBITMAP bmp = nullptr;
-    HGDIOBJ oldBmp = nullptr;
-    mem = CreateCompatibleDC(hdc);
-    bmp = CreateCompatibleBitmap(hdc, W, H);
-    oldBmp = SelectObject(mem, bmp);
-    if (t.bg2 != t.bg) FillVGradient(mem, 0, 0, W, H, t.bg, t.bg2);
-    else { HBRUSH bgBr = CreateSolidBrush(t.bg); FillRect(mem, &rc, bgBr); DeleteObject(bgBr); }
-    // 注：壁纸毛玻璃透出由 ApplyGlass 的 WS_EX_LAYERED + DWM AcrylicBlur 在系统层实现，
-    // 绘制层保持实色底即可，不再用假的渐变光晕冒充（那会在不透明合成时显得脏）。
-
-    // 窗口圆角裁剪：强调条/辉光/星点等一切内容都不得画出圆角边界——
-    // 之前蓝色强调条以方角画满全宽，在圆角处溢出弧线之外，非常刺眼。
-    int savedClip = 0;
-    {
-        int rWin = S(kWinRadius);
-        if (rWin > 1) {
-            // CreateRoundRectRgn 第 5/6 参数是圆角椭圆的【直径】，不是半径，
-            // 所以这里传 rWin*2 才得到 rWin 的实际裁剪半径。
-            HRGN hWinRgn = CreateRoundRectRgn(0, 0, W + 1, H + 1, rWin * 2, rWin * 2);
-            if (hWinRgn) {
-                savedClip = SaveDC(mem);
-                ExtSelectClipRgn(mem, hWinRgn, RGN_COPY);
-                DeleteObject(hWinRgn);
-            }
-        }
-    }
-    if (t.stars) {
-        HBRUSH starB[3];
-        starB[0] = CreateSolidBrush(RGB(255, 255, 255));
-        starB[1] = CreateSolidBrush(RGB(180, 190, 235));
-        starB[2] = CreateSolidBrush(RGB(120, 130, 190));
-        for (auto& s : g.stars) {
-            // 亮度 ≥200 亮白、≥160 淡蓝、其余暗蓝
-            HBRUSH b = s.v >= 200 ? starB[0] : (s.v >= 160 ? starB[1] : starB[2]);
-            int r = s.x, bb = s.y + (s.s == 2 ? 1 : 0);
-            RECT sr{r, s.y, r + s.s, bb + s.s};
-            FillRect(mem, &sr, b);
-        }
-        for (auto& b : starB) DeleteObject(b);
-    }
-
-    // ================= Raycast 风格主窗 =================
-    // 结构：窗口内一枚【独立圆角搜索框】+ 下方【结果列表直接铺在玻璃上】（无独立卡片）。
-    // 每行：大 squircle 图标 + 标题/副标题上下双行；选中项 = 通栏纯色胶囊。
-    // 搜索框底边 = inputH，列表顶边 rowsTop = inputH + gapTop（命中测试/Layout 共用此等式）。
-    const int rows = (std::min)((int)g.items.size(), (int)kMaxVisibleResults);
-    const int gapTop = S(kBaseCardGapTop);
-    const int rowsTop = inputH + gapTop;
-
-    // —— 搜索区：无独立边框、无独立实心底，就是整窗玻璃的一部分 ——
-    // 参考 Raycast 2.0：搜索框没有描边方框，只在下方用一条极淡 hairline 与结果区分。
-    // 旧版画了「独立圆角实色块 + 亮描边」，空态下那圈边框浮在玻璃上非常突兀——
-    // 用户抱怨的「输入框边界特别难看，尤其没输入时」正是这枚假控件。
-    // 现在改成：一层比玻璃略亮的极淡提亮（焦点态暗示，读起来是一块可交互区而非控件），
-    // 边框完全删掉；分区交给下面那条几乎看不见的 hairline。
-    {
-        RECT sr{pad, pad, W - pad, inputH};
-        const int rs = S(kSearchRadius);
-        // 「提亮」混进窗体底色，而不是混入 bgInput：再没有与周围玻璃割裂的实心色块。
-        COLORREF searchLift = Blend(t.bg, t.textTitle, t.dark ? 0.045f : 0.06f);
-        FillRoundRectAA(mem, sr, rs, [&](float, float) -> COLORREF { return searchLift; });
-    }
-    // 搜索区 / 结果区之间的极淡分隔线：只画在左右 pad 之间，取该处玻璃色微亮，
-    // 位于 gap 的垂直中点。它几乎不可见，只提供「这里分了两区」的暗示。
-    if (rows > 0) {
-        const int hy = inputH + S(kBaseCardGapTop) / 2;
-        COLORREF hair = Blend(t.bg, t.textSec, t.dark ? 0.07f : 0.10f);
-        HBRUSH hb = CreateSolidBrush(hair);
-        RECT hr{pad, hy, W - pad, hy + S(1)};
-        FillRect(mem, &hr, hb);
-        DeleteObject(hb);
-    }
-
-    SetBkMode(mem, TRANSPARENT);
-
-    // —— 搜索框内的图标与输入文字 ——
-    // 文字起点在「放大镜 + 间距」之后，整体位于搜索框垂直中心。
-    SelectObject(mem, g.fInput);
-    const int glyphSize = S(16);
-    const int searchMidY = pad + (inputH - pad) / 2;
-    const int textStartX = InputTextStartX();
-    {
-        RECT clip{pad, pad, W - pad, inputH};
-        SaveDC(mem);
-        IntersectClipRect(mem, clip.left, clip.top, clip.right, clip.bottom);
-        // 选区底色
-        if (g.selStart != g.selEnd) {
-            int x1 = textStartX - g.scrollX + SelectionStartWidth(mem);
-            int x2 = textStartX - g.scrollX + SelectionEndWidth(mem);
-            if (x2 < x1) std::swap(x1, x2);
-            RECT sr2{x1, searchMidY - S(13), x2, searchMidY + S(13)};
-            HBRUSH sb = CreateSolidBrush(Blend(t.bgCard, t.accent, 0.35f));
-            FillRect(mem, &sr2, sb); DeleteObject(sb);
-        }
-        if (g.text.empty() && g.compText.empty()) {
-            // 空态：放大镜与占位文字都压淡、去掉蓝色偏色，安静地融进玻璃，
-            // 不再是一枚「有边框的输入控件里杵着个亮图标」。
-            COLORREF phGlyph = Blend(t.textDis, t.bg, 0.22f);
-            COLORREF phText = Blend(t.textDis, t.bg, 0.18f);
-            PaintSearchGlyph(mem, pad + S(14), searchMidY - glyphSize / 2,
-                             glyphSize, phGlyph);
-            RECT hr{textStartX, pad, W + 4096, inputH};
-            SetTextColor(mem, phText);
-            DrawTextW(mem, L"搜索程序 · 文件 · 网页", -1, &hr,
-                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-        } else {
-            PaintSearchGlyph(mem, pad + S(14), searchMidY - glyphSize / 2,
-                             glyphSize, Blend(t.textDis, t.accent2, 0.35f));
-            RECT r{textStartX - g.scrollX, pad, W + 4096, inputH};
-            SetTextColor(mem, t.textBody);
-            DrawTextW(mem, g.text.c_str(), (int)g.text.size(), &r,
-                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-        }
-        if (!g.compText.empty()) {
-            int cx = textStartX - g.scrollX + CaretTextWidth(mem);
-            SetTextColor(mem, t.textSec);
-            RECT cr{cx, pad, W + 4096, inputH};
-            DrawTextW(mem, g.compText.c_str(), (int)g.compText.size(), &cr,
-                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-            SIZE csz{};
-            GetTextExtentPoint32W(mem, g.compText.c_str(), (int)g.compText.size(), &csz);
-            RECT ur{cx, searchMidY + S(13), cx + csz.cx, searchMidY + S(15)};
-            FillRect(mem, &ur, g.brDivider);
-        }
-        RestoreDC(mem, -1);
-    }
-    if (g.caretOn && GetFocus() == g.hwnd) {
-        int cx = textStartX + CaretTextWidth(mem) - g.scrollX;
-        RECT cr{cx, searchMidY - S(13), cx + S(2), searchMidY + S(13)};
-        HBRUSH carBr = CreateSolidBrush(t.textBody);
-        FillRect(mem, &cr, carBr); DeleteObject(carBr);
-    }
-
-    // —— 结果列表：直接铺在玻璃上，无独立卡片 ——
-    SelectObject(mem, g.fList);
-    const COLORREF selFill = RGB(46, 124, 124);  // 通栏选中胶囊：Raycast teal
-    const COLORREF selText = t.dark ? RGB(255, 255, 255) : RGB(255, 255, 255);
-    const COLORREF subOnSel = Blend(selText, selFill, 0.42f);  // 选中行副标题：淡一档
-    const int listL = pad, listR = W - pad;
-    const int iconX = listL + S(kIconGapL);
-    const int textX = iconX + S(kIconSize) + S(kIconTextGap);
-    const int badgeRight = listR - S(kBadgeGapR);
-    const int badgeW = S(kBadgeW), badgeH = S(kBadgeH);
-    for (int i = 0; i < rows; ++i) {
-        Row& row = g.items[i];
-        int y = rowsTop + i * rowH;
-        const int tier = (row.kind == Row::Prog || row.kind == Row::File || row.kind == Row::Folder)
-                             ? UsageTier(row.usage) : 0;
-        const bool hot = tier >= 2;
-        const bool isSel = (i == g.sel);
-
-        // 选中态：通栏纯色胶囊（左右到列表边界，圆角 kSelRadius）
-        if (isSel) {
-            RECT pill{listL, y, listR, y + rowH};
-            FillRoundRectAA(mem, pill, S(kSelRadius),
-                            [&](float, float) -> COLORREF { return selFill; });
-        } else if (i == g.hoverRow && g.hoverT > 0.001f) {
-            RECT pill{listL, y, listR, y + rowH};
-            COLORREF hoverBg = Blend(t.bgCard, t.accent2, (float)(0.10 + 0.12 * g.hoverT));
-            FillRoundRectAA(mem, pill, S(kSelRadius),
-                            [&](float, float) -> COLORREF { return hoverBg; });
-        }
-
-        // 大 squircle 图标：真实 HICON 直接画，外加一层圆角底托（无图标时也显示占位）
-        {
-            int isz = S(kIconSize);
-            int iconTop = y + (rowH - isz) / 2;
-            RECT well{iconX, iconTop, iconX + isz, iconTop + isz};
-            HICON rowIcon = nullptr;
-            if (row.kind == Row::Prog && row.prog) {
-                rowIcon = GetProgramIcon(row.prog);
-            } else if ((row.kind == Row::File || row.kind == Row::Folder ||
-                        row.kind == Row::Reveal) && !row.action.empty()) {
-                rowIcon = GetPathIcon(row.action);
-            }
-            // 底托：无图标时是有层次的圆角块，有图标时作为 HICON 的衬底
-            COLORREF wellBase = Blend(t.bgCard, t.accent2, t.dark ? 0.20f : 0.12f);
-            FillRoundRectAA(mem, well, S(kIconRadius), [&](float, float v) -> COLORREF {
-                COLORREF base = wellBase;
-                if (v < 0.22f) return Blend(base, t.textTitle,
-                                            (t.dark ? 0.16f : 0.22f) * (1 - v / 0.22f));
-                if (v > 0.84f) return Darken(base, (int)(12 * (v - 0.84f) / 0.16f + 0.5f));
-                return base;
-            });
-            if (rowIcon)
-                DrawIconEx(mem, iconX + S(2), iconTop + S(2), rowIcon,
-                           isz - S(4), isz - S(4), 0, nullptr, DI_NORMAL);
-        }
-
-        // 标题（上） + 副标题（下）：Raycast 双行信息层级
-        const int titleRoomMax = badgeRight - badgeW - S(10) - textX;
-        SelectObject(mem, g.fList);
-        int yTitle = y + rowH / 2 - S(9);
-        int ySub = y + rowH / 2 + S(9);
-        // 标题：hot 行加粗并向正文色靠拢；选中行纯白
-        HFONT hTitle = (!isSel && hot && g.fListHot) ? g.fListHot : g.fList;
-        HFONT hOldTitle = (HFONT)SelectObject(mem, hTitle);
-        COLORREF titleCol = isSel ? selText
-                          : (row.kind == Row::Hint ? t.textDis
-                             : hot ? Blend(t.accent2, t.textBody, 0.42f - 0.34f * UsageHeat(row.usage))
-                                   : t.textBody);
-        SetTextColor(mem, titleCol);
-        // 标题绘制在上半区（22px 高的矩形，垂直居中于 yTitle）
-        RECT tr{textX, yTitle - S(11), textX + titleRoomMax, yTitle + S(11)};
-        DrawTextW(mem, row.title.c_str(), (int)row.title.size(), &tr,
-                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-        SelectObject(mem, hOldTitle);
-        if (!row.sub.empty()) {
-            HFONT hOldSub = (HFONT)SelectObject(
-                mem, g.fontPool[FontSlot((g.theme ? g.theme->fontList : 15) - 1)]);
-            SetTextColor(mem, isSel ? subOnSel : t.textSec);
-            RECT sr{textX, ySub - S(9), textX + titleRoomMax, ySub + S(9)};
-            DrawTextW(mem, row.sub.c_str(), (int)row.sub.size(), &sr,
-                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-            SelectObject(mem, hOldSub);
-        }
-
-        // 快捷键键帽：几何 ⌘（四爪 + 中心）+ 数字。不用 U+2318 字符（Windows 缺字变方框）。
-        WCHAR hk = HotkeyChar(i);
-        if (hk) {
-            RECT br{badgeRight - badgeW, y + (rowH - badgeH) / 2, badgeRight, y + (rowH - badgeH) / 2 + badgeH};
-            COLORREF keyBg = isSel ? Blend(selFill, RGB(0, 0, 0), 0.18f)
-                                   : Blend(t.bgCard, t.accent2, 0.10f);
-            const int kr = S(kBadgeR);
-            FillRoundRectAA(mem, br, kr, [&](float, float) -> COLORREF { return keyBg; });
-            StrokeRoundRectAA(mem, br, kr, isSel ? subOnSel : t.textSec, 1);
-            COLORREF gc = isSel ? selText : t.textSec;
-            int ccx = br.left + S(9), ccy = (br.top + br.bottom) / 2;
-            HBRUSH gb = CreateSolidBrush(gc);
-            RECT gh{ccx - S(4), ccy - S(1), ccx + S(4), ccy + S(1)}; FillRect(mem, &gh, gb);
-            RECT gv{ccx - S(1), ccy - S(4), ccx + S(1), ccy + S(4)}; FillRect(mem, &gv, gb);
-            for (int dx : {-4, 4}) for (int dy : {-4, 4}) {
-                RECT gp{ccx + S(dx) - S(1), ccy + S(dy) - S(1),
-                        ccx + S(dx) + S(1), ccy + S(dy) + S(1)};
-                FillRect(mem, &gp, gb);
-            }
-            DeleteObject(gb);
-            RECT nr{br.right - S(12), br.top, br.right - S(2), br.bottom};
-            SetTextColor(mem, gc);
-            DrawTextW(mem, &hk, 1, &nr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-        }
-    }
-    // 耗时底栏：非秒出才出现。pending 实时跳毫秒 + 还在等哪层；报齐后定格总耗时 + 首屏延迟。
-    {
-        int fm = 0; bool fl = false;
-        if (LatencyFooter(fm, fl)) {
-            // 底栏独占窗口最下面一条带：分隔线在带的上边，文字在带内垂直居中。
-            // 带的上边 = 卡片底边 + 窗口底部留白，所以底栏不会和卡片叠在一起。
-            int fy = H - S(kBaseFooterH);
-            RECT dl{pad, fy, W - pad, fy + 1};
-            PaintDivider(mem, dl, t.divider, 55);
-            SelectObject(mem, g.fontPool[FontSlot(kFontMin)]);
-            SetBkMode(mem, TRANSPARENT);
-            std::wstring left = (fl ? L"… " : L"") + std::to_wstring(fm) + L" ms";
-            std::wstring right = fl ? PendingLayerText()
-                : (g.qFirstMs >= 0 && g.qFirstMs < fm ? L"首屏 " + std::to_wstring(g.qFirstMs) + L" ms" : L"");
-            SetTextColor(mem, fl ? t.accent2 : t.textSec);
-            RECT lr{pad, fy, W - pad, H};
-            DrawTextW(mem, left.c_str(), (int)left.size(), &lr,
-                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-            if (!right.empty()) {
-                SetTextColor(mem, t.textDis);
-                DrawTextW(mem, right.c_str(), (int)right.size(), &lr,
-                          DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-            }
-            SelectObject(mem, g.fList);
-        }
-    }
-
-    // 描边（DWM 边框不可用时回退 GDI 抗锯齿圆角描边）
-    if (!g.dwmBorderOk) {
-        RECT fr{0, 0, W, H};
-        StrokeRoundRectAA(mem, fr, S(kWinRadius), t.border, t.borderWidth);
-    }
-
-    BitBlt(hdc, 0, 0, W, H, mem, 0, 0, SRCCOPY);
-    if (savedClip) RestoreDC(mem, savedClip);
-    SelectObject(mem, oldBmp);
-    DeleteObject(bmp);
-    DeleteDC(mem);
-}
-
-// 截图工具解析：同目录优先，其次注册表自定义路径。启动时和 sidecar 下载完成时各跑一次
-// （下载逻辑在 flowtary-settings.exe，主进程只能靠 MsgCaptureInstalled 重新解析）。
 static void ResolveCaptureExe() {
     g.captureExe.clear();
     std::wstring exe = GetExePath();
@@ -5075,7 +3517,7 @@ static void ResolveCaptureExe() {
 }
 
 // =====================================================================
-// 设置窗 sidecar（flowtary-settings.exe，FLTK）
+// 设置窗 sidecar（flowtary-settings.exe，Slint）
 //
 // 分工：sidecar 负责界面与「写注册表」；主进程负责运行态与派生缓存。
 //   · 打开时主进程先快照运行态 → sidecar 期间的实时预览只改主进程内存
@@ -5090,7 +3532,6 @@ static bool sSidecarCommitted = false;   // 本次会话是否已提交（提交
 static void TakeSettingsSnapshot() {
     sLiveSaved = sSnap;  // sSnap = 最近一次「已落盘」的设置；预览不会碰它
     sThemeIdxSaved = g.themeIdx;
-    sBeautifySaved = g.beautify;
     sTuneSaved.assign(kThemeCount, ThemeTune());
     for (int i = 0; i < kThemeCount; ++i) {
         sTuneSaved[i].alpha = kThemes[i].alpha;
@@ -5114,7 +3555,6 @@ static void RestoreSettingsSnapshot() {
     g.themeIdx = sThemeIdxSaved;
     g.theme = &kThemes[g.themeIdx];
     RestoreThemeTune();
-    g.beautify = sBeautifySaved;
     ApplyTheme();
 }
 
@@ -5157,10 +3597,7 @@ static void ApplySettingsPreview(const ipc::Preview& p) {
         g.themeIdx = p.themeIdx;
         g.theme = &kThemes[g.themeIdx];
     }
-    bool beautifyChanged = (g.beautify != (p.beautify != FALSE));
-    g.beautify = p.beautify != FALSE;
     ApplyTheme();  // 重建画刷/字体/星点 + 暗色菜单 + 主窗 Layout/Repaint
-    if (beautifyChanged) ApplyBeautify();
 }
 
 // 保存后重放：注册表已由 sidecar 写好，主进程按唯一读法全量重来一遍。
@@ -5173,8 +3610,7 @@ static void ReplaySettings() {
     g.windowCache.clear();  // 刷新间隔可能改小了：立即失效，不等旧间隔
     g.windowCacheTick = 0;
     ApplyTheme();
-    ApplyBeautify();
-    if (IsWindowVisible(g.hwnd) || g.uiEngine == 1) LayoutAndRepaint();
+    LayoutAndRepaint();
     TakeSettingsSnapshot();  // 已提交：把新状态当回退基线
 }
 
@@ -5219,7 +3655,7 @@ static void OnSettingsSessionEnded() {
     EndSettingsSession();
     if (!committed) {
         RestoreSettingsSnapshot();
-        if (IsWindowVisible(g.hwnd) || g.uiEngine == 1) LayoutAndRepaint();
+        LayoutAndRepaint();
     }
 }
 
@@ -5245,7 +3681,7 @@ static void HandleSettingsIpc(const COPYDATASTRUCT* cds) {
             return;
         case ipc::MsgCancel:
             RestoreSettingsSnapshot();
-            if (IsWindowVisible(g.hwnd) || g.uiEngine == 1) LayoutAndRepaint();
+            LayoutAndRepaint();
             sSidecarCommitted = false;  // 取消后仍可继续改，基线仍是打开时的状态
             return;
         case ipc::MsgClosed:
@@ -5277,13 +3713,7 @@ static void OpenSettings() {
     std::wstring exe = GetExePath();
     size_t slash = exe.find_last_of(L"\\/");
     std::wstring dir = (slash == std::wstring::npos) ? L"" : exe.substr(0, slash + 1);
-    // Slint 引擎走 Slint 设置窗；没构建时回退到 FLTK 版，避免设置入口消失
     std::wstring sidecar = dir + L"flowtary-settings.exe";
-    if (g.uiEngine == 1) {
-        std::wstring slintSidecar = dir + L"flowtary-settings-slint.exe";
-        if (GetFileAttributesW(slintSidecar.c_str()) != INVALID_FILE_ATTRIBUTES)
-            sidecar = slintSidecar;
-    }
     if (GetFileAttributesW(sidecar.c_str()) == INVALID_FILE_ATTRIBUTES) {
         TrayBalloon(L"Flowtary", L"未找到设置程序（与主程序同目录）");
         return;
@@ -5416,13 +3846,10 @@ static HWND SlintUiWindow() {
     return FindWindowW(nullptr, L"flowtary-slint");
 }
 
-// 启动器当前是否处于打开状态（GDI 看窗口可见性；Slint 看渲染器界面窗口）
+// 启动器当前是否处于打开状态（渲染器界面窗口可见）
 static bool LauncherVisible() {
-    if (g.uiEngine == 1) {
-        HWND ui = SlintUiWindow();
-        return ui && IsWindowVisible(ui);
-    }
-    return IsWindowVisible(g.hwnd);
+    HWND ui = SlintUiWindow();
+    return ui && IsWindowVisible(ui);
 }
 
 // 主题调色板 → 桥：COLORREF 是 0x00BBGGRR，附 8 位 alpha 方便渲染器直接当 #RRGGBBAA 用
@@ -5500,7 +3927,6 @@ static void SlintBuildRows(std::vector<char>& out) {
 
 // 大脑 → 渲染器：下发完整状态（文本 + 行列表）
 static void SlintPushState() {
-    if (g.uiEngine != 1) return;
     SlintBridgeEnsure();
     if (!g.bridge) return;
     SlintPushTheme();  // 主题与状态一起下发（换主题/微调都会走到这里）
@@ -5526,7 +3952,6 @@ static void SlintPushState() {
 
 // 大脑 → 渲染器：投递一条命令（显示 / 隐藏 / 退出）
 static void SlintSendCmd(int cmd) {
-    if (g.uiEngine != 1) return;
     SlintBridgeEnsure();
     if (!g.bridge) return;
     if (cmd == slintbridge::kCmdShow) {
@@ -5562,16 +3987,14 @@ static void SlintWriteTextSlot(volatile LONG* seq, slintbridge::TextSlot& slot,
 
 // 让渲染器弹出别名输入覆盖层（预填默认名）
 static void SlintPushAliasPrompt(const std::wstring& defaultName) {
-    if (g.uiEngine != 1) return;
     SlintBridgeEnsure();
     if (!g.bridge) return;
     SlintWriteTextSlot(&g.bridge->aliasSeq, g.bridge->alias, WideToUtf8(defaultName));
     SlintSendCmd(slintbridge::kCmdAliasPrompt);
 }
 
-// 屏幕顶部轻提示：Slint 引擎走渲染器的独立无边框窗口，GDI 引擎走原生窗口
+// 屏幕顶部轻提示：走渲染器的独立无边框窗口
 static void SlintShowToast(const std::wstring& text) {
-    if (g.uiEngine != 1) return;
     SlintBridgeEnsure();
     if (!g.bridge) return;
     SlintWriteTextSlot(&g.bridge->toastSeq, g.bridge->toast, WideToUtf8(text));
@@ -5582,10 +4005,10 @@ static void SlintShowToast(const std::wstring& text) {
 static int g_slintMenuRow = -1;
 
 // 把当前行的右键菜单命令写进桥，由渲染器用 Slint 自绘展示。
-// 命令条件与 GDI 版 ShowRowMenu 完全一致，执行逻辑也共用 RunRowMenuCommand。
+// 命令条件与执行逻辑都在 RunRowMenuCommand 这一份。
 static void SlintPushRowMenu()
 {
-    if (g.uiEngine != 1 || !g.bridge) return;
+    if (!g.bridge) return;
     if (g.sel < 0 || g.sel >= (int)g.items.size()) return;
     const Row& r = g.items[g.sel];
     if (r.kind == Row::Hint) return;
@@ -5649,12 +4072,8 @@ static void SlintHandleRequests() {
                 unsigned n = r.textLen;
                 if (n > (unsigned)slintbridge::kTextMax) n = (unsigned)slintbridge::kTextMax;
                 std::wstring w = Utf8ToWide(std::string(r.text, r.text + n));
-                if (g.text != w) {
-                    g.text = w;
-                    g.caret = g.text.size();
-                    g.selStart = g.selEnd = 0;
-                }
-                AfterEdit();  // → Refresh()：重新出结果（内部会推状态）
+                if (g.text != w) g.text = w;
+                Refresh();  // 重新出结果（内部会推状态）
                 needPush = true;
                 break;
             }
@@ -5737,16 +4156,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     switch (msg) {
         case WM_CREATE: {
             // 字体由字体池提供（见 UpdateScale / ApplyTheme）
-            if (g.theme) g.brDivider = CreateSolidBrush(g.theme->divider);
-            UINT blink = GetCaretBlinkTime();
-            if (blink == 0 || blink == INFINITE) blink = 530;
-            SetTimer(hwnd, kTimerBlink, blink, nullptr);
             return 0;
         }
         case WM_DESTROY:
             AppendTrace("WM_DESTROY (main window)");
             StopProgramsRefresh(hwnd);
-            KillTimer(hwnd, kTimerBlink);
             FlushHistoryQuery();    // 退出前把攒着的最后一轮查询落盘（含没报齐就退出的那类现场）
             SaveClickWeightsNow();  // 退出前把未写盘的点击权重落盘（含「仅退出时写入」模式）
             SaveLearnedNow();       // 自学习数据同样落盘
@@ -5766,16 +4180,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 DestroyIcon(g.hTrayIcon);
                 g.hTrayIcon = nullptr;
             }
-            for (auto& kv : g.pathIcons) {
-                if (kv.second) DestroyIcon(kv.second);
-            }
-            g.pathIcons.clear();
             for (int i = 0; i < kFontMax - kFontMin + 1; ++i) {
                 if (g.fontPool[i]) { DeleteObject(g.fontPool[i]); g.fontPool[i] = nullptr; }
             }
-            if (g.fListHot) { DeleteObject(g.fListHot); g.fListHot = nullptr; }
-            if (g.brDivider) { DeleteObject(g.brDivider); g.brDivider = nullptr; }
-            if (g.brMenuBg) { DeleteObject(g.brMenuBg); g.brMenuBg = nullptr; }
             SlintSendCmd(slintbridge::kCmdQuit);  // 通知 Slint 渲染器自行退出
             PostQuitMessage(0);
             return 0;
@@ -5783,11 +4190,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_HOTKEY:
             if (wParam == 1) {
                 // 输入框聚焦时屏蔽已注册的 Alt 热键（Alt+Space / Alt+Q / Ctrl+Alt+Space），
-                // 使其不再隐藏/切换窗口，仅 Alt+数字 生效（见 WM_SYSKEYDOWN）。
-                // Slint 引擎下启动器窗口属于渲染器进程，用前台窗口判断同一个语义。
-                bool launcherFocused = (g.uiEngine == 1)
-                                           ? (GetForegroundWindow() == SlintUiWindow())
-                                           : (GetFocus() == g.hwnd);
+                // 使其不再隐藏/切换窗口。启动器窗口属于渲染器进程，用前台窗口判断。
+                bool launcherFocused = (GetForegroundWindow() == SlintUiWindow());
                 if (launcherFocused) {
                     AppendTrace("HOTKEY swallowed: launcher focused while hotkey fired");
                     return 0;
@@ -5801,89 +4205,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             }
             return 0;
 
-        case WM_ACTIVATE:
-            // 输入弹窗（添加别名）打开时不算失焦：否则启动器会被自动隐藏
-            if (LOWORD(wParam) == WA_INACTIVE && IsWindowVisible(hwnd) && !s_promptActive)
-                Hide();
-            return 0;
-
-        case WM_ERASEBKGND:
-            return 1;
-
-        case WM_PAINT: {
-            PAINTSTRUCT ps;
-            HDC hdc = BeginPaint(hwnd, &ps);
-            Paint(hdc);
-            EndPaint(hwnd, &ps);
-            return 0;
-        }
-
-        case WM_MEASUREITEM: {
-            // 黑暗自绘菜单：计算条目尺寸（itemData 即文本指针，空文本=分隔线）
-            MEASUREITEMSTRUCT* mis = (MEASUREITEMSTRUCT*)lParam;
-            if (!mis || mis->CtlType != ODT_MENU) break;
-            const WCHAR* text = (const WCHAR*)mis->itemData;
-            if (text && *text) {
-                HDC hdc = GetDC(hwnd);
-                HGDIOBJ old = SelectObject(hdc, g.fList);
-                SIZE sz{};
-                GetTextExtentPoint32W(hdc, text, (int)wcslen(text), &sz);
-                SelectObject(hdc, old);
-                ReleaseDC(hwnd, hdc);
-                mis->itemWidth = sz.cx + S(44);
-                mis->itemHeight = S(30);
-            } else {
-                mis->itemWidth = S(60);
-                mis->itemHeight = S(9);  // 分隔线高度
-            }
-            return TRUE;
-        }
-
-        case WM_DRAWITEM: {
-            // 主题自绘菜单：背景/选中/文字均取当前主题色，与主界面一致
-            DRAWITEMSTRUCT* dis = (DRAWITEMSTRUCT*)lParam;
-            if (!dis || dis->CtlType != ODT_MENU) break;
-            const WCHAR* text = (const WCHAR*)dis->itemData;
-            const Theme& t = *g.theme;
-            HBRUSH bg = CreateSolidBrush(t.menuBg);
-            FillRect(dis->hDC, &dis->rcItem, bg);
-            DeleteObject(bg);
-            if (!text || !*text) {  // 分隔线
-                RECT lr{dis->rcItem.left + S(10), dis->rcItem.top + S(4),
-                        dis->rcItem.right - S(10), dis->rcItem.top + S(5)};
-                HBRUSH lb = CreateSolidBrush(t.divider);
-                FillRect(dis->hDC, &lr, lb);
-                DeleteObject(lb);
-                return TRUE;
-            }
-            if (dis->itemState & ODS_SELECTED) {
-                HBRUSH hb = CreateSolidBrush(t.menuHi);
-                FillRect(dis->hDC, &dis->rcItem, hb);
-                DeleteObject(hb);
-            }
-            if (dis->itemState & ODS_CHECKED) {
-                // 自绘勾选标记（设置页下拉的当前项指示），置于文字左侧留白处
-                int cx = dis->rcItem.left + S(8);
-                int cy = (dis->rcItem.top + dis->rcItem.bottom) / 2;
-                int s = S(4);
-                HPEN pen = CreatePen(PS_SOLID, S(2), t.text);
-                HGDIOBJ oldPen = SelectObject(dis->hDC, pen);
-                MoveToEx(dis->hDC, cx - s, cy, nullptr);
-                LineTo(dis->hDC, cx - s / 2, cy + s / 2);
-                LineTo(dis->hDC, cx + s, cy - s / 2);
-                SelectObject(dis->hDC, oldPen);
-                DeleteObject(pen);
-            }
-            SetBkMode(dis->hDC, TRANSPARENT);
-            SetTextColor(dis->hDC, t.text);
-            SelectObject(dis->hDC, g.fList);
-            RECT tr = dis->rcItem;
-            tr.left += S(16);
-            DrawTextW(dis->hDC, text, -1, &tr,
-                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-            return TRUE;
-        }
-
         case WM_TIMER:
             if (wParam == kTimerDebounce) {
                 KillTimer(hwnd, kTimerDebounce);
@@ -5896,19 +4217,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 KillTimer(hwnd, kTimerHistFlush);
                 FlushHistoryQuery();   // 编辑静置到期：把这一轮的 Q 行落盘
             } else if (wParam == kTimerBlink) {
-                if(PollProgramIcons())InvalidateRect(hwnd,nullptr,FALSE);
-                if(s_programWatch.Poll())StartProgramsRefresh();
-                g.caretOn = !g.caretOn;
-                RECT r{0, 0, S(kBaseW), S(kBaseInputH)};
-                InvalidateRect(hwnd, &r, FALSE);
+                // 目录变更轮询（原来兼作光标闪烁定时器；主窗不再自绘，只保留轮询）
+                if (s_programWatch.Poll()) StartProgramsRefresh();
             } else if (wParam == kTimerBalloon) {
                 KillTimer(hwnd, kTimerBalloon);
                 // 清除气泡文本，防止后续 NIM_MODIFY（如提示更新）再次弹出旧气泡
                 g.nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
                 g.nid.szInfo[0] = L'\0';
                 Shell_NotifyIconW(NIM_MODIFY, &g.nid);
-            } else if (wParam == kTimerTween) {
-                TickTweens();
             } else if (wParam == kTimerLatency) {
                 // 还在等：实时跳毫秒（跨阈值时底栏出现/长高，需要重新 Layout）；报齐就停。
                 if (SearchPending()) LayoutAndRepaint();
@@ -5978,16 +4294,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 RestoreFrequentPrograms(*p,p->stats.truncated);  // 截断时用高频权重补回漏扫的程序
                 g.programs = std::move(p->programs);
                 s_programCatalogStats=std::move(p->stats);
-                s_programIcons.Reset(++s_programGeneration);
                 delete p;
             }
             s_programScanState->running=false;
             g.startingUp = false;
             TrayUpdateTip();  // 提示文案从「正在启动中」切回热键名
-            if (IsWindowVisible(hwnd) || g.uiEngine == 1) {
-                if(g.mode==Mode::Programs)Refresh();
-                else LayoutAndRepaint();
-            }
+            if(g.mode==Mode::Programs)Refresh();
+            else LayoutAndRepaint();
             return 0;
         }
         case WM_APP_APPS_CHANGED:
@@ -6039,325 +4352,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 else if (cmd == IDM_EXIT) DestroyWindow(hwnd);
             }
             return 0;
-        }
-
-        case WM_KEYDOWN: {
-            bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-            // Alt+数字 由 WM_SYSKEYDOWN（Alt 组合键消息）统一处理，详见下方 case。
-            switch (wParam) {
-                case VK_RETURN:
-                    ExecuteSelected(ResolveExecKind(ctrl, shift));
-                    return 0;
-                case VK_ESCAPE:
-                    Hide();
-                    return 0;
-                case VK_UP:
-                    if (!g.items.empty()) {
-                        g.sel = (g.sel - 1 + (int)g.items.size()) % (int)g.items.size();
-                        RepaintNow();
-                    }
-                    return 0;
-                case VK_DOWN:
-                    if (!g.items.empty()) {
-                        g.sel = (g.sel + 1) % (int)g.items.size();
-                        RepaintNow();
-                    }
-                    return 0;
-case VK_LEFT:
-                    if (shift) {
-                        if (g.selStart == g.selEnd) {
-                            g.selStart = g.selEnd = g.caret;
-                        }
-                        if (g.caret > 0) g.caret--;
-                        g.selEnd = g.caret;
-                    } else {
-                        if (g.selStart != g.selEnd) {
-                            g.caret = (g.selStart < g.selEnd) ? g.selStart : g.selEnd;
-                            g.selStart = g.selEnd = g.caret;
-                        } else if (g.caret > 0) {
-                            g.caret--;
-                        }
-                    }
-                    AfterEdit();
-                    return 0;
-                case VK_RIGHT:
-                    if (shift) {
-                        if (g.selStart == g.selEnd) {
-                            g.selStart = g.selEnd = g.caret;
-                        }
-                        if (g.caret < g.text.size()) g.caret++;
-                        g.selEnd = g.caret;
-                    } else {
-                        if (g.selStart != g.selEnd) {
-                            g.caret = (g.selStart > g.selEnd) ? g.selStart : g.selEnd;
-                            g.selStart = g.selEnd = g.caret;
-                        } else if (g.caret < g.text.size()) {
-                            g.caret++;
-                        }
-                    }
-                    AfterEdit();
-                    return 0;
-                case VK_HOME:
-                    if (shift) {
-                        if (g.selStart == g.selEnd) g.selStart = g.caret;
-                        g.selEnd = 0;
-                    } else {
-                        g.selStart = g.selEnd = 0;
-                    }
-                    g.caret = 0;
-                    AfterEdit();
-                    return 0;
-                case VK_END:
-                    if (shift) {
-                        if (g.selStart == g.selEnd) g.selStart = g.caret;
-                        g.selEnd = g.text.size();
-                    } else {
-                        g.selStart = g.selEnd = g.text.size();
-                    }
-                    g.caret = g.text.size();
-                    AfterEdit();
-                    return 0;
-                case VK_BACK:
-                    if (DeleteSelection()) {
-                        AfterEdit();
-                    } else if (g.caret > 0) {
-                        g.text.erase(g.caret - 1, 1);
-                        g.caret--;
-                        AfterEdit();
-                    }
-                    return 0;
-                case VK_DELETE:
-                    if (DeleteSelection()) {
-                        AfterEdit();
-                    } else if (g.caret < g.text.size()) {
-                        g.text.erase(g.caret, 1);
-                        AfterEdit();
-                    }
-                    return 0;
-                case 'A':
-                    if (ctrl) SelectAll();
-                    return 0;
-                case 'V':
-                    if (ctrl) Paste();
-                    return 0;
-                case 'C':
-                    if (ctrl) CopySelection();
-                    return 0;
-                case 'X':
-                    if (ctrl) {
-                        CopySelection();
-                        if (DeleteSelection()) AfterEdit();
-                    }
-                    return 0;
-                default:
-                    break;
-            }
-            break;
-        }
-
-        case WM_SYSKEYDOWN: {
-            // 仅处理本软件自带的 Alt+数字 / Alt+字母 快捷键：输入框聚焦时最高优先级、独占执行。
-            // 其它 Alt+ 组合（Alt+F4 / Alt 单独等）不拦截，交给系统默认行为。
-            if (GetFocus() == g.hwnd && g.hotkeyMode != 2) {
-                if (TryAltHotkey(wParam)) return 0;
-            }
-            break;
-        }
-
-        case WM_CHAR:
-            if (wParam >= 32) {
-                WCHAR ch = (WCHAR)wParam;
-                InsertChars(&ch, 1);
-            }
-            return 0;
-
-        case WM_IME_SETCONTEXT:
-            // 组合串由主窗口自绘内联渲染：屏蔽系统浮动组合窗（浅色"临时字"浮窗）
-            if (wParam) SetImePos();
-            return DefWindowProcW(hwnd, msg, wParam,
-                                  lParam & ~(LPARAM)ISC_SHOWUICOMPOSITIONWINDOW);
-
-        case WM_IME_STARTCOMPOSITION:
-            SetImePos();
-            return DefWindowProcW(hwnd, msg, wParam, lParam);
-
-        case WM_IME_CHAR:
-            // 上屏文本已通过 WM_IME_COMPOSITION(GCS_RESULTSTR) 插入，
-            // 此处吞掉 IME 产生的 WM_IME_CHAR，避免结果文字重复插入。
-            return 0;
-
-        case WM_IME_ENDCOMPOSITION:
-            g.compText.clear();
-            InvalidateRect(hwnd, &RECT{0, 0, S(kBaseW), S(kBaseInputH)}, FALSE);
-            return DefWindowProcW(hwnd, msg, wParam, lParam);
-
-        case WM_IME_COMPOSITION:
-            SetImePos();
-            if (lParam & GCS_RESULTSTR) {
-                g.compText.clear();  // 先清组合串再上屏，避免同步重绘时画出旧文本
-                HIMC hIMC = ImmGetContext(hwnd);
-                if (hIMC) {
-                    LONG bytes = ImmGetCompositionStringW(hIMC, GCS_RESULTSTR, nullptr, 0);
-                    if (bytes > 0) {
-                        std::vector<WCHAR> buf(bytes / sizeof(WCHAR) + 1, 0);
-                        ImmGetCompositionStringW(hIMC, GCS_RESULTSTR, buf.data(), bytes);
-                        InsertChars(buf.data(), wcslen(buf.data()));
-                    }
-                    ImmReleaseContext(hwnd, hIMC);
-                }
-                return 0;
-            }
-            if (lParam & GCS_COMPSTR) {
-                // 取组合中文本，交由 Paint 内联渲染
-                HIMC hIMC = ImmGetContext(hwnd);
-                if (hIMC) {
-                    LONG bytes = ImmGetCompositionStringW(hIMC, GCS_COMPSTR, nullptr, 0);
-                    if (bytes > 0) {
-                        std::vector<WCHAR> buf(bytes / sizeof(WCHAR) + 1, 0);
-                        ImmGetCompositionStringW(hIMC, GCS_COMPSTR, buf.data(), bytes);
-                        g.compText.assign(buf.data(), wcslen(buf.data()));
-                    } else {
-                        g.compText.clear();
-                    }
-                    ImmReleaseContext(hwnd, hIMC);
-                }
-                InvalidateRect(hwnd, &RECT{0, 0, S(kBaseW), S(kBaseInputH)}, FALSE);
-                return 0;
-            }
-            if (!lParam) {  // 组合被整体清除
-                g.compText.clear();
-                InvalidateRect(hwnd, &RECT{0, 0, S(kBaseW), S(kBaseInputH)}, FALSE);
-            }
-            break;
-
-        case WM_CONTEXTMENU: {
-            // 结果列表右键菜单（lParam==-1 表示键盘 Shift+F10 / 应用键）
-            POINT p{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-            bool keyboard = (p.x == -1 && p.y == -1);
-            if (!keyboard) ScreenToClient(hwnd, &p);
-            int idx = keyboard ? g.sel : -1;
-            int inputH = S(kBaseInputH), rowH = S(kBaseRowH);
-            int rowsTop = inputH + S(kBaseCardGapTop);
-            if (!keyboard && p.y >= rowsTop && !g.items.empty()) {
-                idx = (p.y - rowsTop) / rowH;
-                if (idx >= (int)g.items.size()) idx = -1;
-            }
-            if (idx >= 0 && idx < (int)g.items.size()) {
-                g.sel = idx;
-                RepaintNow();
-                ShowRowMenu(hwnd);
-            }
-            return 0;
-        }
-
-        case WM_MOUSEMOVE: {
-            int x = GET_X_LPARAM(lParam);
-            int y = GET_Y_LPARAM(lParam);
-            int inputH = S(kBaseInputH), rowH = S(kBaseRowH);
-            int rowsTop = inputH + S(kBaseCardGapTop);
-            // 拖拽选区中：随鼠标移动扩展 selEnd，光标跟到末尾
-            if (g.dragging) {
-                size_t pos = CaretFromX(x);
-                g.selEnd = pos;
-                g.caret = pos;
-                RepaintNow();
-                return 0;
-            }
-            int idx = -1;
-            if (y >= rowsTop && !g.items.empty()) {
-                idx = (y - rowsTop) / rowH;
-                if (idx < 0 || idx >= (int)g.items.size()) idx = -1;
-            }
-            // 悬停行变化：触发 hover 补间动画（进入→提亮，离开→回落）
-            if (idx != g.hoverRow) {
-                g.hoverRow = idx;
-                StartTween(&g.hoverT, idx >= 0 ? 1.0 : 0.0, g.theme ? g.theme->animMs : 200);
-            }
-            if (idx >= 0 && idx != g.sel) {
-                g.sel = idx;
-                RepaintNow();
-            }
-            // 武装 WM_MOUSELEAVE：鼠标移出结果列表区时清悬停态
-            TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd, 0};
-            TrackMouseEvent(&tme);
-            return 0;
-        }
-
-        case WM_MOUSELEAVE: {
-            if (g.hoverRow != -1) {
-                g.hoverRow = -1;
-                StartTween(&g.hoverT, 0.0, g.theme ? g.theme->animMs : 200);
-            }
-            return 0;
-        }
-
-        case WM_LBUTTONDOWN: {
-            int x = GET_X_LPARAM(lParam);
-            int y = GET_Y_LPARAM(lParam);
-            int inputH = S(kBaseInputH), rowH = S(kBaseRowH);
-            int rowsTop = inputH + S(kBaseCardGapTop);
-            if (y >= rowsTop && !g.items.empty()) {
-                int idx = (y - rowsTop) / rowH;
-                if (idx >= 0 && idx < (int)g.items.size()) {
-                    g.sel = idx;
-                    g.pressRow = idx;
-                    StartTween(&g.pressT, 1.0, 90);  // 按下瞬间轻微下沉（点击即执行，仅一闪）
-                    ExecuteSelected();
-                }
-            } else {
-                // 输入行：放置光标，准备拖拽选区
-                SetFocus(hwnd);
-                size_t pos = CaretFromX(x);
-                g.caret = pos;
-                if (!(GetKeyState(VK_SHIFT) & 0x8000)) {
-                    g.selStart = g.selEnd = pos;
-                } else {
-                    g.selEnd = pos;  // 锚点 selStart 不变，扩展到 pos
-                }
-                g.dragging = true;
-                SetCapture(hwnd);
-                Refresh();
-            }
-            return 0;
-        }
-
-        case WM_LBUTTONDBLCLK: {
-            int y = GET_Y_LPARAM(lParam);
-            if (y < S(kBaseInputH)) {
-                SetFocus(hwnd);
-                size_t pos = CaretFromX(GET_X_LPARAM(lParam));
-                size_t a, b;
-                WordBoundsAt(pos, a, b);
-                g.selStart = a;
-                g.selEnd = b;
-                g.caret = b;
-                Refresh();
-            }
-            return 0;
-        }
-
-        case WM_LBUTTONUP: {
-            if (g.pressRow != -1) {
-                g.pressRow = -1;
-                StartTween(&g.pressT, 0.0, 120);
-            }
-            if (g.dragging) {
-                g.dragging = false;
-                ReleaseCapture();
-            }
-            return 0;
-        }
-
-        case WM_SETCURSOR: {
-            POINT p;
-            GetCursorPos(&p);
-            ScreenToClient(hwnd, &p);
-            if (p.y < S(kBaseInputH)) {
-                SetCursor(LoadCursorW(nullptr, IDC_IBEAM));
-                return TRUE;
-            }
-            break;
         }
 
         default:
@@ -6490,7 +4484,7 @@ static LRESULT CALLBACK NoticeProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 
 // 显示弹窗并等待其关闭；autoCloseMs > 0 时到点自动关闭
 static void ShowNotice(const std::wstring& title, const std::wstring& body,
-                       const std::wstring& btn, int autoCloseMs = 0) {
+                       const std::wstring& btn, int autoCloseMs) {
     static bool registered = false;
     if (!registered) {
         WNDCLASSEXW nc{};
@@ -6530,273 +4524,10 @@ static void ShowNotice(const std::wstring& title, const std::wstring& body,
     }
 }
 
-// ---------------- 屏幕居中轻量 toast（半透明无边界药丸） ----------------
-// 打开成功 / top 置顶等场景共用：出现在目标窗口所在屏幕的正中间，
-// 半透明药丸 + 柔和外投影、无描边无边界；文字保持完全不透明。
-// 用 UpdateLayeredWindow 逐像素 alpha 合成（预乘 BGRA），
-// 淡入 120ms → 停留 1.3s → 淡出 150ms，按 16ms 定时器重建位图；
-// 非阻塞（不开嵌套消息循环）、WS_EX_NOACTIVATE 不抢焦点、点击穿透。
-struct TopToastData {
-    std::wstring text;
-    COLORREF fill = 0;          // 药丸填充色（跟随主题）
-    COLORREF textColor = 0;     // 文字色（跟随主题）
-    int fillA = 165;            // 药丸不透明度 0..255
-    int shadowA = 95;           // 投影（贴边）不透明度
-    int W = 0, H = 0;           // 位图/窗口尺寸（含投影留白，逻辑像素）
-    int pl = 0, pr = 0;         // 药丸左右边界（位图像素）
-    int cy = 0, r = 0;          // 药丸垂直中心与半径
-    int shadowR = 0;            // 投影外扩半径
-    int baseX = 0, baseY = 0;   // 窗口位置（屏幕坐标）
-    DWORD t0 = 0;               // 淡入起始时间
-    int phase = 0;              // 0=淡入, 1=停留, 2=淡出
-    DWORD phaseT0 = 0;          // 当前阶段起始时间
-};
-
-// 像素中心到水平线段的距离（药丸 = 线段 + 半径的并集）
-static inline float ToastDistToSeg(float px, float py, float x0, float y0,
-                                   float x1, float y1) {
-    float dx = x1 - x0, dy = y1 - y0;
-    float len2 = dx * dx + dy * dy;
-    float t = len2 > 0 ? ((px - x0) * dx + (py - y0) * dy) / len2 : 0.f;
-    if (t < 0.f) t = 0.f; else if (t > 1.f) t = 1.f;
-    float ex = px - (x0 + t * dx), ey = py - (y0 + t * dy);
-    return sqrtf(ex * ex + ey * ey);
-}
-
-// 合成一帧：外投影 + 半透明药丸 + 不透明文字 → 32bpp 预乘 alpha 位图。
-// m = 整体不透明度倍率（淡入淡出）。文字掩膜由 GDI 抗锯齿绘制，灰度即覆盖率。
-static HBITMAP BuildToastFrame(const TopToastData& nd, HFONT font, float m) {
-    if (nd.W <= 0 || nd.H <= 0) return nullptr;
-    BITMAPINFO bi{};
-    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
-    bi.bmiHeader.biWidth = nd.W;
-    bi.bmiHeader.biHeight = -nd.H;   // top-down
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    void* bits = nullptr;
-    HBITMAP bmp = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    if (!bmp || !bits) { if (bmp) DeleteObject(bmp); return nullptr; }
-    memset(bits, 0, (size_t)nd.W * nd.H * 4);
-
-    // 文字掩膜：黑底白字（GDI 抗锯齿），灰度 = 文字覆盖率
-    HBITMAP tmBmp = nullptr;
-    HDC tdc = CreateCompatibleDC(nullptr);
-    const BYTE* tb = nullptr;
-    if (tdc) {
-        void* tbits = nullptr;
-        tmBmp = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &tbits, nullptr, 0);
-        if (tmBmp && tbits) {
-            memset(tbits, 0, (size_t)nd.W * nd.H * 4);
-            SelectObject(tdc, tmBmp);
-            HBRUSH blk = CreateSolidBrush(RGB(0, 0, 0));
-            RECT full{0, 0, nd.W, nd.H};
-            FillRect(tdc, &full, blk);
-            DeleteObject(blk);
-            SetBkMode(tdc, TRANSPARENT);
-            SetTextColor(tdc, RGB(255, 255, 255));
-            SelectObject(tdc, font);
-            RECT tr{nd.pl + S(20), 0, nd.pr - S(20), nd.H};
-            DrawTextW(tdc, nd.text.c_str(), (int)nd.text.size(), &tr,
-                      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-            tb = (const BYTE*)tbits;
-        }
-    }
-
-    if (tb) {
-        BYTE* p = (BYTE*)bits;
-        float fr = (float)GetRValue(nd.fill), fg = (float)GetGValue(nd.fill), fb = (float)GetBValue(nd.fill);
-        float cr = (float)GetRValue(nd.textColor), cg = (float)GetGValue(nd.textColor), cb = (float)GetBValue(nd.textColor);
-        for (int y = 0; y < nd.H; ++y) {
-            for (int x = 0; x < nd.W; ++x) {
-                size_t i = (size_t)y * nd.W + x;
-                float tm = tb[i * 4] / 255.f;              // 文字覆盖率
-                float d = ToastDistToSeg(x + 0.5f, y + 0.5f, (float)nd.pl + nd.r,
-                                         (float)nd.cy, (float)nd.pr - nd.r, (float)nd.cy);
-                float cov = (float)nd.r + 0.5f - d;        // 药丸覆盖率（抗锯齿边缘）
-                if (cov < 0.f) cov = 0.f; else if (cov > 1.f) cov = 1.f;
-                // 药丸填充 + 外侧投影（二次衰减，只在药丸外）
-                float a = cov * (float)nd.fillA;
-                float sd = d - nd.r;
-                if (sd > 0.f && sd < (float)nd.shadowR) {
-                    float k = 1.f - sd / (float)nd.shadowR;
-                    float sh = k * k * (float)nd.shadowA;
-                    if (sh > a) a = sh;
-                }
-                // 颜色：文字处向文字色插值；药丸内用填充色；纯投影区黑色
-                float rr, gg, bb;
-                if (tm > 0.f) {
-                    rr = fr + (cr - fr) * tm;
-                    gg = fg + (cg - fg) * tm;
-                    bb = fb + (cb - fb) * tm;
-                } else if (cov > 0.f) {
-                    rr = fr; gg = fg; bb = fb;
-                } else {
-                    rr = gg = bb = 0.f;
-                }
-                float ta = tm * 255.f;                    // 文字保持完全不透明
-                if (ta > a) a = ta;
-                a *= m;
-                if (a < 1.f) continue;                    // 全透明像素不动（已清零）
-                if (a > 255.f) a = 255.f;
-                p[i * 4]     = (BYTE)(bb * a / 255.f);    // 预乘 BGRA
-                p[i * 4 + 1] = (BYTE)(gg * a / 255.f);
-                p[i * 4 + 2] = (BYTE)(rr * a / 255.f);
-                p[i * 4 + 3] = (BYTE)a;
-            }
-        }
-    }
-    if (tdc) DeleteDC(tdc);
-    if (tmBmp) DeleteObject(tmBmp);
-    return bmp;
-}
-
-// 把当前帧推送到分层窗口（位置不变，仅内容/透明度变化）
-static void ToastPushFrame(HWND h, const TopToastData& nd, HFONT font, float m) {
-    HBITMAP bmp = BuildToastFrame(nd, font, m);
-    if (!bmp) return;
-    HDC wdc = GetDC(h);
-    if (wdc) {
-        HDC mem = CreateCompatibleDC(wdc);
-        if (mem) {
-            HGDIOBJ old = SelectObject(mem, bmp);
-            POINT ptSrc{0, 0};
-            SIZE sz{nd.W, nd.H};
-            POINT ptDst{nd.baseX, nd.baseY};
-            BLENDFUNCTION bf{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-            UpdateLayeredWindow(h, wdc, &ptDst, &sz, mem, &ptSrc, 0, &bf, ULW_ALPHA);
-            SelectObject(mem, old);
-        }
-        DeleteDC(mem);
-    }
-    ReleaseDC(h, wdc);
-    DeleteObject(bmp);
-}
-
-static LRESULT CALLBACK TopToastProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
-    switch (msg) {
-        case WM_CREATE: {
-            const TopToastData* nd = (const TopToastData*)((CREATESTRUCTW*)lp)->lpCreateParams;
-            TopToastData* self = nd ? new TopToastData(*nd) : new TopToastData();
-            if (self) { self->t0 = GetTickCount(); self->phase = 0; }
-            SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)self);
-            SetTimer(h, 2, 16, nullptr);   // 淡入动画
-            return 0;
-        }
-        case WM_NCHITTEST:                // 点击穿透：不挡下方窗口的操作
-            return HTTRANSPARENT;
-        case WM_TIMER:
-            if (wp == 1) {  // 停留结束 → 进入淡出
-                KillTimer(h, 1);
-                TopToastData* nd = (TopToastData*)GetWindowLongPtrW(h, GWLP_USERDATA);
-                if (nd) { nd->phase = 2; nd->phaseT0 = GetTickCount(); }
-                SetTimer(h, 2, 16, nullptr);
-                return 0;
-            }
-            if (wp == 2) {  // 淡入 / 淡出：重建位图推送到分层窗口
-                TopToastData* nd = (TopToastData*)GetWindowLongPtrW(h, GWLP_USERDATA);
-                if (!nd) break;
-                DWORD now = GetTickCount();
-                float m = 1.f;
-                if (nd->phase == 0) {
-                    double p = (double)(now - nd->t0) / 120.0; if (p > 1) p = 1;
-                    m = (float)(1 - pow(1 - p, 3));           // ease-out cubic
-                    if (p >= 1) {
-                        KillTimer(h, 2);                      // 停留期间不跑动画定时器（省资源）
-                        nd->phase = 1;
-                        SetTimer(h, 1, 1300, nullptr);        // 停留 1.3s
-                    }
-                } else if (nd->phase == 2) {
-                    double p = (double)(now - nd->phaseT0) / 150.0; if (p > 1) p = 1;
-                    m = (float)(1 - p);
-                    if (p >= 1) { DestroyWindow(h); return 0; }
-                } else {
-                    return 0;                                 // 停留期定时器已停，防御性返回
-                }
-                HFONT font = g.fontPool[FontSlot((g.theme ? g.theme->fontInput : 16) + 1)];
-                ToastPushFrame(h, *nd, font, m);
-                return 0;
-            }
-            break;
-        case WM_DESTROY:
-            KillTimer(h, 1); KillTimer(h, 2);
-            delete (TopToastData*)GetWindowLongPtrW(h, GWLP_USERDATA);
-            SetWindowLongPtrW(h, GWLP_USERDATA, 0);
-            return 0;
-    }
-    return DefWindowProcW(h, msg, wp, lp);
-}
-
-// 在目标窗口所在屏幕的正中央弹出半透明 toast（无目标时主屏居中），非阻塞、自动消失
-static void ShowTopToast(HWND target, const std::wstring& text) {
-    // Slint 引擎：由渲染器画一个独立的无边框置顶小窗，视觉与启动器一致
-    if (g.uiEngine == 1 && SlintUiWindow()) {
-        SlintShowToast(text);
-        return;
-    }
-    static bool registered = false;
-    if (!registered) {
-        WNDCLASSEXW nc{};
-        nc.cbSize = sizeof(nc);
-        nc.lpfnWndProc = TopToastProc;
-        nc.hInstance = g.inst;
-        nc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        nc.lpszClassName = L"FlowtaryTopToast";
-        if (RegisterClassExW(&nc)) registered = true;
-    }
-    if (!g.theme) return;
-    // 按文本实测宽度决定尺寸（设上限防过宽）
-    HFONT font = g.fontPool[FontSlot(g.theme->fontInput + 1)];
-    HDC dc = GetDC(nullptr);
-    HGDIOBJ oldFont = (HFONT)SelectObject(dc, font);
-    SIZE sz{};
-    GetTextExtentPoint32W(dc, text.c_str(), (int)text.size(), &sz);
-    SelectObject(dc, oldFont);
-    ReleaseDC(nullptr, dc);
-
-    const int shadowR = S(10);
-    const int pillH = S(40);
-    int W = sz.cx + S(20) * 2 + shadowR * 2;
-    int maxW = S(420);
-    if (W > maxW) W = maxW;
-    if (W < S(120)) W = S(120);
-    int H = pillH + shadowR * 2;
-
-    // 定位：目标窗口所在显示器的工件区正中央
-    MONITORINFO mi{};
-    mi.cbSize = sizeof(mi);
-    HMONITOR mon = target ? MonitorFromWindow(target, MONITOR_DEFAULTTONEAREST)
-                          : MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
-    if (!GetMonitorInfoW(mon, &mi)) {
-        mi.rcWork.left = 0; mi.rcWork.top = 0;
-        mi.rcWork.right = GetSystemMetrics(SM_CXSCREEN);
-        mi.rcWork.bottom = GetSystemMetrics(SM_CYSCREEN);
-    }
-    int x = mi.rcWork.left + ((mi.rcWork.right - mi.rcWork.left) - W) / 2;
-    int y = mi.rcWork.top + ((mi.rcWork.bottom - mi.rcWork.top) - H) / 2;
-
-    TopToastData nd{text};
-    nd.W = W; nd.H = H;
-    nd.shadowR = shadowR;
-    nd.pl = shadowR; nd.pr = W - shadowR;
-    nd.cy = H / 2;
-    nd.r = pillH / 2;
-    nd.baseX = x; nd.baseY = y;
-    // 填充色跟随主题：暗色用输入框底色，浅色用卡片底色；文字用主题主文字色
-    nd.fill = g.theme->dark ? g.theme->bgInput : g.theme->bgCard;
-    nd.textColor = g.theme->text;
-    nd.fillA = g.theme->dark ? 160 : 170;
-
-    HWND h = CreateWindowExW(WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-                             L"FlowtaryTopToast", L"", WS_POPUP,
-                             x, y, W, H, nullptr, nullptr, g.inst, &nd);
-    if (!h) return;
-    ToastPushFrame(h, nd, font, 0.f);   // 首帧全透明，由定时器淡入
-    ShowWindow(h, SW_SHOWNOACTIVATE);   // 不抢焦点、不进入任务栏/Alt-Tab
-}
+// 屏幕居中轻提示：由 Slint 渲染器画独立无边框置顶小窗
+static void ShowTopToast(const std::wstring& text) { SlintShowToast(text); }
 
 // ---------------- 单实例：区分「同版本重复启动」与「新版本替换启动」 ----------------
-// 版本戳 = 本 exe 路径 + 最后修改时间。运行中的实例把戳写进注册表；
-// 后启动的进程比对：一致 → 同一个构建，属重复启动；不一致 → 新版本，接管。
 struct BuildStamp {
     std::wstring path;
     unsigned long long stamp = 0;
@@ -6906,9 +4637,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
                              L"Flowtary", WS_POPUP, 0, 0, S(kBaseW), S(kBaseInputH), nullptr,
                              nullptr, hInst, nullptr);
     if (!g.hwnd) return 1;
-    ApplyRoundCorners(g.hwnd);
-    ApplyGlass(g.hwnd);  // 系统亚克力玻璃：分层窗口 alpha 透出背后 + DWM 模糊
-    ApplyTheme();  // 应用主题：透明度、字体、刷子、菜单深色、星点
+    ApplyTheme();  // 应用主题：字体与菜单深浅
     fdj_init(g.hwnd);  // 文件对话框“文件夹原地跳转”增强（类 Listary Quick-Switch）
 
     // 唤起快捷键：仅当开关开启时注册，依次尝试 Alt+Space -> Alt+Q -> Ctrl+Alt+Space
