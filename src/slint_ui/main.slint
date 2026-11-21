@@ -209,6 +209,7 @@ export component MainWindow inherits Window {
     in-out property <color> th-sel-b: #4da6ff22;
     in-out property <color> th-on-accent: #ffffff;
     in-out property <length> th-radius: 22px;
+    in-out property <image> shadow-img;   // C++ 生成的柔和投影
 
     // 唤起动效：内容淡入 + 轻微上浮（由 C++ 在 show 后触发）
     // 默认 true：渲染器启动时先建窗口，避免首帧出现空面板
@@ -227,6 +228,16 @@ export component MainWindow inherits Window {
     callback alias-committed(string);
     callback alias-cancelled();
 
+    // —— 柔和投影（C++ 生成的模糊位图，画布比面板大 24px、下移 8px）——
+    Image {
+        x: 32px - 24px;
+        y: 32px - 24px + 8px;
+        width: parent.width - 64px + 48px;
+        height: parent.height - 64px + 48px;
+        source: root.shadow-img;
+        opacity: root.revealed ? 1 : 0;
+        animate opacity { duration: 150ms; easing: ease-out; }
+    }
     // —— 面板底板：外投影 + 主题渐变 + 顶部高光 ——
     // 窗口四周留 32px 透明边距容纳完整投影（与 C++ 的 kUiMargin 对应）
     Rectangle {
@@ -236,11 +247,9 @@ export component MainWindow inherits Window {
         animate opacity { duration: 150ms; easing: ease-out; }
         border-radius: root.th-radius;
         background: transparent;
+        // 不透明描边：正好压住亚克力背板的 1 位硬边，四角才不会露出锯齿/第二层线
         border-width: 1px;
-        border-color: #ffffff1f;
-        drop-shadow-blur: 18px;
-        drop-shadow-color: #0000004d;
-        drop-shadow-offset-y: 4px;
+        border-color: #1c2028;
 
         // 玻璃底色：单独一层并留一点透，DWM 模糊从背后透上来
         Rectangle {

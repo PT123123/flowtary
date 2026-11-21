@@ -19,6 +19,8 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <cstdint>
 #include <cwchar>
 #include <cwctype>
 #include <memory>
@@ -157,6 +159,101 @@ static unsigned g_glassTint = 0x8A181218;  // ABGR，随主题底色更新
 static int g_uiRadius = 20;                // 面板圆角（逻辑 px），与 Slint 的 th-radius 同步
 static bool g_glassArmed = false;          // 面板定位好并开始淡入后才允许背板出现
 
+// ---- 面板投影 ----
+// Slint 的软件渲染器实测不画 drop-shadow，这里自己生成一张模糊圆角阴影图交给 Slint，
+// 比叠描边干净，四角也不会出现分层。
+static int g_shadowW = 0, g_shadowH = 0, g_shadowR = 0;
+static MainWindow* g_uiRaw = nullptr;
+
+static void box_blur_h(std::vector<float>& a, int w, int h, int r)
+{
+    if (r <= 0) return;
+    std::vector<float> tmp(a.size());
+    const float inv = 1.f / (2 * r + 1);
+    for (int y = 0; y < h; ++y) {
+        const float* src = a.data() + (size_t)y * w;
+        float* dst = tmp.data() + (size_t)y * w;
+        float sum = 0.f;
+        for (int x = -r; x <= r; ++x) sum += src[std::clamp(x, 0, w - 1)];
+        for (int x = 0; x < w; ++x) {
+            dst[x] = sum * inv;
+            sum += src[(std::min)(x + r + 1, w - 1)] - src[(std::max)(x - r, 0)];
+        }
+    }
+    a.swap(tmp);
+}
+
+static void box_blur_v(std::vector<float>& a, int w, int h, int r)
+{
+    if (r <= 0) return;
+    std::vector<float> tmp(a.size());
+    const float inv = 1.f / (2 * r + 1);
+    for (int x = 0; x < w; ++x) {
+        float sum = 0.f;
+        for (int y = -r; y <= r; ++y) sum += a[(size_t)std::clamp(y, 0, h - 1) * w + x];
+        for (int y = 0; y < h; ++y) {
+            tmp[(size_t)y * w + x] = sum * inv;
+            sum += a[(size_t)(std::min)(y + r + 1, h - 1) * w + x]
+                 - a[(size_t)(std::max)(y - r, 0) * w + x];
+        }
+    }
+    a.swap(tmp);
+}
+
+// panelW/H、radius 都是物理像素；画布比面板大 2*pad，向下偏移 off
+static void regen_panel_shadow(int panelW, int panelH, int radius, UINT dpi)
+{
+    if (!g_uiRaw || panelW <= 0 || panelH <= 0) return;
+    const int pad = MulDiv(24, (int)dpi, 96);
+    const int off = MulDiv(8, (int)dpi, 96);
+    const int W = panelW + pad * 2, H = panelH + pad * 2;
+    if (W == g_shadowW && H == g_shadowH && radius == g_shadowR) return;
+    g_shadowW = W; g_shadowH = H; g_shadowR = radius;
+
+    std::vector<float> mask((size_t)W * H, 0.f);
+    std::vector<float> sdf((size_t)W * H, 0.f);
+    const float cx = W * 0.5f;
+    const float cy = H * 0.5f - (float)off;
+    const float hw = panelW * 0.5f, hh = panelH * 0.5f;
+    const float r = (float)(std::max)(1, radius);
+    for (int y = 0; y < H; ++y) {
+        const float py = y + 0.5f;
+        float* row = mask.data() + (size_t)y * W;
+        float* srow = sdf.data() + (size_t)y * W;
+        for (int x = 0; x < W; ++x) {
+            const float dx = std::fabs((x + 0.5f) - cx) - (hw - r);
+            const float dy = std::fabs(py - cy) - (hh - r);
+            const float ox = (std::max)(dx, 0.f), oy = (std::max)(dy, 0.f);
+            const float dist = (std::min)((std::max)(dx, dy), 0.f) + std::sqrt(ox * ox + oy * oy) - r;
+            srow[x] = dist;
+            row[x] = std::clamp(0.5f - dist, 0.f, 1.f);
+        }
+    }
+    // 两层合成：贴边的一层收紧（接触阴影），外面一层铺开（环境阴影）
+    std::vector<float> wide = mask, tight = mask;
+    const int brWide = (std::max)(2, MulDiv(8, (int)dpi, 96));
+    const int brTight = (std::max)(1, MulDiv(2, (int)dpi, 96));
+    for (int i = 0; i < 3; ++i) {
+        box_blur_h(wide, W, H, brWide);
+        box_blur_v(wide, W, H, brWide);
+    }
+    for (int i = 0; i < 2; ++i) {
+        box_blur_h(tight, W, H, brTight);
+        box_blur_v(tight, W, H, brTight);
+    }
+
+    slint::SharedPixelBuffer<slint::Rgba8Pixel> buf(W, H);
+    auto* p = buf.begin();
+    for (size_t i = 0; i < mask.size(); ++i) {
+        const float v = tight[i] * 0.35f + wide[i] * 0.65f;
+        // 只保留面板轮廓之外的阴影：否则整块黑底会透进半透明玻璃，面板看起来发死
+        const float outside = std::clamp(sdf[i] + 0.5f, 0.f, 1.f);
+        const auto a = (uint8_t)std::clamp(v * 400.f * outside + 0.5f, 0.f, 255.f);
+        *p++ = slint::Rgba8Pixel { 0, 0, 0, a };
+    }
+    g_uiRaw->set_shadow_img(slint::Image(std::move(buf)));
+}
+
 static LRESULT CALLBACK GlassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
@@ -230,17 +327,16 @@ static void sync_glass(HWND ui)
     UINT dpi = GetDpiForWindow(ui);
     if (!dpi) dpi = 96;
     const int m = MulDiv(kUiMargin, (int)dpi, 96);
-    // 背板再往里收 1px：模糊边缘压在面板那根 1px 描边下面，避免露出第二层边
-    const int pad = MulDiv(1, (int)dpi, 96);
-    const int x = rc.left + m + pad, y = rc.top + m + pad;
-    const int w = (rc.right - rc.left) - (m + pad) * 2;
-    const int h = (rc.bottom - rc.top) - (m + pad) * 2;
+    const int x = rc.left + m, y = rc.top + m;
+    const int w = (rc.right - rc.left) - m * 2;
+    const int h = (rc.bottom - rc.top) - m * 2;
     if (w < 32 || h < 32) {
         hide_glass();
         return;
     }
-    int r = MulDiv(g_uiRadius, (int)dpi, 96);
-    if (r > pad) r -= pad;  // 圆角跟着内缩，保持与面板边缘平行
+    // 背板边缘与面板描边完全重合：不再内缩，避免内侧多出一圈暗边
+    const int r = MulDiv(g_uiRadius, (int)dpi, 96);
+    regen_panel_shadow(w, h, r, dpi);
     if (HRGN rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, r * 2, r * 2))
         SetWindowRgn(g_glass, rgn, TRUE);  // takes ownership
     // 没 arm 时只同步几何、保持隐藏：否则唤起瞬间会先看到一块模糊背板从旧位置跳过来
@@ -1145,6 +1241,7 @@ int main()
 
     auto ctx = std::make_shared<UiCtx>();
     g_ctx = ctx;
+    g_uiRaw = ctx->ui.operator->();
     parse_launch_args();
     ctx->model = std::make_shared<slint::VectorModel<ResultItem>>();
     ctx->ui->set_items(ctx->model);
