@@ -123,11 +123,13 @@ static LONG g_lastStateSeq = 0;
 static LONG g_lastCmdTail = 0;
 static bool g_uiActive = false;
 static bool g_brainSeen = false;
+static bool g_menuOpen = false;  // 主进程正弹结果右键菜单：期间不因失焦自动隐藏
 
 // 一行结果（来自主进程的状态槽）
 struct RowView {
     int kind = 0;
     int hotkey = 0;
+    int usage = 0;          // 历史使用次数（跨词点击权重 + 自学习）
     std::string title;      // utf8
     std::string sub;        // utf8
     std::string iconPath;   // utf8（图标来源路径，空 = 用文字徽标）
@@ -228,6 +230,20 @@ static void rebuild_model(UiCtx& ctx)
             it.hotkey = slint::SharedString(badge);
         }
         it.kind = r.kind;
+        // 使用次数分档：与 GDI 版一致（0-2 原样，3-9 常用，10-29 高频，>=30 重度），
+        // 只对本地程序/文件/文件夹生效，徽章显示「×N」。
+        int tier = 0;
+        if (r.kind == slintbridge::kRowProg || r.kind == slintbridge::kRowFile ||
+            r.kind == slintbridge::kRowFolder) {
+            if (r.usage >= 30) tier = 4;
+            else if (r.usage >= 10) tier = 3;
+            else if (r.usage >= 3) tier = 2;
+        }
+        it.usage_tier = tier;
+        if (tier) {
+            std::string badge = "\xC3\x97" + std::to_string(r.usage);  // ×N
+            it.usage_badge = slint::SharedString(badge.c_str());
+        }
         const char* gl = glyph_for(r.kind);
         it.glyph = slint::SharedString(gl);
         it.icon_bg = bg_for(r.kind);
@@ -253,7 +269,43 @@ static void remove_native_frame(HWND hwnd)
     }
 }
 
+// GDI 版启动器是 WS_EX_TOPMOST；winit 创建的窗口默认不是，会被其它窗口盖住
+static void apply_topmost(HWND hwnd)
+{
+    if (!hwnd) return;
+    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+}
+
 static void position_ui(HWND hwnd, bool center);
+
+// 与 main.slint 结果列表排版对应：y=70 起、行间距 2px、提示行 34px 其余 54px
+static int row_at_client_y(const UiCtx& ctx, int y)
+{
+    int top = 70;
+    for (int i = 0; i < (int)ctx.rows.size(); ++i) {
+        int h = ctx.rows[i].kind == slintbridge::kRowHint ? 34 : 54;
+        if (y >= top && y < top + h) return i;
+        top += h + 2;
+    }
+    return -1;
+}
+
+// 请求主进程弹第 idx 行的右键菜单（-1 = 当前选中行）。
+// 菜单由主进程创建（那里才有行数据和全部命令逻辑），这里先压住失焦隐藏。
+static void request_row_menu(int idx)
+{
+    if (!g_ctx || g_ctx->rows.empty()) return;
+    g_menuOpen = true;
+    // 菜单由主进程弹出，而此刻前台是本进程：允许大脑把菜单 owner 设为前台，
+    // 否则菜单收不到键盘（Esc/方向键），点菜单外也不会关闭。
+    if (g_brain && IsWindow(g_brain)) {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(g_brain, &pid);
+        if (pid) AllowSetForegroundWindow(pid);
+    }
+    send_req(slintbridge::kReqRowMenu, idx);
+}
 
 // 窗口高度：与 main.slint 的排版常量对应（70 行区起点 + 行高 + 12 底栏间距 + 34 底栏）
 static int compute_window_height(const UiCtx& ctx, bool hasQuery)
@@ -292,6 +344,7 @@ static void apply_state(UiCtx& ctx)
         RowView r;
         r.kind = h.kind;
         r.hotkey = h.hotkey;
+        r.usage = h.usage;
         r.title = take(h.titleLen);
         r.sub = take(h.subLen);
         r.iconPath = take(h.iconLen);
@@ -365,6 +418,7 @@ static void show_ui()
     apply_rounded_region(hwnd);
     position_ui(hwnd, ctx.centerWake);  // 先摆好位置再显示，避免旧位置闪一下
     ctx.ui->window().show();
+    apply_topmost(hwnd);
     if (hwnd) {
         DWORD myTid = GetCurrentThreadId();
         HWND fg = GetForegroundWindow();
@@ -374,7 +428,9 @@ static void show_ui()
         SetForegroundWindow(hwnd);
         if (attached) AttachThreadInput(myTid, fgTid, FALSE);
     }
-    g_uiActive = true;
+    // 只有真的拿到前台才算「活跃」：SetForegroundWindow 被系统拒绝时窗口虽显示，
+    // 键盘仍在前一个窗口，不能把它当成已激活（否则后续失焦逻辑会错乱）。
+    g_uiActive = (GetForegroundWindow() == hwnd);
     slint::Timer::single_shot(std::chrono::milliseconds(40), []() {
         if (!g_ctx) return;
         g_ctx->ui->invoke_focus_input();
@@ -415,6 +471,12 @@ static void on_bridge_update()
                 case slintbridge::kCmdShow: show_ui(); break;
                 case slintbridge::kCmdHide: hide_ui(); break;
                 case slintbridge::kCmdQuit: slint::quit_event_loop(); break;
+                case slintbridge::kCmdMenuBegin: g_menuOpen = true; break;
+                case slintbridge::kCmdMenuEnd:
+                    g_menuOpen = false;
+                    // 菜单关闭后主进程会把前台还回来，这里顺手把焦点给回搜索框
+                    if (g_ctx) g_ctx->ui->invoke_focus_input();
+                    break;
                 default: break;
             }
         }
@@ -453,8 +515,30 @@ static LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             // 动态高度：尺寸一落地就同步更新圆角区域，避免旧区域的残帧
             if (wp != SIZE_MINIMIZED) apply_rounded_region(hwnd);
             break;
+        case WM_KEYDOWN:
+            // 应用键：打开当前结果的右键菜单（与 GDI 版一致）
+            if (wp == VK_APPS) {
+                request_row_menu(-1);
+                return 0;
+            }
+            break;
+        case WM_RBUTTONUP: {
+            // 结果行右键菜单交给主进程弹（行数据与命令逻辑都在那边）
+            int y = (int)(short)HIWORD(lp);
+            UINT dpi = GetDpiForWindow(hwnd);
+            if (!dpi) dpi = 96;
+            int ly = MulDiv(y, 96, (int)dpi);  // 客户端像素 → Slint 逻辑像素
+            int idx = g_ctx ? row_at_client_y(*g_ctx, ly) : -1;
+            if (idx >= 0) request_row_menu(idx);
+            return 0;  // 输入框区域不弹系统编辑菜单
+        }
         case WM_SYSKEYDOWN: {
             WPARAM vk = wp;
+            // Shift+F10：打开当前结果的右键菜单（与 GDI 版一致）
+            if (vk == VK_F10 && (GetKeyState(VK_SHIFT) & 0x8000) != 0) {
+                request_row_menu(-1);
+                return 0;
+            }
             bool digit = (vk >= '0' && vk <= '9') || (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9);
             bool letter = (vk >= 'A' && vk <= 'Z') || (vk >= 'a' && vk <= 'z');
             bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
@@ -471,7 +555,8 @@ static LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         case WM_ACTIVATE:
             if (LOWORD(wp) == WA_INACTIVE) {
-                if (g_uiActive) {
+                // 右键菜单归主进程所有，弹出时本窗口会短暂失焦，不能当成「点走了」
+                if (g_uiActive && !g_menuOpen) {
                     g_uiActive = false;
                     send_req(slintbridge::kReqHide);
                 }
@@ -569,8 +654,18 @@ int main()
     ctx->ui->on_move_selection([](int delta) {
         send_req(slintbridge::kReqNav, delta);
     });
+    // 回车：带上 Ctrl/Shift 语义（Ctrl=关闭、Ctrl+Shift=提权，与 GDI 版一致）；
+    // 鼠标点击走 item-clicked，永远是普通执行。
     ctx->ui->on_item_activated([](int idx) {
-        send_req(slintbridge::kReqActivate, idx);
+        int flags = 0;
+        if (GetKeyState(VK_CONTROL) & 0x8000) flags |= slintbridge::kActCtrl;
+        if (GetKeyState(VK_SHIFT) & 0x8000) flags |= slintbridge::kActShift;
+        int row = idx < 0 ? 0 : (idx & slintbridge::kActRowMask);
+        send_req(slintbridge::kReqActivate, row | flags);
+    });
+    ctx->ui->on_item_clicked([](int idx) {
+        int row = idx < 0 ? 0 : (idx & slintbridge::kActRowMask);
+        send_req(slintbridge::kReqActivate, row);
     });
     ctx->ui->on_escape_pressed([]() {
         send_req(slintbridge::kReqHide);
@@ -616,6 +711,7 @@ int main()
     remove_native_frame(h0);
     enable_acrylic(h0);
     apply_rounded_region(h0);
+    apply_topmost(h0);
     if (!g_origUiWndProc)
         g_origUiWndProc = (WNDPROC)SetWindowLongPtrW(h0, GWLP_WNDPROC, (LONG_PTR)UiWndProc);
     position_ui(h0, ctx->centerWake);

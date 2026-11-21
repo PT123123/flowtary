@@ -448,6 +448,7 @@ static void SlintSendCmd(int cmd);
 static void SlintHandleRequests();
 static bool TryAltHotkeyDirect(WPARAM wParam);
 static HWND SlintIpcWindow();
+static HWND SlintUiWindow();
 
 // 行 → 可触发序号（Hint 行不算）：返回第几个可执行项（用于分配数字徽章），-1=不可触发
 static int HotkeySeq(int itemIdx) {
@@ -2827,7 +2828,8 @@ static void ExecuteSelected(ExecKind ek = ExecKind::Normal) {
         LogHistoryOpen(g.items[g.sel]); // 台账记「这次实际点了哪条」，与权重分开：关了权重也留痕
         // 打开成功的轻量提示：贴在启动器原位顶部，淡入淡出自动消失（不抢焦点、不阻塞）
         std::wstring toast = OpenedToastText(g.items[g.sel]);
-        if (!toast.empty()) ShowTopToast(g.hwnd, toast);
+        // toast 按「启动器所在显示器」居中：Slint 引擎下启动器窗口属于渲染器
+        if (!toast.empty()) ShowTopToast(g.uiEngine == 1 ? SlintUiWindow() : g.hwnd, toast);
         Hide();
     }
 }
@@ -2955,6 +2957,51 @@ static void OwnerDrawMenuItem(HWND hwnd, DRAWITEMSTRUCT* dis) {
     DrawTextW(dis->hDC, text, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 }
 
+// 结果右键菜单的 owner 窗口。Slint 引擎下主窗口是隐藏的，隐藏窗口无法成为
+// 前台窗口，菜单收不到键盘（Esc/方向键关不掉）；用 1x1 全透明置顶工具窗做 owner，
+// 菜单就能正常收键盘，点菜单外面也会关闭。GDI 引擎仍用主窗口当 owner。
+static LRESULT CALLBACK MenuOwnerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+        case WM_MEASUREITEM:
+            OwnerMeasureMenuItem(hwnd, (MEASUREITEMSTRUCT*)lp);
+            return TRUE;
+        case WM_DRAWITEM:
+            OwnerDrawMenuItem(hwnd, (DRAWITEMSTRUCT*)lp);
+            return TRUE;
+        case WM_ERASEBKGND:
+            return 1;
+        default:
+            break;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static HWND EnsureMenuOwner()
+{
+    static HWND s_owner = nullptr;
+    if (s_owner && IsWindow(s_owner)) return s_owner;
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = MenuOwnerProc;
+        wc.hInstance = g.inst;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.lpszClassName = L"FlowtaryMenuOwner";
+        if (!RegisterClassExW(&wc)) return nullptr;
+        registered = true;
+    }
+    HWND h = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED,
+                             L"FlowtaryMenuOwner", L"", WS_POPUP, -32000, -32000, 1, 1,
+                             nullptr, nullptr, g.inst, nullptr);
+    if (!h) return nullptr;
+    SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);  // 完全透明，只用来当 owner
+    ShowWindow(h, SW_SHOWNOACTIVATE);
+    s_owner = h;
+    return h;
+}
+
 static void ShowRowMenu(HWND hwnd) {
     if (g.sel < 0 || g.sel >= (int)g.items.size()) return;
     Row& r = g.items[g.sel];
@@ -3012,7 +3059,7 @@ static void ShowRowMenu(HWND hwnd) {
                 RecordLearned(r);  // 右键打开成功同样记自学习
                 LogHistoryOpen(r);
                 std::wstring toast = OpenedToastText(r);
-                if (!toast.empty()) ShowTopToast(g.hwnd, toast);
+                if (!toast.empty()) ShowTopToast(g.uiEngine == 1 ? SlintUiWindow() : g.hwnd, toast);
             }
             break;
         case IDM_OPENLOC:
@@ -4429,7 +4476,7 @@ static void AddAliasForRow(const std::wstring& target, const std::wstring& defau
     g.learnedDirty = true;
     MarkUsageDirty();
     SaveLearnedNow();  // 立即落盘：别名马上可用，也和目录里的 .lnk 保持一致
-    ShowTopToast(g.hwnd, L"已添加别名：" + name);
+    ShowTopToast(g.uiEngine == 1 ? SlintUiWindow() : g.hwnd, L"已添加别名：" + name);
 }
 
 // 立即写盘：按排序键裁剪到上限（连带删除被挤出条目的 .lnk）后整体写出
@@ -5449,6 +5496,15 @@ static void SlintSendCmd(int cmd) {
     if (g.uiEngine != 1) return;
     SlintBridgeEnsure();
     if (!g.bridge) return;
+    if (cmd == slintbridge::kCmdShow) {
+        // 唤起时主进程刚收到热键，拥有前台授权；把它转授给渲染器，
+        // 否则渲染器 SetForegroundWindow 会被系统前台锁拒绝（窗口显示但打不了字）。
+        if (HWND ui = SlintUiWindow()) {
+            DWORD pid = 0;
+            GetWindowThreadProcessId(ui, &pid);
+            if (pid) AllowSetForegroundWindow(pid);
+        }
+    }
     LONG head = g.bridge->cmdHead;
     LONG tail = g.bridge->cmdTail;
     if (head - tail >= (LONG)(sizeof(g.bridge->cmd) / sizeof(g.bridge->cmd[0]))) return;  // 满了就丢
@@ -5490,8 +5546,39 @@ static void SlintHandleRequests() {
                 break;
             }
             case slintbridge::kReqActivate: {
-                if (r.arg >= 0 && r.arg < (int)g.items.size()) g.sel = r.arg;
-                ExecuteSelected();
+                int idx = r.arg & slintbridge::kActRowMask;
+                bool ctrl = (r.arg & slintbridge::kActCtrl) != 0;
+                bool shift = (r.arg & slintbridge::kActShift) != 0;
+                if (idx >= 0 && idx < (int)g.items.size()) g.sel = idx;
+                // 与 GDI 版一致：Ctrl=关闭 / Ctrl+Shift=提权（窗口行另有语义）
+                ExecuteSelected(ResolveExecKind(ctrl, shift));
+                break;
+            }
+            case slintbridge::kReqRowMenu: {
+                static bool menuOpen = false;
+                if (menuOpen) break;  // 菜单自身的嵌套消息循环里不再重入
+                int idx = r.arg;
+                if (idx >= 0 && idx < (int)g.items.size()) {
+                    g.sel = idx;
+                    SlintPushState();  // 先把高亮挪到右键那一行
+                }
+                menuOpen = true;
+                // 菜单归主进程创建；先让渲染器别把失焦当成「点走了」而隐藏
+                SlintSendCmd(slintbridge::kCmdMenuBegin);
+                // Slint 模式主窗口是隐藏的，隐藏窗口当 owner 收不到键盘，
+                // 改用专用透明 owner（GDI 模式仍用主窗口）
+                HWND owner = (g.uiEngine == 1) ? EnsureMenuOwner() : nullptr;
+                if (!owner) owner = g.hwnd;
+                if (g.sel >= 0 && g.sel < (int)g.items.size() &&
+                    g.items[g.sel].kind != Row::Hint)
+                    ShowRowMenu(owner);
+                // 先把前台还给渲染器，再撤掉临时 owner，最后通知菜单结束（恢复聚焦）
+                if (owner != g.hwnd) {
+                    if (HWND ui = SlintUiWindow()) SetForegroundWindow(ui);
+                    ShowWindow(owner, SW_HIDE);
+                }
+                SlintSendCmd(slintbridge::kCmdMenuEnd);
+                menuOpen = false;
                 break;
             }
             case slintbridge::kReqHide:
@@ -5568,8 +5655,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (wParam == 1) {
                 // 输入框聚焦时屏蔽已注册的 Alt 热键（Alt+Space / Alt+Q / Ctrl+Alt+Space），
                 // 使其不再隐藏/切换窗口，仅 Alt+数字 生效（见 WM_SYSKEYDOWN）。
-                if (GetFocus() == g.hwnd) {
-                    AppendTrace("HOTKEY swallowed: focus is self while hotkey fired");
+                // Slint 引擎下启动器窗口属于渲染器进程，用前台窗口判断同一个语义。
+                bool launcherFocused = (g.uiEngine == 1)
+                                           ? (GetForegroundWindow() == SlintUiWindow())
+                                           : (GetFocus() == g.hwnd);
+                if (launcherFocused) {
+                    AppendTrace("HOTKEY swallowed: launcher focused while hotkey fired");
                     return 0;
                 }
                 AppendTrace(IsWindowVisible(hwnd) ? "HOTKEY toggle -> hide" : "HOTKEY toggle -> show");

@@ -55,7 +55,14 @@ enum ReqOp : int {
     kReqHide = 4,      // 隐藏启动器
     kReqAltKey = 5,    // Alt+数字 / Alt+字母，arg = 虚拟键码
     kReqReady = 6,     // 渲染器就绪（请下发状态并显示窗口）
+    kReqRowMenu = 7,   // 请求第 arg 行的右键菜单（arg < 0 = 当前选中行）
 };
+
+// kReqActivate 的 arg 编码：低 16 位是行号，高位是修饰键（与 GDI 版
+// 「Ctrl+回车=关闭 / Ctrl+Shift+回车=提权」的语义保持一致）
+constexpr int kActRowMask = 0xFFFF;
+constexpr int kActCtrl = 0x10000;
+constexpr int kActShift = 0x20000;
 
 // 状态命令（大脑 → 渲染器）
 enum StateCmd : int {
@@ -63,6 +70,8 @@ enum StateCmd : int {
     kCmdShow = 1,   // 显示窗口并聚焦输入框
     kCmdHide = 2,   // 隐藏窗口
     kCmdQuit = 3,   // 主进程退出，渲染器自行关闭
+    kCmdMenuBegin = 4, // 主进程要弹结果右键菜单：暂停「失焦自动隐藏」
+    kCmdMenuEnd = 5,   // 菜单已关闭：恢复失焦隐藏并聚焦输入框
 };
 
 // 行类型（与主程序 Row::Kind 的取值顺序一一对应，改动必须两边同步）
