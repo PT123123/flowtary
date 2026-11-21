@@ -195,10 +195,14 @@ static void ensure_glass()
         GetModuleHandleW(nullptr), nullptr);
     if (!g_glass) return;
     enable_acrylic(g_glass, g_glassTint);
-    // Win11：让 DWM 也按圆角裁一遍，避免区域与 DWM 圆角不一致时四角露出模糊
-    const DWORD kDwmwaCornerPref = 33;  // DWMWA_WINDOW_CORNER_PREFERENCE
-    int pref = 2;                       // DWMWCP_ROUND
+    // 形状完全交给 SetWindowRgn。DWM 若再按自己的半径圆角、并沿窗口画 1px 边框，
+    // 就会在面板内侧多出一圈弧线/白线（左上角最明显），所以这里禁用。
+    const DWORD kDwmwaCornerPref = 33;   // DWMWA_WINDOW_CORNER_PREFERENCE
+    int pref = 1;                        // DWMWCP_DONOTROUND
     DwmSetWindowAttribute(g_glass, kDwmwaCornerPref, &pref, sizeof(pref));
+    const DWORD kDwmwaBorderColor = 34;  // DWMWA_BORDER_COLOR
+    COLORREF none = 0xFFFFFFFE;          // DWMWA_COLOR_NONE
+    DwmSetWindowAttribute(g_glass, kDwmwaBorderColor, &none, sizeof(none));
 }
 
 static void set_glass_tint(unsigned tint)
@@ -444,6 +448,10 @@ static void remove_native_frame(HWND hwnd)
     const DWORD kDwmwaNcRenderingPolicy = 2;
     int ncPolicy = 1;  // DWMNCRP_DISABLED
     DwmSetWindowAttribute(hwnd, kDwmwaNcRenderingPolicy, &ncPolicy, sizeof(ncPolicy));
+    // Win11 的 1px DWM 边框也去掉，否则会沿窗口/面板顶边画一条白线
+    const DWORD kDwmwaBorderColor = 34;
+    COLORREF none = 0xFFFFFFFE;  // DWMWA_COLOR_NONE
+    DwmSetWindowAttribute(hwnd, kDwmwaBorderColor, &none, sizeof(none));
     LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
     LONG_PTR want = (style & ~(WS_CAPTION | WS_THICKFRAME | WS_BORDER | WS_DLGFRAME |
                                WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX)) | WS_POPUP;

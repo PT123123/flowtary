@@ -237,21 +237,10 @@ export component MainWindow inherits Window {
         border-radius: root.th-radius;
         background: transparent;
         border-width: 1px;
-        border-color: #ffffff24;
-
-        // 柔和投影：软件渲染不支持高斯模糊，用多层低透明度圆角描边叠出渐变
-        for i in 8: Rectangle {
-            x: -3px - i * 2.5px;
-            y: -3px - i * 2.5px + 5px;
-            width: parent.width + 6px + i * 5px;
-            height: parent.height + 6px + i * 5px;
-            border-radius: root.th-radius + 3px + i * 2.5px;
-            background: transparent;
-            border-width: 4px;
-            border-color: i == 0 ? #00000012 : i == 1 ? #00000010 : i == 2 ? #0000000d
-                        : i == 3 ? #0000000a : i == 4 ? #00000008 : i == 5 ? #00000006
-                        : i == 6 ? #00000004 : #00000002;
-        }
+        border-color: #ffffff1f;
+        drop-shadow-blur: 18px;
+        drop-shadow-color: #0000004d;
+        drop-shadow-offset-y: 4px;
 
         // 玻璃底色：单独一层并留一点透，DWM 模糊从背后透上来
         Rectangle {
@@ -266,29 +255,6 @@ export component MainWindow inherits Window {
             x: 1px; y: 1px; width: parent.width - 2px; height: 150px;
             border-radius: root.th-radius - 1px;
             background: @linear-gradient(180deg, root.th-glow 0%, transparent 100%);
-        }
-        // 玻璃斜向反光：左上亮、右下暗，制造薄玻璃的折射层次
-        Rectangle {
-            x: 1px; y: 1px; width: parent.width - 2px; height: parent.height - 2px;
-            border-radius: root.th-radius - 1px;
-            background: @linear-gradient(122deg,
-                #ffffff2a 0%,
-                #ffffff0c 18%,
-                transparent 45%,
-                transparent 70%,
-                #00000020 100%);
-        }
-        // 顶部镜面高光（避开 1px 边框，两端淡出）
-        Rectangle {
-            x: 20px; y: 2px; width: parent.width - 40px; height: 1px;
-            background: @linear-gradient(90deg,
-                transparent 0%, #ffffff70 24%, #ffffff70 76%, transparent 100%);
-        }
-        // 底部暗边，收住玻璃下缘
-        Rectangle {
-            x: 18px; y: parent.height - 3px; width: parent.width - 36px; height: 1px;
-            background: @linear-gradient(90deg,
-                transparent 0%, #00000055 24%, #00000055 76%, transparent 100%);
         }
 
     // —— 搜索区 ——
