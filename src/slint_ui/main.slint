@@ -55,8 +55,9 @@ component AliasCard inherits Rectangle {
         background: root.th-menu;
         border-width: 1px;
         border-color: #ffffff20;
-        drop-shadow-blur: 24px;
-        drop-shadow-color: #00000066;
+        drop-shadow-blur: 28px;
+        drop-shadow-color: #00000088;
+        drop-shadow-offset-y: 8px;
 
         Text {
             x: 20px; y: 16px; width: parent.width - 40px; height: 24px;
@@ -97,14 +98,15 @@ component AliasCard inherits Rectangle {
         Rectangle {
             x: parent.width - 178px; y: 118px; width: 72px; height: 32px;
             border-radius: 9px;
-            background: #ffffff0d;
+            background: cancel-ta.has-hover ? #ffffff16 : #ffffff0d;
             border-width: 1px; border-color: #ffffff18;
+            animate background { duration: 90ms; }
             Text {
                 width: 100%; height: 100%;
                 text: "取消"; color: #b9c3d6; font-size: 12px;
                 horizontal-alignment: center; vertical-alignment: center;
             }
-            TouchArea {
+            cancel-ta := TouchArea {
                 mouse-cursor: pointer;
                 clicked => { root.cancelled(); }
             }
@@ -112,20 +114,41 @@ component AliasCard inherits Rectangle {
         Rectangle {
             x: parent.width - 98px; y: 118px; width: 78px; height: 32px;
             border-radius: 9px;
-            background: root.th-accent-dark;
+            background: ok-ta.has-hover ? root.th-accent : root.th-accent-dark;
             border-width: 1px; border-color: root.th-accent-border;
+            animate background { duration: 90ms; }
             Text {
                 width: 100%; height: 100%;
                 text: "确认"; color: root.th-text; font-size: 12px; font-weight: 600;
                 horizontal-alignment: center; vertical-alignment: center;
             }
-            TouchArea {
+            ok-ta := TouchArea {
                 mouse-cursor: pointer;
                 clicked => { root.committed(root.value); }
             }
         }
     }
     init => { field.focus(); }
+}
+
+// 键帽：统一底部提示 / 空态标签的按键样式
+component Keycap inherits Rectangle {
+    in property <string> label;
+    height: 20px;
+    width: max(22px, cap-text.preferred-width + 14px);
+    border-radius: 6px;
+    background: #ffffff0a;
+    border-width: 1px;
+    border-color: #ffffff16;
+    cap-text := Text {
+        width: 100%; height: 100%;
+        text: root.label;
+        color: #aeb8c9;
+        font-size: 10.5px;
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
 }
 
 export component MainWindow inherits Window {
@@ -183,32 +206,36 @@ export component MainWindow inherits Window {
     callback alias-committed(string);
     callback alias-cancelled();
 
-    // —— 面板底板：DWM Acrylic 之上再叠一层主题色渐变 + 顶部高光 ——
+    // —— 面板底板：外投影 + 主题渐变 + 顶部高光 ——
+    // 窗口四周留 10px 透明边距给外投影（与 C++ 的 kUiMargin 对应）
     Rectangle {
-        x: 0; y: 0; width: 100%; height: 100%;
+        x: 10px; y: 10px; width: parent.width - 20px; height: parent.height - 20px;
         border-radius: root.th-radius;
         background: @linear-gradient(180deg, root.th-panel-top 0%, root.th-panel-bottom 100%);
         border-width: 1px;
-        border-color: #ffffff12;
-    }
-    // 顶部极淡强调色氛围光，避免整块玻璃发灰
-    Rectangle {
-        x: 1px; y: 1px; width: parent.width - 2px; height: 150px;
-        border-radius: root.th-radius - 1px;
-        background: @linear-gradient(180deg, root.th-glow 0%, transparent 100%);
-    }
+        border-color: #ffffff14;
+        drop-shadow-blur: 26px;
+        drop-shadow-color: #0000007d;
+        drop-shadow-offset-y: 6px;
+
+        // 顶部极淡强调色氛围光，避免整块玻璃发灰
+        Rectangle {
+            x: 1px; y: 1px; width: parent.width - 2px; height: 150px;
+            border-radius: root.th-radius - 1px;
+            background: @linear-gradient(180deg, root.th-glow 0%, transparent 100%);
+        }
 
     // —— 搜索区 ——
     // 放大镜：圆环 + 手柄（描边路径，不填充）
     Path {
-        x: 22px; y: 23px; width: 18px; height: 18px;
+        x: 21px; y: 22px; width: 20px; height: 20px;
         fill: transparent;
         stroke: root.query != "" ? root.th-accent : root.th-sub;
-        stroke-width: 2px;
-        commands: "M 7 0 A 7 7 0 1 0 7 14 A 7 7 0 1 0 7 0 M 12.5 12.5 L 17.5 17.5";
+        stroke-width: 1.8px;
+        commands: "M 8 0 A 8 8 0 1 0 8 16 A 8 8 0 1 0 8 0 M 14 14 L 19 19";
     }
     Text {
-        x: 52px; y: 0; width: parent.width - 52px - 86px; height: 64px;
+        x: 52px; y: 0; width: parent.width - 52px - 78px; height: 64px;
         vertical-alignment: center;
         text: "搜索程序、文件或网页…";
         color: root.th-sub;
@@ -216,7 +243,7 @@ export component MainWindow inherits Window {
         visible: root.query == "";
     }
     input := TextInput {
-        x: 52px; y: 0; width: parent.width - 52px - 86px; height: 64px;
+        x: 52px; y: 0; width: parent.width - 52px - 78px; height: 64px;
         vertical-alignment: center;
         text <=> root.query;
         color: root.th-text;
@@ -240,25 +267,25 @@ export component MainWindow inherits Window {
             return reject;
         }
     }
-    // 右侧 Esc 提示
+    // 右侧 Esc 键帽
     Rectangle {
-        x: parent.width - 60px; y: 21px; width: 42px; height: 22px;
+        x: parent.width - 58px; y: 21px; width: 42px; height: 22px;
         border-radius: 7px;
-        background: #ffffff08;
+        background: #ffffff0a;
         border-width: 1px;
-        border-color: #ffffff12;
+        border-color: #ffffff16;
         Text {
             width: 100%; height: 100%;
             text: "Esc";
             color: root.th-sub;
-            font-size: 10px; font-weight: 600;
+            font-size: 10.5px; font-weight: 600;
             horizontal-alignment: center; vertical-alignment: center;
         }
     }
     // 搜索区 / 结果区的发丝分隔线（两端淡出）
     Rectangle {
         x: 16px; y: 64px; width: parent.width - 32px; height: 1px;
-        background: @linear-gradient(90deg, transparent 0%, #ffffff18 18%, #ffffff18 82%, transparent 100%);
+        background: @linear-gradient(90deg, transparent 0%, #ffffff1c 18%, #ffffff1c 82%, transparent 100%);
     }
 
     // —— 结果列表 ——
@@ -282,7 +309,7 @@ export component MainWindow inherits Window {
             Rectangle {
                 x: 0; y: 0; width: 100%; height: 100%;
                 border-radius: 12px;
-                background: #ffffff0d;
+                background: #ffffff10;
                 opacity: ta.has-hover && idx != root.selected ? 1 : 0;
                 animate opacity { duration: 100ms; easing: ease-out; }
             }
@@ -307,12 +334,12 @@ export component MainWindow inherits Window {
 
             // 图标：有真实 image 用之，否则回退文字徽标；提示行（kind=4）不画图标
             if item.kind != 4: Rectangle {
-                x: 12px; y: (parent.height - 36px) / 2;
-                width: 36px; height: 36px;
-                border-radius: 11px;
+                x: 14px; y: (parent.height - 38px) / 2;
+                width: 38px; height: 38px;
+                border-radius: 12px;
                 background: item.icon-bg;
                 border-width: 1px;
-                border-color: idx == root.selected ? #ffffff30 : #ffffff1a;
+                border-color: idx == root.selected ? #ffffff33 : #ffffff1a;
                 Text {
                     width: 100%; height: 100%;
                     text: item.glyph;
@@ -321,7 +348,7 @@ export component MainWindow inherits Window {
                     horizontal-alignment: center; vertical-alignment: center;
                 }
                 Image {
-                    x: 3px; y: 3px; width: 30px; height: 30px;
+                    x: 3px; y: 3px; width: 32px; height: 32px;
                     source: item.icon;
                     image-fit: contain;
                 }
@@ -329,8 +356,8 @@ export component MainWindow inherits Window {
 
             // 普通结果：标题 + 副标题
             if item.kind != 4: Text {
-                x: 60px; y: 8px;
-                width: parent.width - 60px - 56px - (item.usage-tier > 0 ? 40px : 0px);
+                x: 64px; y: 8px;
+                width: parent.width - 64px - 58px - (item.usage-tier > 0 ? 42px : 0px);
                 height: 20px;
                 text: item.title;
                 color: idx == root.selected ? root.th-text : item.usage-tier > 0 ? root.th-accent2 : root.th-text;
@@ -338,16 +365,18 @@ export component MainWindow inherits Window {
                 font-weight: idx == root.selected || item.usage-tier > 0 ? 600 : 500;
                 vertical-alignment: center;
                 overflow: elide;
+                animate color { duration: 120ms; }
             }
             if item.kind != 4: Text {
-                x: 60px; y: 27px;
-                width: parent.width - 60px - 56px - (item.usage-tier > 0 ? 40px : 0px);
+                x: 64px; y: 27px;
+                width: parent.width - 64px - 58px - (item.usage-tier > 0 ? 42px : 0px);
                 height: 16px;
                 text: item.sub;
-                color: idx == root.selected ? root.th-text : root.th-sub;
-                font-size: 11px;
+                color: idx == root.selected ? #e8eef8 : root.th-sub;
+                font-size: 11.5px;
                 vertical-alignment: center;
                 overflow: elide;
+                animate color { duration: 120ms; }
             }
 
             // 使用次数徽章「×N」：常用/高频/重度，用法与 GDI 版分档一致
@@ -372,7 +401,7 @@ export component MainWindow inherits Window {
             }
             // 提示行：单行说明，左边距对齐图标之外
             if item.kind == 4: Text {
-                x: 14px; width: parent.width - 48px; height: 100%;
+                x: 18px; width: parent.width - 52px; height: 100%;
                 text: item.title;
                 color: root.th-sub;
                 font-size: 12px;
@@ -401,63 +430,92 @@ export component MainWindow inherits Window {
 
     // —— 底部快捷键提示（有结果且菜单未打开时显示）——
     if !root.empty && !root.menu-open: Rectangle {
-        x: 16px; y: root.window-height - 34px; width: parent.width - 32px; height: 34px;
+        x: 0; y: parent.height - 34px; width: 100%; height: 34px;
         Rectangle {
-            x: 0; y: 0; width: 100%; height: 1px;
+            x: 16px; y: 0; width: parent.width - 32px; height: 1px;
             background: @linear-gradient(90deg, transparent 0%, #ffffff12 18%, #ffffff12 82%, transparent 100%);
         }
-        Text {
-            x: 2px; y: 10px; width: 60%;
-            text: "↑↓ 选择      ↵ 打开      Esc 隐藏";
-            color: root.th-sub; font-size: 11px;
+        HorizontalLayout {
+            x: 18px; y: 7px; width: parent.width - 36px; height: 20px;
+            spacing: 6px;
+            alignment: start;
+            Keycap { label: "↑↓"; }
+            Text {
+                text: "选择"; color: root.th-sub; font-size: 11px;
+                vertical-alignment: center;
+            }
+            Keycap { label: "↵"; }
+            Text {
+                text: "打开"; color: root.th-sub; font-size: 11px;
+                vertical-alignment: center;
+            }
+            Keycap { label: "Esc"; }
+            Text {
+                text: "隐藏"; color: root.th-sub; font-size: 11px;
+                vertical-alignment: center;
+            }
         }
-        Text {
-            x: parent.width - 140px; y: 10px; width: 138px;
-            text: "Alt + 数字 快速打开";
-            color: root.th-sub; font-size: 11px;
-            horizontal-alignment: right;
+        HorizontalLayout {
+            x: parent.width - 190px; y: 7px; width: 174px; height: 20px;
+            spacing: 6px;
+            alignment: end;
+            Keycap { label: "Alt + 数字"; }
+            Text {
+                text: "快速打开"; color: root.th-sub; font-size: 11px;
+                vertical-alignment: center;
+            }
         }
     }
 
-    // —— 空态欢迎面板 ——
+    // —— 空态欢迎面板（整体垂直居中）——
     if empty && root.query == "": Rectangle {
         x: 0; y: 0; width: 100%; height: 100%;
         Rectangle {
-            x: (root.width - 58px) / 2; y: 60px;
-            width: 58px; height: 58px;
-            border-radius: 18px;
+            x: (parent.width - 56px) / 2; y: (parent.height - 160px) / 2;
+            width: 56px; height: 56px;
+            border-radius: 17px;
             background: @linear-gradient(135deg, root.th-accent 0%, root.th-accent-dark 100%);
             border-width: 1px;
-            border-color: #ffffff30;
+            border-color: #ffffff33;
+            drop-shadow-blur: 18px;
+            drop-shadow-color: root.th-accent-dark;
+            Rectangle {
+                x: 1px; y: 1px; width: parent.width - 2px; height: 26px;
+                border-radius: 16px;
+                background: @linear-gradient(180deg, #ffffff2e 0%, transparent 100%);
+            }
             Text {
                 width: 100%; height: 100%;
                 text: "F";
                 color: root.th-text;
-                font-size: 29px; font-weight: 800;
+                font-size: 28px; font-weight: 800;
                 horizontal-alignment: center; vertical-alignment: center;
             }
         }
         Text {
-            x: 0; y: 132px; width: 100%; height: 32px;
+            x: 0; y: (parent.height - 160px) / 2 + 72px; width: 100%; height: 30px;
             text: "Flowtary";
             color: root.th-text;
-            font-size: 24px; font-weight: 600;
+            font-size: 23px; font-weight: 600;
+            letter-spacing: 0.4px;
             horizontal-alignment: center;
+            vertical-alignment: center;
         }
         Text {
-            x: 0; y: 168px; width: 100%; height: 22px;
+            x: 0; y: (parent.height - 160px) / 2 + 104px; width: 100%; height: 20px;
             text: "搜索程序、文件与网页";
             color: root.th-sub;
-            font-size: 13px;
+            font-size: 12.5px;
             horizontal-alignment: center;
+            vertical-alignment: center;
         }
         HorizontalLayout {
-            x: 0; y: 208px; width: 100%; height: 26px;
+            x: 0; y: (parent.height - 160px) / 2 + 136px; width: 100%; height: 24px;
             alignment: center;
             spacing: 8px;
             Rectangle {
-                width: 108px; height: 26px;
-                border-radius: 8px;
+                width: 96px; height: 24px;
+                border-radius: 7px;
                 background: #ffffff08;
                 border-width: 1px; border-color: #ffffff12;
                 Text {
@@ -468,8 +526,8 @@ export component MainWindow inherits Window {
                 }
             }
             Rectangle {
-                width: 108px; height: 26px;
-                border-radius: 8px;
+                width: 104px; height: 24px;
+                border-radius: 7px;
                 background: #ffffff08;
                 border-width: 1px; border-color: #ffffff12;
                 Text {
@@ -480,8 +538,8 @@ export component MainWindow inherits Window {
                 }
             }
             Rectangle {
-                width: 88px; height: 26px;
-                border-radius: 8px;
+                width: 78px; height: 24px;
+                border-radius: 7px;
                 background: #ffffff08;
                 border-width: 1px; border-color: #ffffff12;
                 Text {
@@ -494,11 +552,11 @@ export component MainWindow inherits Window {
         }
     }
 
-    // —— 无结果 ——
+    // —— 无结果（整体垂直居中） ——
     if empty && root.query != "": Rectangle {
         x: 0; y: 0; width: 100%; height: 100%;
         Rectangle {
-            x: (root.width - 52px) / 2; y: 60px;
+            x: (parent.width - 52px) / 2; y: (parent.height - 112px) / 2;
             width: 52px; height: 52px;
             border-radius: 16px;
             background: #ffffff08;
@@ -514,15 +572,15 @@ export component MainWindow inherits Window {
             }
         }
         Text {
-            x: 60px; y: 128px; width: root.width - 120px; height: 26px;
+            x: 60px; y: (parent.height - 112px) / 2 + 64px; width: parent.width - 120px; height: 26px;
             text: "没有找到 “" + root.query + "”";
             color: root.th-text;
-            font-size: 16px; font-weight: 500;
+            font-size: 15.5px; font-weight: 500;
             horizontal-alignment: center;
             overflow: elide;
         }
         Text {
-            x: 0; y: 160px; width: 100%; height: 20px;
+            x: 0; y: (parent.height - 112px) / 2 + 92px; width: 100%; height: 20px;
             text: "换个关键词，或等索引扫描完成再试";
             color: root.th-sub;
             font-size: 12px;
@@ -545,7 +603,10 @@ export component MainWindow inherits Window {
         border-radius: 12px;
         background: root.th-menu;
         border-width: 1px;
-        border-color: #ffffff1f;
+        border-color: #ffffff22;
+        drop-shadow-blur: 20px;
+        drop-shadow-color: #00000080;
+        drop-shadow-offset-y: 4px;
 
         VerticalLayout {
             x: 5px; y: 5px; width: parent.width - 10px;
@@ -553,6 +614,7 @@ export component MainWindow inherits Window {
                 height: 32px;
                 border-radius: 8px;
                 background: idx == root.menu-selected ? #ffffff14 : transparent;
+                animate background { duration: 90ms; }
                 Text {
                     x: 10px; y: 0; width: parent.width - 20px; height: 100%;
                     text: item.label;
@@ -589,6 +651,7 @@ export component MainWindow inherits Window {
         committed(t) => { root.alias-committed(t); }
         cancelled => { root.alias-cancelled(); }
     }
+    }  // panel
 
     focus-input => { input.focus(); }
 }

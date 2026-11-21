@@ -140,6 +140,9 @@ struct RowView {
     std::wstring iconWide;
 };
 
+// 窗口四周留给外投影的透明边距（与 main.slint 的 panel 内缩保持一致）
+static constexpr int kUiMargin = 10;
+
 struct UiCtx {
     slint::ComponentHandle<MainWindow> ui;
     std::shared_ptr<slint::VectorModel<ResultItem>> model;
@@ -148,7 +151,7 @@ struct UiCtx {
     std::unordered_map<std::wstring, slint::Image> iconCache;   // 小写路径 -> 图标
     std::unordered_map<std::wstring, bool> iconRequested;        // 小写路径 -> 已排队
     bool centerWake = true;   // 屏幕居中唤醒（跟随鼠标为 false）
-    int windowHeight = 300;   // 逻辑像素；按结果行数动态伸缩
+    int windowHeight = 320;   // 逻辑像素；按结果行数动态伸缩（含投影边距）
     // Slint 自绘右键菜单的状态（不再有原生菜单窗口）
     bool menuOpen = false;
     int menuRow = -1;         // 锚定的结果行
@@ -331,15 +334,15 @@ static void request_row_menu(int idx)
     send_req(slintbridge::kReqRowMenu, idx);
 }
 
-// 窗口高度：与 main.slint 的排版常量对应（70 行区起点 + 行高 + 12 底栏间距 + 34 底栏）
+// 窗口高度：与 main.slint 的排版常量对应（70 行区起点 + 行高 + 12 底栏间距 + 34 底栏 + 上下投影边距）
 static int compute_window_height(const UiCtx& ctx, bool hasQuery)
 {
-    if (ctx.rows.empty()) return hasQuery ? 230 : 300;
+    if (ctx.rows.empty()) return hasQuery ? 250 : 320;
     int content = 0;
     for (auto& r : ctx.rows)
         content += (r.kind == slintbridge::kRowHint ? 34 : 54);
     content += ((int)ctx.rows.size() - 1) * 2;
-    return 70 + content + 12 + 34;
+    return 70 + content + 12 + 34 + kUiMargin * 2;
 }
 
 // 某一行在列表里的顶部坐标（与 main.slint 排版一致）
@@ -385,13 +388,16 @@ static void show_row_menu(UiCtx& ctx)
     ctx.menuBaseH = ctx.menuOpen ? ctx.menuBaseH : ctx.windowHeight;
 
     const int menuH = count * 32 + 10;  // 与 main.slint 的菜单排版常量一致
+    const int panelH = ctx.menuBaseH - kUiMargin * 2;
     int y = row_top_of(ctx, row) - 4;
-    if (y + menuH > ctx.menuBaseH - 10) y = ctx.menuBaseH - 10 - menuH;
-    if (y < 66) y = 66;
-    const int needH = ctx.menuBaseH > y + menuH + 10 ? ctx.menuBaseH : y + menuH + 10;
+    if (y + menuH > panelH - 10) y = panelH - 10 - menuH;
+    if (y < 56) y = 56;
+    const int needH = ctx.menuBaseH > y + menuH + 10 + kUiMargin
+                          ? ctx.menuBaseH
+                          : y + menuH + 10 + kUiMargin;
 
-    ctx.menuX = 680 - 8 - ctx.menuW;
-    ctx.menuY = y;
+    ctx.menuX = 680 - kUiMargin - 8 - ctx.menuW;
+    ctx.menuY = y + kUiMargin;
     ctx.menuOpen = true;
     ctx.menuHeightNow = needH;
     ctx.menuModel->set_vector(std::move(items));
@@ -626,7 +632,7 @@ static void show_alias_prompt(UiCtx& ctx)
     std::string name = read_text_slot(seq, g_bridge->alias);
     if (ctx.menuOpen) close_row_menu(ctx, false);
     ctx.aliasPrevH = ctx.windowHeight;
-    if (ctx.windowHeight < 300) ctx.ui->set_window_height(300);  // 覆盖层放得下
+    if (ctx.windowHeight < 320) ctx.ui->set_window_height(320);  // 覆盖层放得下
     ctx.ui->set_alias_text(slint::SharedString(name.c_str()));
     ctx.ui->set_alias_open(true);
 }
