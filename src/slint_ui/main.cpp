@@ -438,6 +438,65 @@ static WNDPROC g_origToastProc = nullptr;
 static int g_toastGen = 0;
 static bool g_toastStyled = false;  // 原生窗口已接管样式（首次建窗期间为 false）
 static bool g_toastReveal = false;  // 首次建窗完成后需要回来居中显示
+static POINT g_menuOpenPt {};       // 菜单弹出瞬间的光标位置（用于延迟武装悬停）
+static HWND g_toastGlass = nullptr; // toast 背后的亚克力玻璃层（透桌面 + 圆角）
+static unsigned g_toastTint = 0x8A221D1C;  // ABGR，跟随菜单主题色
+
+// toast 的玻璃背板与主窗同一套实现：软件渲染器不会把矩形 alpha 合成到桌面，
+// 真正的透明必须靠 DWM 亚克力。Slint 那层只画文字/描边，背景保持透明。
+static void ensure_toast_glass()
+{
+    if (g_toastGlass) return;
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc {};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = GlassProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = L"FlowtaryToastGlass";
+        registered = RegisterClassExW(&wc) != 0;
+        if (!registered) return;
+    }
+    g_toastGlass = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_TOPMOST,
+        L"FlowtaryToastGlass", L"", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr,
+        GetModuleHandleW(nullptr), nullptr);
+    if (!g_toastGlass) return;
+    enable_acrylic(g_toastGlass, g_toastTint);
+    const DWORD kCornerPref = 33;
+    int pref = 1;  // DWMWCP_DONOTROUND
+    DwmSetWindowAttribute(g_toastGlass, kCornerPref, &pref, sizeof(pref));
+    const DWORD kBorderColor = 34;
+    COLORREF none = 0xFFFFFFFE;  // DWMWA_COLOR_NONE
+    DwmSetWindowAttribute(g_toastGlass, kBorderColor, &none, sizeof(none));
+}
+
+static void toast_glass_hide()
+{
+    if (g_toastGlass) ShowWindow(g_toastGlass, SW_HIDE);
+}
+
+// 玻璃层贴在 toast 正下方：hWndInsertAfter=toast 即放到它后面，z 序不会盖住文字
+static void toast_glass_sync(HWND toast)
+{
+    if (!toast || !IsWindowVisible(toast)) {
+        toast_glass_hide();
+        return;
+    }
+    ensure_toast_glass();
+    if (!g_toastGlass) return;
+    RECT rc {};
+    if (!GetWindowRect(toast, &rc)) return;
+    const int w = rc.right - rc.left, h = rc.bottom - rc.top;
+    UINT dpi = GetDpiForWindow(toast);
+    if (!dpi) dpi = 96;
+    const int r = MulDiv(kToastRadius, (int)dpi, 96);
+    if (HRGN rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, r * 2, r * 2))
+        SetWindowRgn(g_toastGlass, rgn, TRUE);  // takes ownership
+    enable_acrylic(g_toastGlass, g_toastTint);  // 换主题后重新染色
+    SetWindowPos(g_toastGlass, toast, rc.left, rc.top, w, h,
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+}
 
 // 圆角裁剪：软件渲染没有逐像素透明，靠窗口区域把药丸四角裁掉，避免露出直角底
 static void toast_region(HWND hwnd)
@@ -472,6 +531,12 @@ static LRESULT CALLBACK ToastWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             break;
         case WM_SIZE:
             if (wp != SIZE_MINIMIZED) toast_region(hwnd);
+            break;
+        case WM_SHOWWINDOW:
+            if (!wp) toast_glass_hide();  // 自动消失时把背板一起收掉
+            break;
+        case WM_WINDOWPOSCHANGED:
+            if (IsWindowVisible(hwnd)) toast_glass_sync(hwnd);
             break;
         case WM_STYLECHANGING: {
             auto* ss = reinterpret_cast<STYLESTRUCT*>(lp);
@@ -747,6 +812,8 @@ static void show_row_menu(UiCtx& ctx)
     ctx.ui->set_menu_y((float)ctx.menuY);
     ctx.ui->set_menu_width((float)ctx.menuW);
     ctx.ui->set_menu_selected(0);
+    ctx.ui->set_menu_hover_armed(false);  // 等鼠标真的移动才允许悬停改选中
+    GetCursorPos(&g_menuOpenPt);
     ctx.ui->set_menu_open(true);
     if (needH != ctx.windowHeight)
         ctx.ui->set_window_height((float)needH);  // 菜单可能比内容高，窗口临时撑大
@@ -758,6 +825,7 @@ static void close_row_menu(UiCtx& ctx, bool notify)
     ctx.menuOpen = false;
     ctx.menuIds.clear();
     ctx.ui->set_menu_open(false);
+    ctx.ui->set_menu_hover_armed(false);
     if (ctx.menuHeightNow != ctx.windowHeight)
         ctx.ui->set_window_height((float)ctx.windowHeight);  // 收回临时撑高的部分
     ctx.menuHeightNow = ctx.windowHeight;
@@ -1087,6 +1155,7 @@ static void toast_present()
         toast_region(h);
         SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        toast_glass_sync(h);
     }
     const int gen = ++g_toastGen;
     slint::Timer::single_shot(std::chrono::milliseconds(2200), [gen]() {
@@ -1131,6 +1200,8 @@ static void show_toast(const std::string& text)
     if (g_bridge && g_bridge->themeSeq) {
         (*g_toast)->set_th_menu(color_from_wire(g_bridge->theme.menu));
         (*g_toast)->set_th_text(color_from_wire(g_bridge->theme.text));
+        // COLORREF 与 DWM 渐变色同为 ABGR 字节序，只换掉高 8 位透明度
+        g_toastTint = (g_bridge->theme.menu & 0x00FFFFFFu) | 0x8A000000u;
     }
     if (g_toastStyled) {
         toast_present();
@@ -1250,6 +1321,15 @@ static LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case WM_SIZE:
             // 动态高度：尺寸一落地就同步更新圆角区域，避免旧区域的残帧
             if (wp != SIZE_MINIMIZED) apply_rounded_region(hwnd);
+            break;
+        case WM_MOUSEMOVE:
+            // 菜单弹出时光标常压在第 2 项上：位移超过 4px 才认定是用户主动悬停
+            if (g_ctx && g_ctx->menuOpen) {
+                POINT cur {};
+                GetCursorPos(&cur);
+                const int dx = cur.x - g_menuOpenPt.x, dy = cur.y - g_menuOpenPt.y;
+                if (dx * dx + dy * dy > 16) g_ctx->ui->set_menu_hover_armed(true);
+            }
             break;
         case WM_KEYDOWN:
             if (g_ctx && g_ctx->menuOpen) {

@@ -184,6 +184,9 @@ export component MainWindow inherits Window {
     in-out property <[MenuItem]> menu-items: [];
     in-out property <bool> menu-open: false;
     in-out property <int> menu-selected: 0;
+    // 菜单刚弹出时光标往往正压在第 2 项上：先禁用悬停驱动，等鼠标真的移动再启用，
+    // 否则初始选中的第 1 项会瞬间「跳」到第 2 项
+    in-out property <bool> menu-hover-armed: false;
     in-out property <length> menu-x: 392px;
     in-out property <length> menu-y: 70px;
     in-out property <length> menu-width: 288px;
@@ -649,7 +652,9 @@ export component MainWindow inherits Window {
             for item[idx] in root.menu-items: Rectangle {
                 height: 32px;
                 border-radius: 8px;
-                background: idx == root.menu-selected || menu-item-ta.has-hover ? #ffffff1f : transparent;
+                background: idx == root.menu-selected
+                            || (root.menu-hover-armed && menu-item-ta.has-hover)
+                           ? #ffffff1f : transparent;
                 animate background { duration: 90ms; easing: ease-out; }
                 Text {
                     x: 10px; y: 0; width: parent.width - 20px; height: 100%;
@@ -662,7 +667,9 @@ export component MainWindow inherits Window {
                 }
                 menu-item-ta := TouchArea {
                     mouse-cursor: pointer;
-                    moved => { root.menu-selected = idx; }
+                    moved => {
+                        if (root.menu-hover-armed) { root.menu-selected = idx; }
+                    }
                     clicked => { root.menu-picked(idx); }
                 }
             }
@@ -707,7 +714,8 @@ export component ToastWindow inherits Window {
     Rectangle {
         x: 0; y: 0; width: 100%; height: 100%;
         border-radius: 14px;
-        background: root.th-menu;
+        // 底不再画实色：后面有独立的亚克力玻璃窗透出桌面，这一层只留描边和文字
+        background: transparent;
         border-width: 1px;
         border-color: #ffffff1f;
         drop-shadow-blur: 18px;
