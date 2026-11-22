@@ -438,7 +438,8 @@ static WNDPROC g_origToastProc = nullptr;
 static int g_toastGen = 0;
 static bool g_toastStyled = false;  // 原生窗口已接管样式（首次建窗期间为 false）
 static bool g_toastReveal = false;  // 首次建窗完成后需要回来居中显示
-static POINT g_menuOpenPt {};       // 菜单弹出瞬间的光标位置（用于延迟武装悬停）
+static POINT g_menuOpenPt {};       // 右键发生瞬间的光标位置（不是菜单显示时再取）
+static int g_menuClickY = -1;       // 右键在窗口逻辑坐标里的 y（用于把菜单第 1 项放到光标下）
 static HWND g_toastGlass = nullptr; // toast 背后的亚克力玻璃层（透桌面 + 圆角）
 static unsigned g_toastTint = 0x8A221D1C;  // ABGR，跟随菜单主题色
 
@@ -721,7 +722,9 @@ static void apply_tool_window(HWND hwnd)
 
 static void position_ui(HWND hwnd, bool center);
 
-// 与 main.slint 结果列表排版对应：y=70 起、行间距 2px、提示行 34px 其余 54px
+// 与 main.slint 结果列表排版对应：y=70 起、行间距 2px、提示行 34px 其余 54px。
+// 注意：这里的 70 是「面板内」坐标；面板在窗口里还内缩 kUiMargin，
+// 调用方必须先把客户端 y 减掉 kUiMargin 再传进来。
 static int row_at_client_y(const UiCtx& ctx, int y)
 {
     int top = 70;
@@ -734,10 +737,12 @@ static int row_at_client_y(const UiCtx& ctx, int y)
 }
 
 // 请求第 idx 行的右键菜单（-1 = 当前选中行）。命令表由主进程写进桥，
-// 菜单本身由 Slint 在本窗口内自绘。
-static void request_row_menu(int idx)
+// 菜单本身由 Slint 在本窗口内自绘。clickY 是右键发生时的窗口逻辑 y（-1=键盘触发）。
+static void request_row_menu(int idx, int clickY = -1)
 {
     if (!g_ctx || g_ctx->rows.empty()) return;
+    g_menuClickY = clickY;
+    GetCursorPos(&g_menuOpenPt);  // 必须在右键这一刻取，等菜单显示再取会晚一拍
     send_req(slintbridge::kReqRowMenu, idx);
 }
 
@@ -796,9 +801,15 @@ static void show_row_menu(UiCtx& ctx)
 
     const int menuH = count * 32 + 10;  // 与 main.slint 的菜单排版常量一致
     const int panelH = ctx.menuBaseH - kUiMargin * 2;
-    int y = row_top_of(ctx, row) - 4;
+    // 鼠标右键：把菜单顶边放到点击 y-16，光标正好落在第 1 项中间（不再压到第 2 项）；
+    // 键盘（应用键/Shift+F10）触发时没有点击点，退回按行顶定位。
+    int y = g_menuClickY >= 0 ? g_menuClickY - 16 : row_top_of(ctx, row) - 4;
     if (y + menuH > panelH - 10) y = panelH - 10 - menuH;
     if (y < 56) y = 56;
+    char mdbg[160];
+    snprintf(mdbg, sizeof(mdbg), "MenuShow reqRow=%d useRow=%d clickY=%d menuY=%d count=%d",
+             m.row, row, g_menuClickY, y + kUiMargin, count);
+    renderer_trace(mdbg);
     const int needH = ctx.menuBaseH > y + menuH + 10 + kUiMargin
                           ? ctx.menuBaseH
                           : y + menuH + 10 + kUiMargin;
@@ -813,7 +824,6 @@ static void show_row_menu(UiCtx& ctx)
     ctx.ui->set_menu_width((float)ctx.menuW);
     ctx.ui->set_menu_selected(0);
     ctx.ui->set_menu_hover_armed(false);  // 等鼠标真的移动才允许悬停改选中
-    GetCursorPos(&g_menuOpenPt);
     ctx.ui->set_menu_open(true);
     if (needH != ctx.windowHeight)
         ctx.ui->set_window_height((float)needH);  // 菜单可能比内容高，窗口临时撑大
@@ -824,6 +834,7 @@ static void close_row_menu(UiCtx& ctx, bool notify)
     if (!ctx.menuOpen) return;
     ctx.menuOpen = false;
     ctx.menuIds.clear();
+    g_menuClickY = -1;
     ctx.ui->set_menu_open(false);
     ctx.ui->set_menu_hover_armed(false);
     if (ctx.menuHeightNow != ctx.windowHeight)
@@ -1362,9 +1373,15 @@ static LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             int y = (int)(short)HIWORD(lp);
             UINT dpi = GetDpiForWindow(hwnd);
             if (!dpi) dpi = 96;
-            int ly = MulDiv(y, 96, (int)dpi);  // 客户端像素 → Slint 逻辑像素
-            int idx = g_ctx ? row_at_client_y(*g_ctx, ly) : -1;
-            if (idx >= 0) request_row_menu(idx);
+            const int sceneY = MulDiv(y, 96, (int)dpi);  // 客户端像素 → 窗口逻辑坐标
+            // 结果列表的 70px 起点是「面板内」坐标，面板四周还有 kUiMargin 投影边距，
+            // 不减掉它就会把第 1 行判成第 2 行（32px ≈ 半行）。
+            int idx = g_ctx ? row_at_client_y(*g_ctx, sceneY - kUiMargin) : -1;
+            char dbg[160];
+            snprintf(dbg, sizeof(dbg), "RBtnUp clientY=%d sceneY=%d panelY=%d idx=%d rows=%zu",
+                     y, sceneY, sceneY - kUiMargin, idx, g_ctx ? g_ctx->rows.size() : 0);
+            renderer_trace(dbg);
+            if (idx >= 0) request_row_menu(idx, sceneY);
             return 0;  // 输入框区域不弹系统编辑菜单
         }
         case WM_SYSKEYDOWN: {
