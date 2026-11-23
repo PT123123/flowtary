@@ -4364,24 +4364,100 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 // ---------------- 主题化提示弹窗 ----------------
 // 「重复启动」「检测到新版本」等场景使用：与主界面同款圆角 + 主题配色，
 // 不受系统主题影响，也比系统 MessageBox 好看。
+//
+// 透明实现与 toast 一致：软件渲染的实色背景盖不住桌面，真正的透明靠
+// DWM 亚克力。弹窗本身保持 layered（淡入动画要用），背景不填实色，
+// 另起一层亚克力玻璃贴在弹窗正下方透出桌面。
+enum NoticeAccentState { NOTICE_ACCENT_ENABLE_ACRYLICBLURBEHIND = 4 };
+struct NoticeAccentPolicy { DWORD AccentState, AccentFlags, GradientColor, AnimationId; };
+struct NoticeCompositionData { DWORD Attrib; void* pvData; SIZE_T cbData; };
+using NoticeSetCompositionFn = BOOL(WINAPI*)(HWND, NoticeCompositionData*);
+static void notice_enable_acrylic(HWND hwnd, unsigned tint) {
+    if (!hwnd) return;
+    auto fn = reinterpret_cast<NoticeSetCompositionFn>(
+        GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetWindowCompositionAttribute"));
+    if (!fn) return;
+    NoticeAccentPolicy p {};
+    p.AccentState = NOTICE_ACCENT_ENABLE_ACRYLICBLURBEHIND;
+    p.AccentFlags = 2;
+    p.GradientColor = tint;  // ABGR：跟随主题底色
+    NoticeCompositionData d { 19, &p, sizeof(p) };
+    fn(hwnd, &d);
+}
+
+static LRESULT CALLBACK NoticeGlassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_ERASEBKGND: return 1;  // 不刷底色，让 DWM 亚克力透出来
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            BeginPaint(hwnd, &ps);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        case WM_NCHITTEST: return HTTRANSPARENT;  // 点击穿透
+        case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static HWND ensure_notice_glass(unsigned tint) {
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc {};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = NoticeGlassProc;
+        wc.hInstance = g.inst;
+        wc.lpszClassName = L"FlowtaryNoticeGlass";
+        registered = RegisterClassExW(&wc) != 0;
+        if (!registered) return nullptr;
+    }
+    HWND glass = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_TOPMOST,
+        L"FlowtaryNoticeGlass", L"", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, g.inst, nullptr);
+    if (!glass) return nullptr;
+    notice_enable_acrylic(glass, tint);
+    // 圆角形状交给 SetWindowRgn，禁掉 DWM 自己的圆角/边框，免得内侧多一圈弧线
+    DWORD pref = DWMWCP_DONOTROUND;
+    DwmSetWindowAttribute(glass, DWMWA_WINDOW_CORNER_PREFERENCE, &pref, sizeof(pref));
+    COLORREF none = 0xFFFFFFFE;  // DWMWA_COLOR_NONE
+    DwmSetWindowAttribute(glass, DWMWA_BORDER_COLOR, &none, sizeof(none));
+    return glass;
+}
+
 struct NoticeData {
     std::wstring title;
     std::wstring body;
     std::wstring btn;
     int baseX = 0, baseY = 0;   // 初始位置（淡入上移用）
     DWORD t0 = 0;               // 淡入起始时间
+    HWND glass = nullptr;       // 背后的亚克力玻璃层
 };
 constexpr int IDC_NOTICE_OK = 5001;
 constexpr int kNoticeW = 400, kNoticeH = 184;
 
 static LRESULT CALLBACK NoticeProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+        case WM_ERASEBKGND:
+            return 1;  // 不擦背景，交给背后的亚克力层
         case WM_CREATE: {
             const NoticeData* nd = (const NoticeData*)((CREATESTRUCTW*)lp)->lpCreateParams;
             NoticeData* self = nd ? new NoticeData(*nd) : new NoticeData();
             if (self) self->t0 = GetTickCount();
             SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)self);
             ApplyRoundCorners(h);
+            if (self) {
+                unsigned tint = (g.theme ? (g.theme->bg & 0x00FFFFFFu) : 0x0016181Cu)
+                              | 0x8A000000u;
+                self->glass = ensure_notice_glass(tint);
+                if (self->glass) {
+                    int w = S(kNoticeW), hh = S(kNoticeH);
+                    if (HRGN rgn = CreateRoundRectRgn(0, 0, w + 1, hh + 1,
+                                                      S(10) * 2, S(10) * 2))
+                        SetWindowRgn(self->glass, rgn, TRUE);
+                    SetWindowPos(self->glass, h, self->baseX, self->baseY + S(8),
+                                 w, hh, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                }
+            }
             SetTimer(h, 2, 16, nullptr);  // 启动淡入动画（透明度 + 上移）
             RECT rc;
             GetClientRect(h, &rc);
@@ -4399,9 +4475,7 @@ static LRESULT CALLBACK NoticeProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             RECT rc;
             GetClientRect(h, &rc);
             const Theme& t = *g.theme;
-            HBRUSH bg = CreateSolidBrush(t.bg);
-            FillRect(hdc, &rc, bg);
-            DeleteObject(bg);
+            // 背景不填实色：底色与磨砂由背后那层亚克力玻璃提供
             RECT accent{0, 0, rc.right, S(3)};  // 顶部一条强调色，呼应主题
             HBRUSH ab = CreateSolidBrush(t.menuHi);
             FillRect(hdc, &accent, ab);
@@ -4466,6 +4540,13 @@ static LRESULT CALLBACK NoticeProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     SetLayeredWindowAttributes(h, 0, a2, LWA_ALPHA);
                     SetWindowPos(h, nullptr, nd->baseX, nd->baseY + off, 0, 0,
                                  SWP_NOZORDER | SWP_NOSIZE | SWP_NOACTIVATE);
+                    // 玻璃层跟着弹窗的淡入位移走，保持严丝合缝
+                    if (nd->glass) {
+                        RECT wr;
+                        if (GetWindowRect(h, &wr))
+                            SetWindowPos(nd->glass, h, wr.left, wr.top, 0, 0,
+                                         SWP_NOSIZE | SWP_NOACTIVATE);
+                    }
                     if (p >= 1) KillTimer(h, 2);
                 }
                 return 0;
@@ -4475,6 +4556,7 @@ static LRESULT CALLBACK NoticeProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_DESTROY: {
             NoticeData* nd = (NoticeData*)GetWindowLongPtrW(h, GWLP_USERDATA);
+            if (nd && nd->glass) DestroyWindow(nd->glass);
             delete nd;
             SetWindowLongPtrW(h, GWLP_USERDATA, 0);
             return 0;
