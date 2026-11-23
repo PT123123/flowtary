@@ -4537,7 +4537,7 @@ static LRESULT CALLBACK NoticeProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     BYTE target = (BYTE)((std::max)((int)(g.theme ? g.theme->alpha : 255), 240));
                     BYTE a2 = (BYTE)(target * e); if (a2 < 1) a2 = 1;
                     int off = (int)(S(8) * (1 - e));              // 从下方 8px 滑入
-                    SetLayeredWindowAttributes(h, 0, a2, LWA_ALPHA);
+                    SetLayeredWindowAttributes(h, 0x00000000, a2, LWA_COLORKEY | LWA_ALPHA);
                     SetWindowPos(h, nullptr, nd->baseX, nd->baseY + off, 0, 0,
                                  SWP_NOZORDER | SWP_NOSIZE | SWP_NOACTIVATE);
                     // 玻璃层跟着弹窗的淡入位移走，保持严丝合缝
@@ -4590,8 +4590,9 @@ static void ShowNotice(const std::wstring& title, const std::wstring& body,
     HWND h = CreateWindowExW(WS_EX_TOPMOST | WS_EX_LAYERED, L"FlowtaryNotice", title.c_str(),
                              WS_POPUP, x, y + S(8), W, H, nullptr, nullptr, g.inst, &nd);
     if (!h) return;
-    // 初始完全透明，由 NoticeProc 的淡入定时器平滑升到目标透明度（避免一闪而出）
-    SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);
+    // GDI 在 layered 窗上留下的未绘制区域是纯黑实底，用 COLORKEY 把它抠掉，
+    // 才能让背后的亚克力玻璃透出来；alpha 仍由淡入定时器统一管理。
+    SetLayeredWindowAttributes(h, 0x00000000, 0, LWA_COLORKEY | LWA_ALPHA);
     ShowWindow(h, SW_SHOW);
     SetForegroundWindow(h);
     SetFocus(h);
