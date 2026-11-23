@@ -427,11 +427,12 @@ static void arm_outside_capture(HWND h, bool on)
     }
 }
 
-// 顶部 toast（独立无边框工具窗）：点击穿透、屏幕居中、2.2 秒自动消失
+// 顶部 toast（独立无边框工具窗）：点击穿透、屏幕顶部居中、2.2 秒自动消失
 // 尺寸与 main.slint 的 ToastWindow 保持一致，用于在 show 之前算好居中位置
 static constexpr int kToastW = 360;
-static constexpr int kToastH = 56;
-static constexpr int kToastRadius = 14;  // 药丸圆角（逻辑像素）
+static constexpr int kToastH = 64;
+static constexpr int kToastRadius = 15;      // 药丸圆角（逻辑像素）
+static constexpr int kToastTopOffset = 96;   // 距工作区顶边的距离（逻辑像素）
 
 static std::optional<slint::ComponentHandle<ToastWindow>> g_toast;
 static WNDPROC g_origToastProc = nullptr;
@@ -440,7 +441,7 @@ static bool g_toastStyled = false;  // 原生窗口已接管样式（首次建�
 static bool g_toastReveal = false;  // 首次建窗完成后需要回来居中显示
 static int g_menuClickY = -1;       // 右键在窗口逻辑坐标里的 y（用于把菜单第 1 项放到光标下）
 static HWND g_toastGlass = nullptr; // toast 背后的亚克力玻璃层（透桌面 + 圆角）
-static unsigned g_toastTint = 0x8A221D1C;  // ABGR，跟随菜单主题色
+static unsigned g_toastTint = 0x38221D1C;  // ABGR，跟随菜单主题色
 
 // toast 的玻璃背板与主窗同一套实现：软件渲染器不会把矩形 alpha 合成到桌面，
 // 真正的透明必须靠 DWM 亚克力。Slint 那层只画文字/描边，背景保持透明。
@@ -545,8 +546,10 @@ static LRESULT CALLBACK ToastWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                                 ~(WS_CAPTION | WS_THICKFRAME | WS_BORDER | WS_DLGFRAME |
                                   WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX)) | WS_POPUP;
             } else if (wp == GWL_EXSTYLE) {
+                // 必须把 LAYERED 也钉住：winit 每次 show/hide 都会重写扩展样式，
+                // 丢了它 COLORKEY 透明就失效。
                 ss->styleNew = (ss->styleNew | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
-                                WS_EX_TRANSPARENT) & ~WS_EX_APPWINDOW;
+                                WS_EX_TRANSPARENT | WS_EX_LAYERED) & ~WS_EX_APPWINDOW;
             }
             break;
         }
@@ -562,9 +565,12 @@ static void toast_style_native(HWND hwnd)
                                WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX)) | WS_POPUP;
     if (want != style) SetWindowLongPtrW(hwnd, GWL_STYLE, want);
     LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-    LONG_PTR wex = (ex | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT) &
-                   ~WS_EX_APPWINDOW;
+    LONG_PTR wex = (ex | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT |
+                    WS_EX_LAYERED) & ~WS_EX_APPWINDOW;
     if (wex != ex) SetWindowLongPtrW(hwnd, GWL_EXSTYLE, wex);
+    // Slint 软件渲染器画不出 alpha，black 底当色键抠成透明，露出背后的亚克力玻璃。
+    // 透明度用 LWA_ALPHA 而非动画，toast 的显隐由 Slint 的 show/hide 控制。
+    SetLayeredWindowAttributes(hwnd, 0x00000000, 255, LWA_COLORKEY | LWA_ALPHA);
     int ncPolicy = 1;  // DWMNCRP_DISABLED
     DwmSetWindowAttribute(hwnd, 2, &ncPolicy, sizeof(ncPolicy));
     const DWORD kDwmwaBorderColor = 34;
@@ -1135,7 +1141,9 @@ static UINT monitor_dpi(HMONITOR mon)
     return 96;
 }
 
-// 屏幕居中显示：先算好位置和尺寸再 show，避免窗口先出现在默认位置再跳过来
+// 屏幕顶部居中显示：先算好位置和尺寸再 show，避免窗口先出现在默认位置再跳过来。
+// 放在顶部而不是正中央：居中会正好压在启动器面板上（面板也在屏幕中部），
+// 提示和面板糊成一团，看不出这是条独立提示。
 static void toast_present()
 {
     if (!g_toast.has_value()) return;
@@ -1147,12 +1155,13 @@ static void toast_present()
     HMONITOR mon = MonitorFromPoint(cur, MONITOR_DEFAULTTONEAREST);
     if (GetMonitorInfoW(mon, &mi)) {
         const UINT dpi = monitor_dpi(mon);
-        // 只定位、不强行改尺寸：窗口逻辑尺寸本来就是 360x56，winit 会按目标显示器
+        // 只定位、不强行改尺寸：窗口逻辑尺寸本来就是 360x64，winit 会按目标显示器
         // 的 DPI 自己缩放；手动设物理尺寸会在跨 DPI 移动时被再放大一次。
         const int W = MulDiv(kToastW, (int)dpi, 96), H = MulDiv(kToastH, (int)dpi, 96);
+        const int top = MulDiv(kToastTopOffset, (int)dpi, 96);  // 距工作区顶边的距离
         slint::PhysicalPosition pos;
         pos.x = mi.rcWork.left + (mi.rcWork.right - mi.rcWork.left - W) / 2;
-        pos.y = mi.rcWork.top + (mi.rcWork.bottom - mi.rcWork.top - H) / 2;
+        pos.y = mi.rcWork.top + top;
         win.set_position(pos);
     }
     win.show();
@@ -1207,8 +1216,11 @@ static void show_toast(const std::string& text)
     if (g_bridge && g_bridge->themeSeq) {
         (*g_toast)->set_th_menu(color_from_wire(g_bridge->theme.menu));
         (*g_toast)->set_th_text(color_from_wire(g_bridge->theme.text));
-        // COLORREF 与 DWM 渐变色同为 ABGR 字节序，只换掉高 8 位透明度
-        g_toastTint = (g_bridge->theme.menu & 0x00FFFFFFu) | 0x8A000000u;
+        // COLORREF 与 DWM 渐变色同为 ABGR 字节序，只换掉高 8 位透明度。
+        // 亚克力本身已经做了模糊，这层 tint 只做「压暗 + 保底可读性」，
+        // 透明度给太高（0x8A=54%）会把透出来的桌面染成一块死黑，看起来反而不透明。
+        // 0x38(22%) 足够让白字在亮背景上读得清，又保留玻璃质感。
+        g_toastTint = (g_bridge->theme.menu & 0x00FFFFFFu) | 0x38000000u;
     }
     if (g_toastStyled) {
         toast_present();
