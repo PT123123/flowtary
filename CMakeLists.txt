@@ -112,6 +112,11 @@ else()
     src/workshop_catalog.cpp
     src/flowtary.rc
     src/flowtary.ico)
+  # version.h 被 flowtary.rc #include，版本号变了必须让 rc 重新编译。
+  # 否则 CMake 增量构建只重链 exe、不重编 .res，exe 里的版本资源会一直停在旧值。
+  # 注意：要挂在 SOURCE 上（target 级 OBJECT_DEPENDS 对 RC 源文件不生效）。
+  set_property(SOURCE src/flowtary.rc APPEND PROPERTY
+    OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/version.h")
   set_source_files_properties(src/flowtary.ico PROPERTIES HEADER_FILE_ONLY TRUE)
   set_target_properties(flowtary PROPERTIES OUTPUT_NAME flowtary)
   target_link_libraries(flowtary PRIVATE ${FLOWTARY_LIBS})
