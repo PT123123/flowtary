@@ -438,7 +438,6 @@ static WNDPROC g_origToastProc = nullptr;
 static int g_toastGen = 0;
 static bool g_toastStyled = false;  // 原生窗口已接管样式（首次建窗期间为 false）
 static bool g_toastReveal = false;  // 首次建窗完成后需要回来居中显示
-static POINT g_menuOpenPt {};       // 右键发生瞬间的光标位置（不是菜单显示时再取）
 static int g_menuClickY = -1;       // 右键在窗口逻辑坐标里的 y（用于把菜单第 1 项放到光标下）
 static HWND g_toastGlass = nullptr; // toast 背后的亚克力玻璃层（透桌面 + 圆角）
 static unsigned g_toastTint = 0x8A221D1C;  // ABGR，跟随菜单主题色
@@ -742,7 +741,6 @@ static void request_row_menu(int idx, int clickY = -1)
 {
     if (!g_ctx || g_ctx->rows.empty()) return;
     g_menuClickY = clickY;
-    GetCursorPos(&g_menuOpenPt);  // 必须在右键这一刻取，等菜单显示再取会晚一拍
     send_req(slintbridge::kReqRowMenu, idx);
 }
 
@@ -795,7 +793,7 @@ static void show_row_menu(UiCtx& ctx)
     int row = m.row;
     if (row < 0 || row >= (int)ctx.rows.size()) row = 0;
     ctx.menuRow = row;
-    ctx.menuSel = 0;
+    ctx.menuSel = -1;   // 不预设高亮：由鼠标 hover / 键盘导航决定
     ctx.menuW = 288;
     ctx.menuBaseH = ctx.menuOpen ? ctx.menuBaseH : ctx.windowHeight;
 
@@ -822,8 +820,7 @@ static void show_row_menu(UiCtx& ctx)
     ctx.ui->set_menu_x((float)ctx.menuX);
     ctx.ui->set_menu_y((float)ctx.menuY);
     ctx.ui->set_menu_width((float)ctx.menuW);
-    ctx.ui->set_menu_selected(0);
-    ctx.ui->set_menu_hover_armed(false);  // 等鼠标真的移动才允许悬停改选中
+    ctx.ui->set_menu_selected(-1);        // 菜单刚弹出不高亮任何项
     ctx.ui->set_menu_open(true);
     if (needH != ctx.windowHeight)
         ctx.ui->set_window_height((float)needH);  // 菜单可能比内容高，窗口临时撑大
@@ -836,7 +833,6 @@ static void close_row_menu(UiCtx& ctx, bool notify)
     ctx.menuIds.clear();
     g_menuClickY = -1;
     ctx.ui->set_menu_open(false);
-    ctx.ui->set_menu_hover_armed(false);
     if (ctx.menuHeightNow != ctx.windowHeight)
         ctx.ui->set_window_height((float)ctx.windowHeight);  // 收回临时撑高的部分
     ctx.menuHeightNow = ctx.windowHeight;
@@ -1333,28 +1329,26 @@ static LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             // 动态高度：尺寸一落地就同步更新圆角区域，避免旧区域的残帧
             if (wp != SIZE_MINIMIZED) apply_rounded_region(hwnd);
             break;
-        case WM_MOUSEMOVE:
-            // 菜单弹出时光标常压在第 2 项上：位移超过 4px 才认定是用户主动悬停
-            if (g_ctx && g_ctx->menuOpen) {
-                POINT cur {};
-                GetCursorPos(&cur);
-                const int dx = cur.x - g_menuOpenPt.x, dy = cur.y - g_menuOpenPt.y;
-                if (dx * dx + dy * dy > 16) g_ctx->ui->set_menu_hover_armed(true);
-            }
-            break;
         case WM_KEYDOWN:
             if (g_ctx && g_ctx->menuOpen) {
                 // 菜单打开时自己接管上下/回车/Esc（不让 TextInput 吃掉）
                 int n = (int)g_ctx->menuIds.size();
                 if (wp == VK_UP || wp == VK_DOWN) {
                     if (n > 0) {
-                        int s = (g_ctx->menuSel + (wp == VK_UP ? -1 : 1) + n) % n;
+                        // 刚弹出没有选中项：向下从第 1 项、向上从末项开始
+                        int s = g_ctx->menuSel < 0
+                              ? (wp == VK_UP ? n - 1 : 0)
+                              : (g_ctx->menuSel + (wp == VK_UP ? -1 : 1) + n) % n;
                         g_ctx->menuSel = s;
                         g_ctx->ui->set_menu_selected(s);
                     }
                     return 0;
                 }
-                if (wp == VK_RETURN) { pick_row_menu(*g_ctx, g_ctx->menuSel); return 0; }
+                if (wp == VK_RETURN) {
+                    int s = g_ctx->menuSel < 0 ? 0 : g_ctx->menuSel;
+                    pick_row_menu(*g_ctx, s);
+                    return 0;
+                }
                 if (wp == VK_ESCAPE) { close_row_menu(*g_ctx, true); return 0; }
             }
             // 应用键：打开当前结果的右键菜单（与 GDI 版一致）
@@ -1571,6 +1565,10 @@ int main()
     // Slint 自绘右键菜单
     ctx->ui->on_menu_picked([](int idx) {
         if (g_ctx) pick_row_menu(*g_ctx, idx);
+    });
+    ctx->ui->on_menu_hovered([](int idx) {
+        // 悬停项同步给键盘：此时按回车直接落在光标所在项
+        if (g_ctx) g_ctx->menuSel = idx;
     });
     ctx->ui->on_menu_dismissed([]() {
         if (g_ctx) close_row_menu(*g_ctx, true);

@@ -183,10 +183,9 @@ export component MainWindow inherits Window {
     // Slint 自绘右键菜单（不再使用原生 GDI 菜单）
     in-out property <[MenuItem]> menu-items: [];
     in-out property <bool> menu-open: false;
-    in-out property <int> menu-selected: 0;
-    // 菜单刚弹出时光标往往正压在第 2 项上：先禁用悬停驱动，等鼠标真的移动再启用，
-    // 否则初始选中的第 1 项会瞬间「跳」到第 2 项
-    in-out property <bool> menu-hover-armed: false;
+    // 键盘选中项；-1 = 没有。鼠标悬停高亮由各项自己的 has-hover 驱动，不写回这里，
+    // 否则指针移开后旧项（第一项）会一直保留高亮。
+    in-out property <int> menu-selected: -1;
     in-out property <length> menu-x: 392px;
     in-out property <length> menu-y: 70px;
     in-out property <length> menu-width: 288px;
@@ -228,6 +227,7 @@ export component MainWindow inherits Window {
     callback focus-input();              // 请求把焦点给搜索框
     callback menu-picked(int);           // 选中右键菜单第 idx 项
     callback menu-dismissed();           // 点击菜单外/按 Esc 关闭
+    callback menu-hovered(int);          // 指针悬停到第 idx 项（只同步选中，不驱动高亮）
     callback alias-committed(string);
     callback alias-cancelled();
 
@@ -652,8 +652,7 @@ export component MainWindow inherits Window {
             for item[idx] in root.menu-items: Rectangle {
                 height: 32px;
                 border-radius: 8px;
-                background: idx == root.menu-selected
-                            || (root.menu-hover-armed && menu-item-ta.has-hover)
+                background: idx == root.menu-selected || menu-item-ta.has-hover
                            ? #ffffff1f : transparent;
                 animate background { duration: 90ms; easing: ease-out; }
                 Text {
@@ -667,9 +666,9 @@ export component MainWindow inherits Window {
                 }
                 menu-item-ta := TouchArea {
                     mouse-cursor: pointer;
-                    moved => {
-                        if (root.menu-hover-armed) { root.menu-selected = idx; }
-                    }
+                    // 高亮只认 has-hover：moved 仅在指针移动那一瞬触发，靠它改
+                    // menu-selected 会让旧项（第一项）一直留着高亮。
+                    moved => { root.menu-hovered(idx); }
                     clicked => { root.menu-picked(idx); }
                 }
             }
