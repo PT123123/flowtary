@@ -27,6 +27,7 @@
 #include "workshop_catalog.h"
 #include <imm.h>
 #include <dwmapi.h>
+#include <gdiplus.h>
 #include <uxtheme.h>
 #include <tlhelp32.h>
 #include <process.h>
@@ -58,6 +59,7 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "imm32.lib")
+#pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "uxtheme.lib")
@@ -404,7 +406,6 @@ static void SlintPushState();
 static void SlintSendCmd(int cmd);
 static void SlintPushRowMenu();
 static void SlintPushAliasPrompt(const std::wstring& defaultName);
-static void SlintShowToast(const std::wstring& text);
 static void SlintHandleRequests();
 static bool TryAltHotkeyDirect(WPARAM wParam);
 static HWND SlintIpcWindow();
@@ -3969,7 +3970,13 @@ static void SlintSendCmd(int cmd) {
     if (head - tail >= (LONG)(sizeof(g.bridge->cmd) / sizeof(g.bridge->cmd[0]))) return;  // 满了就丢
     g.bridge->cmd[head % (LONG)(sizeof(g.bridge->cmd) / sizeof(g.bridge->cmd[0]))] = cmd;
     InterlockedExchange(&g.bridge->cmdHead, head + 1);
-    if (HWND ipc = SlintIpcWindow()) PostMessageW(ipc, slintbridge::kKickToRender, 0, 0);
+    HWND ipc = SlintIpcWindow();
+    {
+        char tb[96];
+        snprintf(tb, sizeof(tb), "KICK: cmd=%d ipc=%p", cmd, (void*)ipc);
+        AppendTrace(tb);
+    }
+    if (ipc) PostMessageW(ipc, slintbridge::kKickToRender, 0, 0);
 }
 
 // 大脑 → 渲染器：把一段文本写进单段文本槽并发布序号
@@ -3992,14 +3999,6 @@ static void SlintPushAliasPrompt(const std::wstring& defaultName) {
     if (!g.bridge) return;
     SlintWriteTextSlot(&g.bridge->aliasSeq, g.bridge->alias, WideToUtf8(defaultName));
     SlintSendCmd(slintbridge::kCmdAliasPrompt);
-}
-
-// 屏幕顶部轻提示：走渲染器的独立无边框窗口
-static void SlintShowToast(const std::wstring& text) {
-    SlintBridgeEnsure();
-    if (!g.bridge) return;
-    SlintWriteTextSlot(&g.bridge->toastSeq, g.bridge->toast, WideToUtf8(text));
-    SlintSendCmd(slintbridge::kCmdToast);
 }
 
 // 当前菜单锚定的行：菜单开着时结果可能被别处刷新，执行命令时回到这一行
@@ -4090,6 +4089,11 @@ static void SlintHandleRequests() {
                 int idx = r.arg & slintbridge::kActRowMask;
                 bool ctrl = (r.arg & slintbridge::kActCtrl) != 0;
                 bool shift = (r.arg & slintbridge::kActShift) != 0;
+                {
+                    char tb[96];
+                    snprintf(tb, sizeof(tb), "EXEC: row=%d ctrl=%d shift=%d", idx, (int)ctrl, (int)shift);
+                    AppendTrace(tb);
+                }
                 if (idx >= 0 && idx < (int)g.items.size()) g.sel = idx;
                 // 与 GDI 版一致：Ctrl=关闭 / Ctrl+Shift=提权（窗口行另有语义）
                 ExecuteSelected(ResolveExecKind(ctrl, shift));
@@ -4138,6 +4142,7 @@ static void SlintHandleRequests() {
                 break;
             case slintbridge::kReqReady:
                 // 渲染器刚起来：先下发状态，再让它显示（避免旧结果闪一下）
+                AppendTrace("REQ: renderer ready");
                 needPush = true;
                 showAfterPush = true;
                 break;
@@ -4608,8 +4613,290 @@ static void ShowNotice(const std::wstring& title, const std::wstring& body,
     }
 }
 
-// 屏幕居中轻提示：由 Slint 渲染器画独立无边框置顶小窗
-static void ShowTopToast(const std::wstring& text) { SlintShowToast(text); }
+// ---------------- 顶部 toast：主进程原生自绘，逐像素 alpha ----------------
+// 1.3.28 及之前的方案有两层「假透明」，这里一并去掉：
+//   1. Slint 软件渲染画不出 alpha → 只能画纯黑底 + LWA_COLORKEY 抠色，
+//      边缘二值硬边（圆角锯齿、文字无 AA）；
+//   2. 背景靠独立窗口的 DWM 亚克力玻璃，而未公开接口 GradientColor 的
+//      alpha 语义是反的（0=全不透明、255=全透明），0x38 实为 78% 不透明，
+//      Win11 上亚克力又退化成无模糊的纯色 tint —— 整块看着像深色实板。
+// 现在的做法：GDI+ 画进 32bpp ARGB 位图（圆角/徽标/文字全走抗锯齿），
+// 预乘后用 UpdateLayeredWindow 逐像素 alpha 上屏，桌面直接透过位图 alpha
+// 显示，不再依赖色键与 DWM 亚克力；淡入淡出用 ULW 的 SourceConstantAlpha。
+static constexpr int kToastW = 360;         // 药丸宽（逻辑像素，与原 .slint 版一致）
+static constexpr int kToastH = 64;
+static constexpr int kToastRadius = 15;
+static constexpr int kToastTopOffset = 96;  // 距工作区顶边的距离
+static constexpr BYTE kToastBgAlpha = 0x8A; // 药丸底不透明度 46%：与「已在运行」弹窗玻璃一致
+static constexpr int kToastFadeIn = 120, kToastHold = 2000, kToastFadeOut = 300;  // ms
+
+struct NativeToast {
+    std::wstring text;
+    HDC memDC = nullptr;
+    HBITMAP bmp = nullptr;
+    HGDIOBJ oldBmp = nullptr;
+    int pxW = 0, pxH = 0;   // 位图物理尺寸
+    int x = 0, y = 0;       // 当前屏幕位置
+    int phase = 0;          // 0=淡入 1=保持 2=淡出 3=已隐藏
+    DWORD t0 = 0;           // 当前阶段起始时间
+};
+static NativeToast g_toast;  // 常驻复用：每次 show 重画内容、重定位、重启动画
+static HWND g_toastWnd = nullptr;
+static ULONG_PTR g_gdiplusToken = 0;
+
+static bool EnsureGdiplus() {
+    if (g_gdiplusToken) return true;
+    Gdiplus::GdiplusStartupInput in;
+    return Gdiplus::GdiplusStartup(&g_gdiplusToken, &in, nullptr) == Gdiplus::Ok;
+}
+
+// 圆角矩形路径（GDI+ 没有内置 AddRoundedRect）
+static void AddRoundRect(Gdiplus::GraphicsPath& p, float x, float y, float w, float h, float r) {
+    const float d = r * 2;
+    p.AddArc(x, y, d, d, 180, 90);
+    p.AddArc(x + w - d, y, d, d, 270, 90);
+    p.AddArc(x + w - d, y + h - d, d, d, 0, 90);
+    p.AddArc(x, y + h - d, d, d, 90, 90);
+    p.CloseFigure();
+}
+
+// 超宽文案按字符回退加「…」（toast 文本短，线性回退足够）
+static std::wstring ToastElide(Gdiplus::Graphics& gfx, const Gdiplus::Font& font,
+                               const std::wstring& text, float maxW) {
+    auto width = [&](const std::wstring& s) {
+        Gdiplus::RectF m(0, 0, 0, 0);
+        if (gfx.MeasureString(s.c_str(), (int)s.size(), &font, Gdiplus::PointF(0, 0),
+                              nullptr, &m) != Gdiplus::Ok)
+            return (float)1e6;  // 量不出宽度就当作超宽
+        return m.Width;
+    };
+    if (width(text) <= maxW) return text;
+    const std::wstring dots = L"…";
+    if (width(dots) > maxW) return L"";
+    size_t n = text.size();
+    while (n > 0 && width(text.substr(0, n) + dots) > maxW) --n;
+    return text.substr(0, n) + dots;
+}
+
+// 重画位图：主题底色药丸（半透明）+ 绿徽标白对勾 + 主题文字色文案
+static void ToastRender(NativeToast* self) {
+    const Theme& t = *g.theme;
+    const int W = S(kToastW), H = S(kToastH);
+    BITMAPINFO bi {};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = W;
+    bi.bmiHeader.biHeight = -H;  // top-down
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP bmp = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!bmp || !bits) {
+        if (bmp) DeleteObject(bmp);
+        return;
+    }
+    memset(bits, 0, (size_t)W * H * 4);  // 全透明底
+    {
+        using namespace Gdiplus;
+        // 包裹 DIB 的 ARGB 位图：GDI+ 写入 straight alpha，画完统一预乘
+        Bitmap surface(W, H, W * 4, PixelFormat32bppARGB, (BYTE*)bits);
+        Graphics gfx(&surface);
+        gfx.SetSmoothingMode(SmoothingModeAntiAlias);
+        gfx.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);  // 灰度 AA：透明底上无彩边
+        gfx.SetPixelOffsetMode(PixelOffsetModeHalf);
+
+        const float r = (float)S(kToastRadius);
+        GraphicsPath pill;
+        AddRoundRect(pill, 0.5f, 0.5f, (float)W - 1.0f, (float)H - 1.0f, r);
+        SolidBrush pillBrush(Color(kToastBgAlpha, GetRValue(t.bg), GetGValue(t.bg), GetBValue(t.bg)));
+        gfx.FillPath(&pillBrush, &pill);
+        Pen edge(Color(0x30, 0xFF, 0xFF, 0xFF), (float)S(1));  // 1px 淡描边：亮背景上给药丸轮廓
+        gfx.DrawPath(&edge, &pill);
+
+        // 左侧成功徽标：绿圆 + 白对勾（几何与原 .slint 版一致）
+        const float cx = (float)S(14) + r, cy = (float)H / 2;
+        SolidBrush badgeBrush(Color(0xFF, 0x2E, 0xA3, 0x6B));
+        gfx.FillEllipse(&badgeBrush, cx - r, cy - r, r * 2, r * 2);
+        const PointF chk[3] = {
+            { cx - S(7), cy + S(0) }, { cx - S(2), cy + S(5) }, { cx + S(7), cy - S(6) },
+        };
+        GraphicsPath check;
+        check.AddLines(chk, 3);
+        Pen checkPen(Color(0xFF, 0xFF, 0xFF, 0xFF), (float)S(2));
+        checkPen.SetStartCap(LineCapRound);
+        checkPen.SetEndCap(LineCapRound);
+        checkPen.SetLineJoin(LineJoinRound);
+        gfx.DrawPath(&checkPen, &check);
+
+        // 文案：13px 同原 .slint 版；字体池按比例建好，lfHeight 负值即 em 像素
+        HFONT hf = g.fontPool[FontSlot(13)];
+        LOGFONTW lf {};
+        if (GetObjectW(hf, sizeof(lf), &lf)) {
+            FontFamily family(lf.lfFaceName);
+            FontFamily fallback(L"Microsoft YaHei UI");
+            const FontFamily* use = family.GetLastStatus() == Ok ? &family : &fallback;
+            const FontStyle style = lf.lfWeight >= 700 ? FontStyleBold : FontStyleRegular;
+            const int em = lf.lfHeight < 0 ? -lf.lfHeight : lf.lfHeight;
+            Font font(use, (float)em, style, UnitPixel);
+            const float tx = (float)S(56), tw = (float)W - tx - S(14);
+            const std::wstring shown = ToastElide(gfx, font, self->text, tw);
+            SolidBrush textBrush(Color(0xFF, GetRValue(t.text), GetGValue(t.text), GetBValue(t.text)));
+            StringFormat fmt;
+            fmt.SetAlignment(StringAlignmentNear);
+            fmt.SetLineAlignment(StringAlignmentCenter);
+            fmt.SetFormatFlags(fmt.GetFormatFlags() | StringFormatFlagsNoClip |
+                               StringFormatFlagsNoWrap);
+            gfx.DrawString(shown.c_str(), (int)shown.size(), &font,
+                           RectF(tx, 0, tw, (float)H), &fmt, &textBrush);
+        }
+    }
+    // 预乘 alpha（UpdateLayeredWindow 要求 premultiplied BGRA）
+    BYTE* p = (BYTE*)bits;
+    for (int i = 0; i < W * H; ++i, p += 4) {
+        const unsigned a = p[3];
+        if (a == 255 || a == 0) continue;
+        p[0] = (BYTE)(p[0] * a / 255);
+        p[1] = (BYTE)(p[1] * a / 255);
+        p[2] = (BYTE)(p[2] * a / 255);
+    }
+    // 换掉旧位图（旧的可能因换屏比例变化而尺寸不同）
+    if (self->memDC && self->bmp) {
+        SelectObject(self->memDC, self->oldBmp);
+        DeleteObject(self->bmp);
+    }
+    if (!self->memDC) self->memDC = CreateCompatibleDC(nullptr);
+    self->bmp = bmp;
+    self->oldBmp = SelectObject(self->memDC, bmp);
+    self->pxW = W;
+    self->pxH = H;
+}
+
+// 上屏：alpha 用于淡入淡出（内容不变，只改 SourceConstantAlpha，不重绘）；
+// pt/size 非空时同时移动窗口（首次显示用）
+static void ToastPresent(HWND h, const NativeToast* self, BYTE alpha,
+                         const POINT* pt = nullptr, const SIZE* size = nullptr) {
+    HDC screen = GetDC(nullptr);
+    BLENDFUNCTION bf { AC_SRC_OVER, 0, alpha, AC_SRC_ALPHA };
+    POINT src { 0, 0 };
+    UpdateLayeredWindow(h, screen, const_cast<POINT*>(pt), const_cast<SIZE*>(size),
+                        self->memDC, &src, 0, &bf, ULW_ALPHA);
+    ReleaseDC(nullptr, screen);
+}
+
+// 淡入 → 保持 → 淡出 → 隐藏
+static void ToastTick(HWND h) {
+    NativeToast* self = &g_toast;
+    if (!self->bmp) return;
+    const DWORD el = GetTickCount() - self->t0;
+    switch (self->phase) {
+        case 0: {  // 淡入
+            const int a = (int)((el * 255UL) / kToastFadeIn);
+            ToastPresent(h, self, (BYTE)(a > 255 ? 255 : a));
+            if (el >= (DWORD)kToastFadeIn) {
+                ToastPresent(h, self, 255);  // 补一帧全显，别停在中间值
+                self->phase = 1;
+                self->t0 = GetTickCount();
+            }
+            break;
+        }
+        case 1:  // 保持
+            if (el >= (DWORD)kToastHold) {
+                self->phase = 2;
+                self->t0 = GetTickCount();
+            }
+            break;
+        case 2: {  // 淡出
+            const int a = 255 - (int)((el * 255UL) / kToastFadeOut);
+            ToastPresent(h, self, (BYTE)(a < 0 ? 0 : a));
+            if (el >= (DWORD)kToastFadeOut) {
+                KillTimer(h, 1);
+                self->phase = 3;
+                ShowWindow(h, SW_HIDE);
+            }
+            break;
+        }
+        default:
+            KillTimer(h, 1);
+            break;
+    }
+}
+
+static LRESULT CALLBACK ToastNativeProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_ERASEBKGND: return 1;
+        case WM_PAINT: {  // ULW 窗口不走 WM_PAINT：留空处理避免闪烁
+            PAINTSTRUCT ps;
+            BeginPaint(h, &ps);
+            EndPaint(h, &ps);
+            return 0;
+        }
+        case WM_NCHITTEST: return HTTRANSPARENT;  // 点击穿透
+        case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
+        case WM_TIMER:
+            if (wp == 1) ToastTick(h);
+            return 0;
+        case WM_DESTROY:
+            if (g_toast.memDC) {
+                if (g_toast.bmp) {
+                    SelectObject(g_toast.memDC, g_toast.oldBmp);
+                    DeleteObject(g_toast.bmp);
+                    g_toast.bmp = nullptr;
+                }
+                DeleteDC(g_toast.memDC);
+                g_toast.memDC = nullptr;
+            }
+            break;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+// 屏幕居中轻提示：主进程 GDI+ 自绘 + UpdateLayeredWindow 逐像素 alpha
+static void ShowTopToast(const std::wstring& text) {
+    if (!g.theme) return;
+    AppendTrace("TOAST show");
+    if (!EnsureGdiplus()) return;
+    if (!g_toastWnd || !IsWindow(g_toastWnd)) {
+        static bool registered = false;
+        if (!registered) {
+            WNDCLASSEXW wc {};
+            wc.cbSize = sizeof(wc);
+            wc.lpfnWndProc = ToastNativeProc;
+            wc.hInstance = g.inst;
+            wc.lpszClassName = L"FlowtaryNativeToast";
+            registered = RegisterClassExW(&wc) != 0;
+            if (!registered) return;
+        }
+        g_toastWnd = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
+                WS_EX_TOPMOST,
+            L"FlowtaryNativeToast", L"", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, g.inst,
+            nullptr);
+        if (!g_toastWnd) return;
+    }
+    g_toast.text = text;
+    ToastRender(&g_toast);
+    if (!g_toast.bmp) return;
+    // 跟随鼠标所在显示器：工作区水平居中、距顶 S(96)
+    POINT cur {};
+    GetCursorPos(&cur);
+    MONITORINFO mi {};
+    mi.cbSize = sizeof(mi);
+    g_toast.x = 0;
+    g_toast.y = 0;
+    if (GetMonitorInfoW(MonitorFromPoint(cur, MONITOR_DEFAULTTONEAREST), &mi)) {
+        g_toast.x = mi.rcWork.left + ((mi.rcWork.right - mi.rcWork.left) - g_toast.pxW) / 2;
+        g_toast.y = mi.rcWork.top + S(kToastTopOffset);
+    }
+    const SIZE size { g_toast.pxW, g_toast.pxH };
+    const POINT pos { g_toast.x, g_toast.y };
+    ToastPresent(g_toastWnd, &g_toast, 0, &pos, &size);  // 全透明就位，避免闪一帧
+    ShowWindow(g_toastWnd, SW_SHOWNOACTIVATE);
+    SetWindowPos(g_toastWnd, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    g_toast.phase = 0;
+    g_toast.t0 = GetTickCount();
+    SetTimer(g_toastWnd, 1, 16, nullptr);  // 重复调用即重启动画
+}
 
 // ---------------- 单实例：区分「同版本重复启动」与「新版本替换启动」 ----------------
 struct BuildStamp {
@@ -4667,6 +4954,18 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     ResolveCaptureExe();
     UpdateScale(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY));  // 建字体池（比例 = max(DPI, 物理高/1080)）
     ApplyTheme(false);  // 建立主题字体与画刷：此时还没有窗口，只为弹窗准备绘制资源
+
+    // 开发调试：--toast-test <文本> —— 启动即弹一条顶部 toast（不走唤起/命令链），
+    // 用于肉眼调整 toast 的配色/透明度/排版。文本含空格时整体加引号传入。
+    if (const wchar_t* flag = wcsstr(GetCommandLineW(), L"--toast-test")) {
+        std::wstring t(flag + 12);
+        const size_t b = t.find_first_not_of(L" \"");
+        if (b != std::wstring::npos) {
+            const size_t e = t.find_last_not_of(L" \"");
+            ShowTopToast(t.substr(b, e - b + 1));
+            AppendTrace("TOAST show (--toast-test)");
+        }
+    }
 
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 

@@ -78,7 +78,6 @@ enum StateCmd : int {
     kCmdHoldShow = 5,   // 主进程要弹自己的对话框（如添加别名）：期间失焦别隐藏
     kCmdReleaseShow = 6, // 对话框结束：恢复正常失焦隐藏
     kCmdAliasPrompt = 7, // 显示别名输入覆盖层（预填文本在 alias 槽）
-    kCmdToast = 8,       // 显示顶部 toast（文案在 toast 槽）
 };
 
 // 行类型（与主程序 Row::Kind 的取值顺序一一对应，改动必须两边同步）
@@ -147,7 +146,7 @@ struct MenuSlot {
     MenuItemWire items[kMenuMaxItems];
 };
 
-// 单段 utf8 文本槽：别名输入框的预填名 / 顶部 toast 文案。
+// 单段 utf8 文本槽：别名输入框的预填名。
 // 大脑写 seq + len + text，再往命令环投一条命令让渲染器来读。
 constexpr int kTextSlotMax = 512;
 struct TextSlot {
@@ -180,11 +179,9 @@ struct Bridge {
     // 右键菜单数据：大脑写 menuSeq + menu，渲染器按 seq 取
     volatile LONG menuSeq;
     MenuSlot menu;
-    // 单段文本：别名输入预填 / toast 文案
+    // 单段文本：别名输入预填
     volatile LONG aliasSeq;
     TextSlot alias;
-    volatile LONG toastSeq;
-    TextSlot toast;
     // 主题调色板
     volatile LONG themeSeq;
     ThemeWire theme;

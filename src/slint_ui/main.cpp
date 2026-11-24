@@ -135,6 +135,7 @@ static LONG g_lastCmdTail = 0;
 static bool g_uiActive = false;
 static bool g_brainSeen = false;
 static bool g_holdHide = false;  // 主进程自己的对话框开着：失焦不隐藏
+static int g_menuClickY = -1;   // 最近一次行右键的屏幕 Y：菜单锚定用
 
 // 一行结果（来自主进程的状态槽）
 struct RowView {
@@ -425,157 +426,6 @@ static void arm_outside_capture(HWND h, bool on)
         if (GetCapture() == h) ReleaseCapture();
         g_outsideCapture = false;
     }
-}
-
-// 顶部 toast（独立无边框工具窗）：点击穿透、屏幕顶部居中、2.2 秒自动消失
-// 尺寸与 main.slint 的 ToastWindow 保持一致，用于在 show 之前算好居中位置
-static constexpr int kToastW = 360;
-static constexpr int kToastH = 64;
-static constexpr int kToastRadius = 15;      // 药丸圆角（逻辑像素）
-static constexpr int kToastTopOffset = 96;   // 距工作区顶边的距离（逻辑像素）
-
-static std::optional<slint::ComponentHandle<ToastWindow>> g_toast;
-static WNDPROC g_origToastProc = nullptr;
-static int g_toastGen = 0;
-static bool g_toastStyled = false;  // 原生窗口已接管样式（首次建窗期间为 false）
-static bool g_toastReveal = false;  // 首次建窗完成后需要回来居中显示
-static int g_menuClickY = -1;       // 右键在窗口逻辑坐标里的 y（用于把菜单第 1 项放到光标下）
-static HWND g_toastGlass = nullptr; // toast 背后的亚克力玻璃层（透桌面 + 圆角）
-static unsigned g_toastTint = 0x38221D1C;  // ABGR，跟随菜单主题色
-
-// toast 的玻璃背板与主窗同一套实现：软件渲染器不会把矩形 alpha 合成到桌面，
-// 真正的透明必须靠 DWM 亚克力。Slint 那层只画文字/描边，背景保持透明。
-static void ensure_toast_glass()
-{
-    if (g_toastGlass) return;
-    static bool registered = false;
-    if (!registered) {
-        WNDCLASSEXW wc {};
-        wc.cbSize = sizeof(wc);
-        wc.lpfnWndProc = GlassProc;
-        wc.hInstance = GetModuleHandleW(nullptr);
-        wc.lpszClassName = L"FlowtaryToastGlass";
-        registered = RegisterClassExW(&wc) != 0;
-        if (!registered) return;
-    }
-    g_toastGlass = CreateWindowExW(
-        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_TOPMOST,
-        L"FlowtaryToastGlass", L"", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr,
-        GetModuleHandleW(nullptr), nullptr);
-    if (!g_toastGlass) return;
-    enable_acrylic(g_toastGlass, g_toastTint);
-    const DWORD kCornerPref = 33;
-    int pref = 1;  // DWMWCP_DONOTROUND
-    DwmSetWindowAttribute(g_toastGlass, kCornerPref, &pref, sizeof(pref));
-    const DWORD kBorderColor = 34;
-    COLORREF none = 0xFFFFFFFE;  // DWMWA_COLOR_NONE
-    DwmSetWindowAttribute(g_toastGlass, kBorderColor, &none, sizeof(none));
-}
-
-static void toast_glass_hide()
-{
-    if (g_toastGlass) ShowWindow(g_toastGlass, SW_HIDE);
-}
-
-// 玻璃层贴在 toast 正下方：hWndInsertAfter=toast 即放到它后面，z 序不会盖住文字
-static void toast_glass_sync(HWND toast)
-{
-    if (!toast || !IsWindowVisible(toast)) {
-        toast_glass_hide();
-        return;
-    }
-    ensure_toast_glass();
-    if (!g_toastGlass) return;
-    RECT rc {};
-    if (!GetWindowRect(toast, &rc)) return;
-    const int w = rc.right - rc.left, h = rc.bottom - rc.top;
-    UINT dpi = GetDpiForWindow(toast);
-    if (!dpi) dpi = 96;
-    const int r = MulDiv(kToastRadius, (int)dpi, 96);
-    if (HRGN rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, r * 2, r * 2))
-        SetWindowRgn(g_toastGlass, rgn, TRUE);  // takes ownership
-    enable_acrylic(g_toastGlass, g_toastTint);  // 换主题后重新染色
-    SetWindowPos(g_toastGlass, toast, rc.left, rc.top, w, h,
-                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
-}
-
-// 圆角裁剪：软件渲染没有逐像素透明，靠窗口区域把药丸四角裁掉，避免露出直角底
-static void toast_region(HWND hwnd)
-{
-    RECT rc {};
-    if (!GetClientRect(hwnd, &rc)) return;
-    const int w = rc.right - rc.left, h = rc.bottom - rc.top;
-    if (w < kToastRadius * 2 || h < kToastRadius * 2) return;
-    UINT dpi = GetDpiForWindow(hwnd);
-    if (!dpi) dpi = 96;
-    const int r = MulDiv(kToastRadius, (int)dpi, 96);
-    // CreateRoundRectRgn 的后两个参数是「直径」，不是半径
-    if (HRGN rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, r * 2, r * 2))
-        SetWindowRgn(hwnd, rgn, TRUE);  // takes ownership
-}
-
-// winit 显示/隐藏 toast 时会把窗口样式重写成「带标题栏的普通窗口 + APPWINDOW」，
-// 于是任务栏、Alt+Tab 里都会冒出一个窗口。与主窗同一套做法：在 STYLECHANGING
-// 里改掉「准备写入的样式」，从源头保证工具窗语义。
-static LRESULT CALLBACK ToastWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
-{
-    switch (msg) {
-        case WM_NCACTIVATE:
-            return TRUE;
-        case WM_NCPAINT:
-            return 0;
-        case 0x00AE:  // WM_NCUAHDRAWCAPTION（主题标题栏绘制）
-        case 0x00AF:  // WM_NCUAHDRAWFRAME（主题边框绘制）
-            return 0;
-        case WM_NCCALCSIZE:
-            if (wp) return 0;
-            break;
-        case WM_SIZE:
-            if (wp != SIZE_MINIMIZED) toast_region(hwnd);
-            break;
-        case WM_SHOWWINDOW:
-            if (!wp) toast_glass_hide();  // 自动消失时把背板一起收掉
-            break;
-        case WM_WINDOWPOSCHANGED:
-            if (IsWindowVisible(hwnd)) toast_glass_sync(hwnd);
-            break;
-        case WM_STYLECHANGING: {
-            auto* ss = reinterpret_cast<STYLESTRUCT*>(lp);
-            if (wp == GWL_STYLE) {
-                ss->styleNew = (ss->styleNew &
-                                ~(WS_CAPTION | WS_THICKFRAME | WS_BORDER | WS_DLGFRAME |
-                                  WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX)) | WS_POPUP;
-            } else if (wp == GWL_EXSTYLE) {
-                // 必须把 LAYERED 也钉住：winit 每次 show/hide 都会重写扩展样式，
-                // 丢了它 COLORKEY 透明就失效。
-                ss->styleNew = (ss->styleNew | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
-                                WS_EX_TRANSPARENT | WS_EX_LAYERED) & ~WS_EX_APPWINDOW;
-            }
-            break;
-        }
-    }
-    return CallWindowProcW(g_origToastProc, hwnd, msg, wp, lp);
-}
-
-// 把 toast 窗口钉成无边框工具窗：不进任务栏/Alt+Tab，不抢焦点，点击穿透
-static void toast_style_native(HWND hwnd)
-{
-    LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-    LONG_PTR want = (style & ~(WS_CAPTION | WS_THICKFRAME | WS_BORDER | WS_DLGFRAME |
-                               WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX)) | WS_POPUP;
-    if (want != style) SetWindowLongPtrW(hwnd, GWL_STYLE, want);
-    LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-    LONG_PTR wex = (ex | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT |
-                    WS_EX_LAYERED) & ~WS_EX_APPWINDOW;
-    if (wex != ex) SetWindowLongPtrW(hwnd, GWL_EXSTYLE, wex);
-    // Slint 软件渲染器画不出 alpha，black 底当色键抠成透明，露出背后的亚克力玻璃。
-    // 透明度用 LWA_ALPHA 而非动画，toast 的显隐由 Slint 的 show/hide 控制。
-    SetLayeredWindowAttributes(hwnd, 0x00000000, 255, LWA_COLORKEY | LWA_ALPHA);
-    int ncPolicy = 1;  // DWMNCRP_DISABLED
-    DwmSetWindowAttribute(hwnd, 2, &ncPolicy, sizeof(ncPolicy));
-    const DWORD kDwmwaBorderColor = 34;
-    COLORREF none = 0xFFFFFFFE;  // DWMWA_COLOR_NONE
-    DwmSetWindowAttribute(hwnd, kDwmwaBorderColor, &none, sizeof(none));
 }
 
 static ft::apps::AsyncIcons g_icons;
@@ -1053,6 +903,13 @@ static void show_ui()
     auto& ctx = *g_ctx;
     HWND hwnd = ctx.ui->window().win32_hwnd();
     const bool wasVisible = hwnd && IsWindowVisible(hwnd);
+    {
+        // 记录激活起点：fg==hwnd 时 activate_ui 会静默成功（不写 Activate 行），
+        // 排查「面板没显示」时别把「无 Activate trace」当成「show_ui 没跑」。
+        char tb[128];
+        snprintf(tb, sizeof(tb), "show_ui: hwnd=%p fg=%p", (void*)hwnd, (void*)GetForegroundWindow());
+        renderer_trace(tb);
+    }
     ctx.ui->set_query(slint::SharedString(""));  // 主进程每次唤起都清空输入
     ctx.ui->set_selected(0);
     ctx.ui->set_alias_open(false);
@@ -1108,7 +965,7 @@ static void hide_ui()
     hide_glass();
 }
 
-// 读取桥里的单段文本槽（别名预填 / toast 文案）
+// 读取桥里的单段文本槽（别名输入预填）
 static std::string read_text_slot(unsigned seq, const slintbridge::TextSlot& slot)
 {
     if (!seq) return {};
@@ -1128,115 +985,6 @@ static void show_alias_prompt(UiCtx& ctx)
     if (ctx.windowHeight < 364) ctx.ui->set_window_height(364);  // 覆盖层放得下
     ctx.ui->set_alias_text(slint::SharedString(name.c_str()));
     ctx.ui->set_alias_open(true);
-}
-
-// 目标显示器的缩放：toast 要跨显示器居中，必须按「鼠标所在显示器」的 DPI 算尺寸/位置，
-// 否则 200% 屏上会被 winit 的 DPI 变更放大一倍，看起来又偏又大。
-static UINT monitor_dpi(HMONITOR mon)
-{
-    static auto getDpi = reinterpret_cast<HRESULT(WINAPI*)(HMONITOR, int, UINT*, UINT*)>(
-        GetProcAddress(LoadLibraryW(L"shcore.dll"), "GetDpiForMonitor"));
-    UINT x = 96, y = 96;
-    if (getDpi && SUCCEEDED(getDpi(mon, 0 /* MDT_EFFECTIVE_DPI */, &x, &y)) && x) return x;
-    return 96;
-}
-
-// 屏幕顶部居中显示：先算好位置和尺寸再 show，避免窗口先出现在默认位置再跳过来。
-// 放在顶部而不是正中央：居中会正好压在启动器面板上（面板也在屏幕中部），
-// 提示和面板糊成一团，看不出这是条独立提示。
-static void toast_present()
-{
-    if (!g_toast.has_value()) return;
-    auto& win = (*g_toast)->window();
-    POINT cur {};
-    GetCursorPos(&cur);
-    MONITORINFO mi {};
-    mi.cbSize = sizeof(mi);
-    HMONITOR mon = MonitorFromPoint(cur, MONITOR_DEFAULTTONEAREST);
-    if (GetMonitorInfoW(mon, &mi)) {
-        const UINT dpi = monitor_dpi(mon);
-        // 只定位、不强行改尺寸：窗口逻辑尺寸本来就是 360x64，winit 会按目标显示器
-        // 的 DPI 自己缩放；手动设物理尺寸会在跨 DPI 移动时被再放大一次。
-        const int W = MulDiv(kToastW, (int)dpi, 96), H = MulDiv(kToastH, (int)dpi, 96);
-        const int top = MulDiv(kToastTopOffset, (int)dpi, 96);  // 距工作区顶边的距离
-        slint::PhysicalPosition pos;
-        pos.x = mi.rcWork.left + (mi.rcWork.right - mi.rcWork.left - W) / 2;
-        pos.y = mi.rcWork.top + top;
-        win.set_position(pos);
-    }
-    win.show();
-    HWND h = win.win32_hwnd();
-    if (h) {
-        toast_style_native(h);
-        toast_region(h);
-        SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-        toast_glass_sync(h);
-    }
-    const int gen = ++g_toastGen;
-    slint::Timer::single_shot(std::chrono::milliseconds(2200), [gen]() {
-        if (gen != g_toastGen || !g_toast.has_value()) return;
-        (*g_toast)->window().hide();
-    });
-}
-
-// 首次显示时 winit 的 HWND 是异步建出来的：等它就绪后接管窗口过程与样式。
-// 这期间窗口藏在屏幕外，不会出现「带标题栏的普通窗口」在角落闪一帧。
-static void toast_bind_native(int attempt)
-{
-    if (!g_toast.has_value()) return;
-    HWND h = (*g_toast)->window().win32_hwnd();
-    if (!h || !IsWindow(h)) {
-        if (attempt < 60) {
-            slint::Timer::single_shot(std::chrono::milliseconds(8),
-                                      [attempt]() { toast_bind_native(attempt + 1); });
-            return;
-        }
-    } else {
-        if (!g_origToastProc)
-            g_origToastProc =
-                (WNDPROC)SetWindowLongPtrW(h, GWLP_WNDPROC, (LONG_PTR)ToastWndProc);
-        toast_style_native(h);
-        toast_region(h);
-    }
-    g_toastStyled = true;
-    if (g_toastReveal) {
-        g_toastReveal = false;
-        toast_present();
-    }
-}
-
-// 顶部 toast：独立工具窗，定位到鼠标所在显示器工作区中央（与原 GDI 版一致）
-static void show_toast(const std::string& text)
-{
-    if (!g_toast.has_value()) {
-        g_toast = ToastWindow::create();
-    }
-    (*g_toast)->set_message(slint::SharedString(text.c_str()));
-    if (g_bridge && g_bridge->themeSeq) {
-        (*g_toast)->set_th_menu(color_from_wire(g_bridge->theme.menu));
-        (*g_toast)->set_th_text(color_from_wire(g_bridge->theme.text));
-        // COLORREF 与 DWM 渐变色同为 ABGR 字节序，只换掉高 8 位透明度。
-        // 亚克力本身已经做了模糊，这层 tint 只做「压暗 + 保底可读性」，
-        // 透明度给太高（0x8A=54%）会把透出来的桌面染成一块死黑，看起来反而不透明。
-        // 0x38(22%) 足够让白字在亮背景上读得清，又保留玻璃质感。
-        g_toastTint = (g_bridge->theme.menu & 0x00FFFFFFu) | 0x38000000u;
-    }
-    if (g_toastStyled) {
-        toast_present();
-        return;
-    }
-    if (!g_toastReveal) {
-        // 第一次：先在屏幕外把原生窗口建出来（不可见），样式接管后再回来居中显示
-        auto& win = (*g_toast)->window();
-        slint::PhysicalPosition pos;
-        pos.x = -20000;
-        pos.y = -20000;
-        win.set_position(pos);
-        win.show();
-        g_toastReveal = true;
-        toast_bind_native(0);
-    }
 }
 
 // 首帧位置由主进程通过命令行传入：常驻渲染器被复用时则用状态槽里的最新值
@@ -1266,12 +1014,7 @@ static void on_bridge_update()
                 case slintbridge::kCmdHoldShow: g_holdHide = true; break;
                 case slintbridge::kCmdReleaseShow: g_holdHide = false; break;
                 case slintbridge::kCmdAliasPrompt: show_alias_prompt(*g_ctx); break;
-                case slintbridge::kCmdToast: {
-                    unsigned seq = (unsigned)InterlockedCompareExchange(&g_bridge->toastSeq, 0, 0);
-                    show_toast(read_text_slot(seq, g_bridge->toast));
-                    break;
-                }
-                default: break;
+                                default: break;
             }
         }
         g_lastCmdTail = tail;
@@ -1538,6 +1281,7 @@ int main()
 
     bridge_open();
     g_brain = find_brain();
+    renderer_trace(g_brain ? "renderer: brain found" : "renderer: brain NOT found");
     if (g_bridge) {
         // 跳过上一轮残留的命令；新显示由下面的 kReqReady 触发
         g_lastCmdTail = InterlockedCompareExchange(&g_bridge->cmdHead, 0, 0);
@@ -1554,6 +1298,11 @@ int main()
     // 回车：带上 Ctrl/Shift 语义（Ctrl=关闭、Ctrl+Shift=提权，与 GDI 版一致）；
     // 鼠标点击走 item-clicked，永远是普通执行。
     ctx->ui->on_item_activated([](int idx) {
+        {
+            char tb[96];
+            snprintf(tb, sizeof(tb), "ACT req: row=%d", idx);
+            renderer_trace(tb);
+        }
         int flags = 0;
         if (GetKeyState(VK_CONTROL) & 0x8000) flags |= slintbridge::kActCtrl;
         if (GetKeyState(VK_SHIFT) & 0x8000) flags |= slintbridge::kActShift;
