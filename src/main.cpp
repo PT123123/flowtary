@@ -2035,43 +2035,89 @@ static HWND TopTargetWindow() {
     return h;
 }
 
+// ---------------- 打开结果判定与提示文案 ----------------
+// ShellExecuteW 返回值 <=32 即失败（SE_ERR_*）。过去各分支无条件 return true，
+// 目标被删/没有关联程序时也照弹「已打开」——workshop 版本目录被替换后旧条目失活
+// 就是这个症状。统一走 ShellOpen 记录失败码，提示里说清是哪一条、为什么。
+static DWORD g_shellExecError = 0;
+static bool ShellOpen(const wchar_t* verb, const wchar_t* path, const wchar_t* args,
+                      const wchar_t* dir, int showCmd) {
+    g_shellExecError = 0;
+    const INT_PTR code = (INT_PTR)ShellExecuteW(nullptr, verb, path, args, dir, showCmd);
+    if (code <= 32) {
+        g_shellExecError = (DWORD)code;
+        return false;
+    }
+    return true;
+}
+
+static std::wstring ShellExecErrorText(DWORD error) {
+    switch (error) {
+        case 0: return L"无法打开";
+        case SE_ERR_FNF: return L"文件不存在";
+        case SE_ERR_PNF: return L"路径不存在";
+        case SE_ERR_ACCESSDENIED: return L"拒绝访问";
+        case SE_ERR_ASSOCINCOMPLETE: return L"文件关联不完整";
+        case SE_ERR_NOASSOC: return L"没有可用的打开方式";
+        case SE_ERR_DLLNOTFOUND: return L"找不到所需的 DLL";
+        default: return L"错误码 " + std::to_wstring(error);
+    }
+}
+
+// 「已打开 / 打开失败」要指名道姓：默认末段文件名；父目录段能区分发布版本时带上
+// （C:\workshop\taskinformer-0.1.67\taskinformer.exe 只有父目录看得出是哪个版本）。
+static std::wstring ToastTargetText(const Row& r) {
+    if (r.action.empty()) return r.title;
+    const size_t slash = r.action.find_last_of(L"\\/");
+    std::wstring leaf = (slash == std::wstring::npos) ? r.action : r.action.substr(slash + 1);
+    if (leaf.empty()) leaf = r.title;
+    if (slash == std::wstring::npos || slash == 0) return leaf;
+    const std::wstring parent = r.action.substr(0, slash);
+    const size_t pslash = parent.find_last_of(L"\\/");
+    if (pslash == std::wstring::npos) return leaf;   // 形如 C:\file：父段就是盘符
+    const std::wstring parentLeaf = parent.substr(pslash + 1);
+    if (parentLeaf.empty() || parentLeaf == leaf) return leaf;
+    static const wchar_t* generic[] = {L"desktop", L"downloads", L"documents", L"programs",
+                                       L"start menu", L"workshop", L"project", L"workbuddy"};
+    const std::wstring lower = ToLowerW(parentLeaf);
+    for (const wchar_t* g : generic) if (lower == g) return leaf;
+    return leaf + L"（" + parentLeaf + L"）";
+}
+
 static bool ExecuteRow(Row& r, ExecKind ek = ExecKind::Normal) {
     switch (r.kind) {
         case Row::Folder:
             // 若当前有系统文件对话框处于焦点，则把该对话框原地跳转到所选文件夹，
-            // 而非在资源管理器中打开（类 Listary Quick-Switch）。失败静默。
-            if (fdj_enabled() && fdj_dialog_open()) {
-                fdj_jump_to_folder(r.action.c_str());
-                return true;
-            }
-            ShellExecuteW(nullptr, L"open", r.action.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-            return true;
+            // 而非在资源管理器中打开（类 Listary Quick-Switch）。
+            if (fdj_enabled() && fdj_dialog_open())
+                return fdj_jump_to_folder(r.action.c_str()) != FALSE;
+            return ShellOpen(L"open", r.action.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         case Row::File:
         case Row::Web:
-            ShellExecuteW(nullptr, L"open", r.action.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-            return true;
+            return ShellOpen(L"open", r.action.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         case Row::Reveal: {
             // 路径直达（文件路径）：在资源管理器中定位并选中，不直接启动该文件
             std::wstring args = L"/select,\"" + r.action + L"\"";
-            ShellExecuteW(nullptr, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
-            return true;
+            return ShellOpen(L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
         }
         case Row::Prog: {
             std::wstring dir = ProgramWorkingDirectory(r.prog);
-            ShellExecuteW(nullptr, L"open", r.action.c_str(), nullptr,
-                          dir.empty() ? nullptr : dir.c_str(), SW_SHOWNORMAL);
-            return true;
+            return ShellOpen(L"open", r.action.c_str(), nullptr,
+                             dir.empty() ? nullptr : dir.c_str(), SW_SHOWNORMAL);
         }
         case Row::Group: {
-            // 一键组：启动组逐个打开文件路径；关闭组按进程名结束进程
+            // 一键组：启动组逐个打开文件路径；关闭组按进程名结束进程。
+            // 只要有一项真的起来了就算成功（失败码保留最后一次，供提示文案引用）。
             if (r.groupKill) {
                 for (auto& name : r.groupTargets) KillProcessesByName(name);
             } else {
+                size_t ok = 0;
                 for (auto& p : r.groupTargets) {
                     std::wstring dir = DirOf(p);
-                    ShellExecuteW(nullptr, L"open", p.c_str(), nullptr,
-                                  dir.empty() ? nullptr : dir.c_str(), SW_SHOWNORMAL);
+                    if (ShellOpen(L"open", p.c_str(), nullptr,
+                                  dir.empty() ? nullptr : dir.c_str(), SW_SHOWNORMAL)) ++ok;
                 }
+                return ok > 0;
             }
             return true;
         }
@@ -2079,13 +2125,12 @@ static bool ExecuteRow(Row& r, ExecKind ek = ExecKind::Normal) {
             std::wstring exe, args, cwd;
             BuildShellCommand(r.action, ek == ExecKind::Admin, exe, args, cwd);
             if (exe.empty()) return false;
-            HINSTANCE h = ShellExecuteW(nullptr, ek == ExecKind::Admin ? L"runas" : L"open",
-                                       exe.c_str(), args.empty() ? nullptr : args.c_str(),
-                                       cwd.empty() ? nullptr : cwd.c_str(),
-                                       ek == ExecKind::Admin ? SW_SHOWNORMAL
-                                                           : (g.shellShowWindow ? SW_SHOWNORMAL
-                                                                                : SW_HIDE));
-            return (INT_PTR)h > 32;
+            return ShellOpen(ek == ExecKind::Admin ? L"runas" : L"open", exe.c_str(),
+                             args.empty() ? nullptr : args.c_str(),
+                             cwd.empty() ? nullptr : cwd.c_str(),
+                             ek == ExecKind::Admin ? SW_SHOWNORMAL
+                                                   : (g.shellShowWindow ? SW_SHOWNORMAL
+                                                                        : SW_HIDE));
         }
         case Row::Top: {
             // top 命令：对唤醒前的前台窗口切换置顶（WS_EX_TOPMOST），
@@ -2139,9 +2184,7 @@ static bool ExecuteRow(Row& r, ExecKind ek = ExecKind::Normal) {
             if (g.captureExe.empty()) return false;
             // 构造命令行参数：enter=模式 tray=false auto-quit=true
             std::wstring args = L"enter=" + r.action + L" tray=false auto-quit=true";
-            HINSTANCE h = ShellExecuteW(nullptr, L"open", g.captureExe.c_str(),
-                                        args.c_str(), nullptr, SW_SHOWNORMAL);
-            return (INT_PTR)h > 32;
+            return ShellOpen(L"open", g.captureExe.c_str(), args.c_str(), nullptr, SW_SHOWNORMAL);
         }
         case Row::Hint:
             break;
@@ -2170,11 +2213,31 @@ static std::wstring OpenedToastText(const Row& r) {
         case Row::Prog:
         case Row::File:
         case Row::Folder:
-            return L"已打开 " + r.title;
+            return L"已打开 " + ToastTargetText(r);
         case Row::Group:
             if (!r.groupTargets.empty())
                 return r.groupKill ? L"已关闭 " + std::to_wstring(r.groupTargets.size()) + L" 个进程"
                                    : L"已启动 " + std::to_wstring(r.groupTargets.size()) + L" 项";
+            return L"";
+        default:
+            return L"";
+    }
+}
+
+// 执行失败时的提示：同样指名道姓，并带上 Shell 给出的具体原因（文件不存在/无关联…）。
+// 返回空串表示这类行不需要失败反馈（窗口切换、top 等静默失败即可）。
+static std::wstring OpenFailureText(const Row& r) {
+    const std::wstring reason = ShellExecErrorText(g_shellExecError);
+    switch (r.kind) {
+        case Row::Prog:
+        case Row::File:
+        case Row::Folder:
+        case Row::Reveal:
+        case Row::Capture:
+            return L"打开失败：" + ToastTargetText(r) + L"，" + reason;
+        case Row::Group:
+            if (!r.groupTargets.empty())
+                return L"打开失败：" + std::to_wstring(r.groupTargets.size()) + L" 项均未启动，" + reason;
             return L"";
         default:
             return L"";
@@ -2191,6 +2254,13 @@ static void ExecuteSelected(ExecKind ek = ExecKind::Normal) {
         std::wstring toast = OpenedToastText(g.items[g.sel]);
         if (!toast.empty()) ShowTopToast(toast);
         Hide();
+    } else {
+        // 执行失败（目标被删 / 无关联程序 / 被策略拦）：说清是哪一条、为什么，窗口保留让用户重试。
+        // 程序行多半是 workshop 版本目录被换掉后留下的死路径——顺手刷新程序表，去掉死条目。
+        Row& r = g.items[g.sel];
+        std::wstring message = OpenFailureText(r);
+        if (!message.empty()) ShowTopToast(message);
+        if (r.kind == Row::Prog) StartProgramsRefresh();
     }
 }
 
@@ -2259,6 +2329,10 @@ static bool RunRowMenuCommand(int cmd) {
                 LogHistoryOpen(r);
                 std::wstring toast = OpenedToastText(r);
                 if (!toast.empty()) ShowTopToast(toast);
+            } else {
+                std::wstring message = OpenFailureText(r);
+                if (!message.empty()) ShowTopToast(message);
+                if (r.kind == Row::Prog) StartProgramsRefresh();
             }
             break;
         case IDM_OPENLOC:
@@ -3412,6 +3486,7 @@ static void PrependLearnedRows(const std::wstring& term) {
     if (!g.learnEnabled || term.empty()) return;
     struct Cand {
         std::wstring path;
+        std::wstring term;   // 命中该条目的学习词/别名（新增别名时键就是别名）
         int count;
         long long last;
         int rank;     // 学习词与查询词的匹配等级：精确 > 学习词前缀 > 查询词前缀
@@ -3427,7 +3502,7 @@ static void PrependLearnedRows(const std::wstring& term) {
             DWORD attr = GetFileAttributesW(pv.first.c_str());
             if (attr == INVALID_FILE_ATTRIBUTES) continue;  // 目标暂不在：本次不展示
             bool isDir = (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
-            cs.push_back({pv.first, pv.second.count, pv.second.last, rank,
+            cs.push_back({pv.first, kv.first, pv.second.count, pv.second.last, rank,
                           !isDir && EndsWithI(pv.first, L".exe"), isDir});
         }
     }
@@ -3450,10 +3525,13 @@ static void PrependLearnedRows(const std::wstring& term) {
         }
         Row r;
         r.kind = c.isDir ? Row::Folder : Row::File;
+        // 标题=别名/学习词（用户认的是这个词），副标题=原文件名+来源，两者都不丢
+        r.title = c.term.empty() ? c.path : c.term;
         size_t s = c.path.find_last_of(L"\\/");
-        r.title = (s == std::wstring::npos) ? c.path : c.path.substr(s + 1);
-        if (!c.isDir && EndsWithI(r.title, L".lnk")) r.title.resize(r.title.size() - 4);  // 程序快捷方式显示应用名
-        r.sub = ShortLocationLabel(c.path);
+        std::wstring leaf = (s == std::wstring::npos) ? c.path : c.path.substr(s + 1);
+        if (!c.isDir && EndsWithI(leaf, L".lnk")) leaf.resize(leaf.size() - 4);  // 程序快捷方式显示应用名
+        const std::wstring loc = ShortLocationLabel(c.path);
+        r.sub = loc.empty() ? leaf : (leaf.empty() ? loc : leaf + L" · " + loc);
         r.action = c.path;
         // 插在「一键组」行之后（显式关键字命中的组动作保持最高位）
         size_t pos = 0;
@@ -4304,6 +4382,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             }
             s_programScanState->running=false;
             g.startingUp = false;
+            {
+                // 记一笔：workshop 版本目录变更后的自动刷新有没有真的发生，事后可查
+                char pb[96];
+                snprintf(pb, sizeof(pb), "programs ready: %zu entries (truncated=%d)",
+                         g.programs.size(), (int)s_programCatalogStats.truncated);
+                AppendTrace(pb);
+            }
             TrayUpdateTip();  // 提示文案从「正在启动中」切回热键名
             if(g.mode==Mode::Programs)Refresh();
             else LayoutAndRepaint();
@@ -4620,14 +4705,14 @@ static void ShowNotice(const std::wstring& title, const std::wstring& body,
 //   2. 背景靠独立窗口的 DWM 亚克力玻璃，而未公开接口 GradientColor 的
 //      alpha 语义是反的（0=全不透明、255=全透明），0x38 实为 78% 不透明，
 //      Win11 上亚克力又退化成无模糊的纯色 tint —— 整块看着像深色实板。
-// 现在的做法：GDI+ 画进 32bpp ARGB 位图（圆角/徽标/文字全走抗锯齿），
-// 预乘后用 UpdateLayeredWindow 逐像素 alpha 上屏，桌面直接透过位图 alpha
-// 显示，不再依赖色键与 DWM 亚克力；淡入淡出用 ULW 的 SourceConstantAlpha。
-static constexpr int kToastW = 360;         // 药丸宽（逻辑像素，与原 .slint 版一致）
-static constexpr int kToastH = 64;
-static constexpr int kToastRadius = 15;
+// 现在的做法：GDI+ 画进 32bpp ARGB 位图（徽标/文字全走抗锯齿），预乘后用
+// UpdateLayeredWindow 逐像素 alpha 上屏，桌面直接透过位图 alpha 显示，不再依赖
+// 色键与 DWM 亚克力；淡入淡出用 ULW 的 SourceConstantAlpha。
+// 底色药丸已按需求去掉：只留「绿圆对勾 + 带细阴影的文字」，桌面整片透出；
+// 没有底板托着，文字必须自带阴影，否则浅色桌面上会糊。
+static constexpr int kToastH = 64;          // 位图高（逻辑像素）：徽标与文字的居中基准
+static constexpr int kToastRadius = 15;     // 左侧圆形徽标半径
 static constexpr int kToastTopOffset = 96;  // 距工作区顶边的距离
-static constexpr BYTE kToastBgAlpha = 0x8A; // 药丸底不透明度 46%：与「已在运行」弹窗玻璃一致
 static constexpr int kToastFadeIn = 120, kToastHold = 2000, kToastFadeOut = 300;  // ms
 
 struct NativeToast {
@@ -4650,14 +4735,19 @@ static bool EnsureGdiplus() {
     return Gdiplus::GdiplusStartup(&g_gdiplusToken, &in, nullptr) == Gdiplus::Ok;
 }
 
-// 圆角矩形路径（GDI+ 没有内置 AddRoundedRect）
-static void AddRoundRect(Gdiplus::GraphicsPath& p, float x, float y, float w, float h, float r) {
-    const float d = r * 2;
-    p.AddArc(x, y, d, d, 180, 90);
-    p.AddArc(x + w - d, y, d, d, 270, 90);
-    p.AddArc(x + w - d, y + h - d, d, d, 0, 90);
-    p.AddArc(x, y + h - d, d, d, 90, 90);
-    p.CloseFigure();
+// 用与绘制同一把字体量文字物理宽度（GDI 量宽与 GDI+ 同字体同字号误差 1px 内）。
+// 没有底板后窗口宽度随文案自适应：短提示保持紧凑，长路径/失败原因也不会被截断。
+static int ToastTextWidth(const std::wstring& text) {
+    HFONT hf = g.fontPool[FontSlot(13)];
+    if (!hf) return 0;
+    HDC dc = CreateCompatibleDC(nullptr);
+    if (!dc) return 0;
+    HGDIOBJ old = SelectObject(dc, hf);
+    SIZE sz {};
+    GetTextExtentPoint32W(dc, text.c_str(), (int)text.size(), &sz);
+    SelectObject(dc, old);
+    DeleteDC(dc);
+    return sz.cx;
 }
 
 // 超宽文案按字符回退加「…」（toast 文本短，线性回退足够）
@@ -4678,10 +4768,16 @@ static std::wstring ToastElide(Gdiplus::Graphics& gfx, const Gdiplus::Font& font
     return text.substr(0, n) + dots;
 }
 
-// 重画位图：主题底色药丸（半透明）+ 绿徽标白对勾 + 主题文字色文案
+// 重画位图：**无底板**（桌面直接透出）+ 绿圆白对勾 + 带细阴影的主题文字。
+// 文字阴影是必须的：没有药丸托底后，浅色系桌面上浅色文字会糊成一片。
 static void ToastRender(NativeToast* self) {
     const Theme& t = *g.theme;
-    const int W = S(kToastW), H = S(kToastH);
+    // 宽度自适应文案：左边徽标区 tx + 文字（上限 kToastTextCap）+ 右侧留白 padR
+    constexpr int kToastTextCap = 420;
+    const int tx = S(56), padR = S(16);
+    const int textPx = ToastTextWidth(self->text);
+    const int W = tx + (textPx > 0 ? (std::min)(textPx, S(kToastTextCap)) : S(kToastTextCap)) + padR;
+    const int H = S(kToastH);
     BITMAPINFO bi {};
     bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     bi.bmiHeader.biWidth = W;
@@ -4705,13 +4801,7 @@ static void ToastRender(NativeToast* self) {
         gfx.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);  // 灰度 AA：透明底上无彩边
         gfx.SetPixelOffsetMode(PixelOffsetModeHalf);
 
-        const float r = (float)S(kToastRadius);
-        GraphicsPath pill;
-        AddRoundRect(pill, 0.5f, 0.5f, (float)W - 1.0f, (float)H - 1.0f, r);
-        SolidBrush pillBrush(Color(kToastBgAlpha, GetRValue(t.bg), GetGValue(t.bg), GetBValue(t.bg)));
-        gfx.FillPath(&pillBrush, &pill);
-        Pen edge(Color(0x30, 0xFF, 0xFF, 0xFF), (float)S(1));  // 1px 淡描边：亮背景上给药丸轮廓
-        gfx.DrawPath(&edge, &pill);
+        const float r = (float)S(kToastRadius);   // 复用为左侧圆形徽标的半径
 
         // 左侧成功徽标：绿圆 + 白对勾（几何与原 .slint 版一致）
         const float cx = (float)S(14) + r, cy = (float)H / 2;
@@ -4738,14 +4828,23 @@ static void ToastRender(NativeToast* self) {
             const FontStyle style = lf.lfWeight >= 700 ? FontStyleBold : FontStyleRegular;
             const int em = lf.lfHeight < 0 ? -lf.lfHeight : lf.lfHeight;
             Font font(use, (float)em, style, UnitPixel);
-            const float tx = (float)S(56), tw = (float)W - tx - S(14);
+            const float tw = (float)W - tx - padR;
             const std::wstring shown = ToastElide(gfx, font, self->text, tw);
-            SolidBrush textBrush(Color(0xFF, GetRValue(t.text), GetGValue(t.text), GetBValue(t.text)));
             StringFormat fmt;
             fmt.SetAlignment(StringAlignmentNear);
             fmt.SetLineAlignment(StringAlignmentCenter);
             fmt.SetFormatFlags(fmt.GetFormatFlags() | StringFormatFlagsNoClip |
                                StringFormatFlagsNoWrap);
+            // 阴影：四个斜向偏移各描一遍半透明黑（GDI+ 没有模糊，多层偏移就是柔边）
+            const float off = (float)S(1.4f);
+            SolidBrush shadowBrush(Color(0xA0, 0x00, 0x00, 0x00));
+            for (int k = 0; k < 4; ++k) {
+                const float ox = (k == 0 || k == 3) ? off : -off;
+                const float oy = (k < 2) ? off : -off;
+                gfx.DrawString(shown.c_str(), (int)shown.size(), &font,
+                               RectF(tx + ox, oy, tw, (float)H), &fmt, &shadowBrush);
+            }
+            SolidBrush textBrush(Color(0xFF, GetRValue(t.text), GetGValue(t.text), GetBValue(t.text)));
             gfx.DrawString(shown.c_str(), (int)shown.size(), &font,
                            RectF(tx, 0, tw, (float)H), &fmt, &textBrush);
         }
@@ -4853,7 +4952,7 @@ static LRESULT CALLBACK ToastNativeProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) 
 // 屏幕居中轻提示：主进程 GDI+ 自绘 + UpdateLayeredWindow 逐像素 alpha
 static void ShowTopToast(const std::wstring& text) {
     if (!g.theme) return;
-    AppendTrace("TOAST show");
+    AppendTrace(("TOAST show: " + WideToUtf8(text)).c_str());  // 记下文案：提示对不对、有没有假报「已打开」事后可查
     if (!EnsureGdiplus()) return;
     if (!g_toastWnd || !IsWindow(g_toastWnd)) {
         static bool registered = false;
@@ -5045,6 +5144,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
 
     // 程序扫描较慢：放到工作线程，托盘图标已先就位且可响应（右键显示「正在启动中」）
     s_programWatch.Start(g.hwnd,WM_APP_APPS_CHANGED);
+    // C:\workshop 是 Flowtary 自有发布目录：版本目录增删/替换后程序表要跟着刷新，
+    // 否则会留着已删除版本的 exe 条目（搜得到、回车没反应、还提示「已打开」）。
+    s_programWatch.Directory(L"C:\\workshop");
+    // 轮询上述变更通知。此前只处理 WM_TIMER(kTimerBlink) 却从没 SetTimer，
+    // 目录监听等于常年闲置——补上 1s 周期（Poll 内部另有 5s 节流）。
+    SetTimer(g.hwnd, kTimerBlink, 1000, nullptr);
     StartProgramsRefresh();
 
 

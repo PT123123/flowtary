@@ -136,6 +136,7 @@ static bool g_uiActive = false;
 static bool g_brainSeen = false;
 static bool g_holdHide = false;  // 主进程自己的对话框开着：失焦不隐藏
 static int g_menuClickY = -1;   // 最近一次行右键的屏幕 Y：菜单锚定用
+static bool g_skipNextRightUp = false;  // 菜单开着时吞掉的那次右键按下，对应的抬起也要吞
 
 // 一行结果（来自主进程的状态槽）
 struct RowView {
@@ -390,6 +391,20 @@ static bool point_outside_panel(HWND h, POINT screenPt)
     return !PtInRect(&rc, screenPt);
 }
 
+// 菜单刚被关掉时，指针正下方的结果行不会自动恢复 hover：Slint 只在收到
+// 指针移动时重算悬停项，而关闭菜单本身不产生移动。这里补一条与当前指针
+// 位置一致的 WM_MOUSEMOVE（走正常窗口链路），让 hover 立刻回到光标下的行。
+static void refresh_hover(HWND hwnd)
+{
+    POINT p{};
+    if (!GetCursorPos(&p)) return;
+    ScreenToClient(hwnd, &p);
+    RECT rc{};
+    if (!GetClientRect(hwnd, &rc)) return;
+    if (p.x < rc.left || p.x >= rc.right || p.y < rc.top || p.y >= rc.bottom) return;
+    SendMessageW(hwnd, WM_MOUSEMOVE, 0, MAKELPARAM((short)p.x, (short)p.y));
+}
+
 static LRESULT CALLBACK OutsideClickProc(int code, WPARAM wp, LPARAM lp)
 {
     if (code == HC_ACTION && (wp == WM_LBUTTONDOWN || wp == WM_RBUTTONDOWN || wp == WM_MBUTTONDOWN) &&
@@ -600,7 +615,8 @@ static void request_row_menu(int idx, int clickY = -1)
     send_req(slintbridge::kReqRowMenu, idx);
 }
 
-// 窗口高度：与 main.slint 的排版常量对应（70 行区起点 + 行高 + 12 底栏间距 + 34 底栏 + 上下投影边距）
+// 窗口高度：与 main.slint 的排版常量对应（70 行区起点 + 行高 + 上下投影边距）
+// 底部快捷键提示条已去掉，不再预留 12px 间距 + 34px 底栏。
 static int compute_window_height(const UiCtx& ctx, bool hasQuery)
 {
     if (ctx.rows.empty()) return hasQuery ? 294 : 364;  // 面板 230 / 300 + 上下投影边距
@@ -608,7 +624,7 @@ static int compute_window_height(const UiCtx& ctx, bool hasQuery)
     for (auto& r : ctx.rows)
         content += (r.kind == slintbridge::kRowHint ? 34 : 54);
     content += ((int)ctx.rows.size() - 1) * 2;
-    return 70 + content + 12 + 34 + kUiMargin * 2;
+    return 70 + content + kUiMargin * 2;
 }
 
 // 某一行在列表里的顶部坐标（与 main.slint 排版一致）
@@ -1118,7 +1134,9 @@ static LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (g_ctx && g_ctx->menuOpen) return 0;
             break;
         case WM_RBUTTONUP: {
-            if (g_ctx && g_ctx->menuOpen) { close_row_menu(*g_ctx, true); return 0; }
+            // 与上面「菜单开着时的右键按下」配对：那次按下没交给 Slint，抬起也不能给
+            if (g_skipNextRightUp) { g_skipNextRightUp = false; return 0; }
+            if (g_ctx && g_ctx->menuOpen) { close_row_menu(*g_ctx, true); refresh_hover(hwnd); return 0; }
             int y = (int)(short)HIWORD(lp);
             UINT dpi = GetDpiForWindow(hwnd);
             if (!dpi) dpi = 96;
@@ -1162,8 +1180,30 @@ static LRESULT CALLBACK UiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             send_req(slintbridge::kReqHide);
             hide_ui();
             return 0;
+        case WM_RBUTTONDOWN: {
+            g_skipNextRightUp = false;   // 上一次按下的抬起若丢了，别误吞这次正常的抬起
+            // 兜底捕获生效时，窗口外的点击也会送到这里
+            POINT p{ (LONG)(short)LOWORD(lp), (LONG)(short)HIWORD(lp) };
+            ClientToScreen(hwnd, &p);
+            if (point_outside_panel(hwnd, p)) {
+                if (!g_holdHide) {
+                    send_req(slintbridge::kReqHide);
+                    hide_ui();
+                }
+                return 0;
+            }
+            // 菜单开着时，右键只负责关菜单。整组按下/抬起都拦下来：
+            // 按下交给 Slint 会让它进入按下/捕获状态，而抬起又被吞掉，
+            // 状态不平衡会让随后的 hover 高亮失效（要再点好几次才恢复）。
+            if (g_ctx && g_ctx->menuOpen) {
+                g_skipNextRightUp = true;
+                close_row_menu(*g_ctx, true);
+                refresh_hover(hwnd);
+                return 0;
+            }
+            break;
+        }
         case WM_LBUTTONDOWN:
-        case WM_RBUTTONDOWN:
         case WM_MBUTTONDOWN: {
             // 兜底捕获生效时，窗口外的点击也会送到这里
             POINT p{ (LONG)(short)LOWORD(lp), (LONG)(short)HIWORD(lp) };
